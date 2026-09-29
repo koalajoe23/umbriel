@@ -21,6 +21,12 @@
 //                            targeted commit, which also sets and waits for the barrier
 //   timing-fifo-pair         binds both; on "b", two commits with past-due targets: the first sets the barrier, the
 //                            second sets and waits for it, so the second may only apply a refresh after the first
+//   timing-stream <count> <offset-ms> [lead-periods]
+//                            binds a wp_commit_timer_v1; on "b", <count> timed commits, the first targeted <offset-ms>
+//                            from now and each later one a refresh period after the previous target, each committed as
+//                            soon as the previous one is presented; then "done". With <lead-periods>, a later target
+//                            is instead at least that many periods past the previous present, plus a quarter period
+//                            more per commit modulo a period, so every target lies ahead at a varying phase
 //   timer-destroy-mid <offset-ms>
 //                            as timing, but destroys the wp_commit_timer_v1 right after the timed commit
 //   timing-invalid           sets a timestamp whose tv_nsec is out of range, which is a protocol error
@@ -123,6 +129,13 @@ namespace {
     uint32_t outstanding = 0;
     // Set by a mode while a burst runs; "done" is logged once its feedback has all resolved.
     bool burstActive = false;
+    // The last wl_output mode refresh rate reported, in mHz; 0 when the output advertises none.
+    int32_t refreshMhz = 0;
+    // timing-stream: timed commits still to make after the one in flight, and the target of the one in flight.
+    uint32_t streamRemaining = 0;
+    uint64_t streamTarget = 0;
+    // timing-stream: how many periods past the previous present a target must lie; 0 for none.
+    uint64_t streamLeadPeriods = 0;
   };
 
   void logLine(std::string_view line) {
@@ -222,6 +235,8 @@ namespace {
     checkBurstDone(state);
   }
 
+  void continueStream(State& state, uint64_t presentedNsec);
+
   void feedbackPresented(
       void* data, struct wp_presentation_feedback* /*feedback*/, uint32_t tvSecHi, uint32_t tvSecLo, uint32_t tvNsec,
       uint32_t /*refresh*/, uint32_t /*seqHi*/, uint32_t /*seqLo*/, uint32_t /*flags*/
@@ -229,12 +244,15 @@ namespace {
     auto* entry = static_cast<Feedback*>(data);
     const uint64_t seconds = (static_cast<uint64_t>(tvSecHi) << 32U) | tvSecLo;
     logLine(std::format("presented {} {}", entry->index, (seconds * 1'000'000'000ULL) + tvNsec));
+    // The next streamed commit goes out before this one resolves, so the burst does not end in between.
+    continueStream(*entry->state, (seconds * 1'000'000'000ULL) + tvNsec);
     finishFeedback(entry);
   }
 
   void feedbackDiscarded(void* data, struct wp_presentation_feedback* /*feedback*/) {
     auto* entry = static_cast<Feedback*>(data);
     logLine(std::format("discarded {} {}", entry->index, monotonicNsec()));
+    continueStream(*entry->state, 0);
     finishFeedback(entry);
   }
 
@@ -378,6 +396,65 @@ namespace {
     return true;
   }
 
+  // Reads a positive commit count and a target offset in milliseconds.
+  bool parseCountOffset(State& state, std::span<char*> args) {
+    if (args.size() < 2
+        || args.size() > 3
+        || !parseCount(state, args.first(1))
+        || !parseOffset(state, args.subspan(1, 1))) {
+      return false;
+    }
+    if (args.size() == 3) {
+      const std::string_view text = args[2];
+      const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), state.streamLeadPeriods);
+      if (error != std::errc{} || end != text.data() + text.size()) {
+        return false;
+      }
+    }
+    // Only one streamed commit is in flight at a time.
+    state.slotCount = kSpareSlots + 1;
+    return true;
+  }
+
+  // One refresh period of the output, 60 Hz when it advertises no rate (headless).
+  uint64_t refreshPeriodNsec(const State& state) {
+    return state.refreshMhz > 0 ? 1'000'000'000'000ULL / static_cast<uint64_t>(state.refreshMhz) : 16'666'667ULL;
+  }
+
+  void commitStreamed(State& state) {
+    const std::optional<uint32_t> index = prepareFeedbackCommit(state);
+    if (!index) {
+      return;
+    }
+    setTimestamp(state, state.streamTarget);
+    logLine(std::format("target {} {}", *index, state.streamTarget));
+    wl_surface_commit(state.surface);
+  }
+
+  void continueStream(State& state, uint64_t presentedNsec) {
+    if (state.streamRemaining == 0) {
+      return;
+    }
+    --state.streamRemaining;
+    const uint64_t period = refreshPeriodNsec(state);
+    state.streamTarget += period;
+    if (state.streamLeadPeriods > 0 && presentedNsec > 0) {
+      const uint64_t phase = (state.nextIndex % 4U) * period / 4U;
+      state.streamTarget = std::max(state.streamTarget, presentedNsec + (state.streamLeadPeriods * period) + phase);
+    }
+    commitStreamed(state);
+  }
+
+  void commandTimingStream(State& state, char command) {
+    if (command != 'b' || state.timer == nullptr) {
+      return;
+    }
+    state.burstActive = true;
+    state.streamRemaining = state.burstCount - 1;
+    state.streamTarget = monotonicNsec() + state.targetOffsetNsec;
+    commitStreamed(state);
+  }
+
   void commandTiming(State& state, char command) {
     if (command == 'b' && state.timer != nullptr && prepareTimedCommit(state)) {
       wl_surface_commit(state.surface);
@@ -467,6 +544,7 @@ namespace {
       Mode{.name = "fifo-destroy-mid", .parse = parseCount, .mapped = mappedFifo, .command = commandFifoDestroyMid},
       Mode{.name = "timing", .parse = parseOffset, .mapped = mappedTiming, .command = commandTiming},
       Mode{.name = "timing-fifo", .parse = parseOffset, .mapped = mappedTimingFifo, .command = commandTimingFifo},
+      Mode{.name = "timing-stream", .parse = parseCountOffset, .mapped = mappedTiming, .command = commandTimingStream},
       Mode{
           .name = "timing-fifo-pair", .parse = parseNoArgs, .mapped = mappedTimingFifo, .command = commandTimingFifoPair
       },
@@ -529,8 +607,9 @@ namespace {
   void
   outputGeometry(void*, wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t, const char*, const char*, int32_t) {}
 
-  void outputMode(void* /*data*/, wl_output* /*output*/, uint32_t flags, int32_t, int32_t, int32_t refresh) {
+  void outputMode(void* data, wl_output* /*output*/, uint32_t flags, int32_t, int32_t, int32_t refresh) {
     if ((flags & WL_OUTPUT_MODE_CURRENT) != 0) {
+      static_cast<State*>(data)->refreshMhz = refresh;
       logLine(std::format("refresh-mhz {}", refresh));
     }
   }
