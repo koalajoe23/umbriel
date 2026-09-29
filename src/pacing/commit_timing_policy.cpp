@@ -31,11 +31,13 @@ namespace umbriel {
     return predictNextPresent(lastPresent, period, now) + period;
   }
 
-  Nanoseconds predictReleaseFramePresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now) {
-    if (lastPresent > 0 && now - lastPresent <= kPredictionFreshPeriods * period) {
-      return predictFollowingPresent(lastPresent, period, now);
+  Nanoseconds
+  predictReleaseFramePresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now, bool presentPending) {
+    if (lastPresent == 0 || now - lastPresent > kPredictionFreshPeriods * period) {
+      return now;
     }
-    return now;
+    return presentPending ? predictFollowingPresent(lastPresent, period, now)
+                          : predictNextPresent(lastPresent, period, now);
   }
 
   bool timedCommitDueStrict(Nanoseconds target, Nanoseconds framePresent) { return target <= framePresent; }

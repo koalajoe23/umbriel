@@ -177,7 +177,10 @@ namespace umbriel {
       return;
     }
     // Inside the scene's frame-done walk: only record the refresh here, and emit it once the walk is over. The
-    // prediction is taken now, before this frame's own present can be recorded. Two frame dones before the idle runs
+    // prediction is taken now, before this frame's own present can be recorded, and so is whether this frame
+    // committed: Output::handleFrame sends frame done after every frame, committed or not, and wlroots keeps
+    // frame_pending set from a successful commit until the next frame event, so it tells whether a released commit
+    // waits behind a pending flip or gets a frame of its own straight away. Two frame dones before the idle runs
     // collapse into one refresh for the later one.
     const Nanoseconds when = toNanoseconds(*event->when);
     m_lastRefreshAt = std::max(m_lastRefreshAt, when);
@@ -189,7 +192,7 @@ namespace umbriel {
     m_deferredEvent = PacerRefreshEvent{
         .when = when,
         .hidden = false,
-        .releasePresent = predictReleaseFramePresent(m_lastPresent, period(), when),
+        .releasePresent = predictReleaseFramePresent(m_lastPresent, period(), when, m_output->frame_pending),
         .serial = ++m_refreshSerial,
     };
     if (m_deferredRefresh == nullptr) {

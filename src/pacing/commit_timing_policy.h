@@ -30,11 +30,16 @@ namespace umbriel {
   // The present after the one `predictNextPresent` would give.
   [[nodiscard]] Nanoseconds predictFollowingPresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now);
 
-  // The present a commit released at a refresh at `now` is expected to reach: `predictFollowingPresent` while the last
-  // present is at most kPredictionFreshPeriods periods old, else `now` itself. An output that idled (headless frames
-  // in particular) resumes at an arbitrary phase, so a stale present extrapolates a present up to a period too late;
-  // `now` is a lower bound, so a stale refresh releases only commits whose target has passed, never early.
-  [[nodiscard]] Nanoseconds predictReleaseFramePresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now);
+  // The present a commit released at a refresh at `now` is expected to reach, while the last present is at most
+  // kPredictionFreshPeriods periods old: `predictFollowingPresent` when the frame behind the refresh committed and its
+  // flip is still pending (`presentPending`), since the released commit then renders at the next frame event and
+  // presents a period after it; `predictNextPresent` when that frame committed nothing, since the released commit's
+  // damage then gets a frame straight away, which flips at the very next vblank. Otherwise `now` itself: an output
+  // that idled (headless frames in particular) resumes at an arbitrary phase, so a stale present extrapolates a
+  // present up to a period too late; `now` is a lower bound, so a stale refresh releases only commits whose target has
+  // passed, never early.
+  [[nodiscard]] Nanoseconds
+  predictReleaseFramePresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now, bool presentPending);
 
   // The commit-timing rule with no tolerance: a wp_commit_timer target is due once its present has arrived.
   [[nodiscard]] bool timedCommitDueStrict(Nanoseconds target, Nanoseconds framePresent);

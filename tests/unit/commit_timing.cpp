@@ -32,15 +32,26 @@ UMBRIEL_TEST(followingIsOnePeriodLater) {
   CHECK_EQ(predictFollowingPresent(1'000'000'000, 10'000'000, 1'005'000'000), 1'020'000'000);
 }
 
-UMBRIEL_TEST(releaseFrameFreshUsesFollowing) {
-  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'005'000'000), 1'020'000'000);
+UMBRIEL_TEST(releaseFrameFreshPendingUsesFollowing) {
+  // The frame committed: its flip is still pending, so a released commit renders at the next frame event and presents
+  // one period after it.
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'005'000'000, true), 1'020'000'000);
+}
+
+UMBRIEL_TEST(releaseFrameFreshIdleUsesNext) {
+  // The frame committed nothing: a released commit's damage gets a frame straight away, which flips at the next vblank.
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'005'000'000, false), 1'010'000'000);
 }
 
 UMBRIEL_TEST(releaseFrameStaleUsesNow) {
-  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'025'000'000), 1'025'000'000);
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'025'000'000, true), 1'025'000'000);
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'025'000'000, false), 1'025'000'000);
 }
 
-UMBRIEL_TEST(releaseFrameNeverPresentedUsesNow) { CHECK_EQ(predictReleaseFramePresent(0, 10'000'000, 5), 5); }
+UMBRIEL_TEST(releaseFrameNeverPresentedUsesNow) {
+  CHECK_EQ(predictReleaseFramePresent(0, 10'000'000, 5, true), 5);
+  CHECK_EQ(predictReleaseFramePresent(0, 10'000'000, 5, false), 5);
+}
 
 UMBRIEL_TEST(strictReleasesAtBoundary) {
   CHECK(timedCommitDueStrict(500, 500));
