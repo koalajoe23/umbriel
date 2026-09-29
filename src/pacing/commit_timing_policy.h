@@ -11,6 +11,8 @@ namespace umbriel {
   // Tick rate for a hidden output's commit-timing clock, which has no presentation feedback of its own to derive a
   // period from.
   inline constexpr Nanoseconds kHiddenFallbackRefreshNsec = 25'000'000; // 40 Hz
+  // How many periods a recorded present stays a trustworthy phase for prediction (see `predictReleaseFramePresent`).
+  inline constexpr Nanoseconds kPredictionFreshPeriods = 2;
   // Tolerance layer over the strict rule (see `timedCommitDue`): period / kCommitTimingEarlyToleranceDivisor.
   inline constexpr Nanoseconds kCommitTimingEarlyToleranceDivisor = 4;
 
@@ -24,6 +26,12 @@ namespace umbriel {
 
   // The present after the one `predictNextPresent` would give.
   [[nodiscard]] Nanoseconds predictFollowingPresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now);
+
+  // The present a commit released at a refresh at `now` is expected to reach: `predictFollowingPresent` while the last
+  // present is at most kPredictionFreshPeriods periods old, else `now` itself. An output that idled (headless frames
+  // in particular) resumes at an arbitrary phase, so a stale present extrapolates a present up to a period too late;
+  // `now` is a lower bound, so a stale refresh releases only commits whose target has passed, never early.
+  [[nodiscard]] Nanoseconds predictReleaseFramePresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now);
 
   // The commit-timing rule with no tolerance: a wp_commit_timer target is due once its present has arrived.
   [[nodiscard]] bool timedCommitDueStrict(Nanoseconds target, Nanoseconds framePresent);

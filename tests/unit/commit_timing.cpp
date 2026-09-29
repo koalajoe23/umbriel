@@ -32,6 +32,16 @@ UMBRIEL_TEST(followingIsOnePeriodLater) {
   CHECK_EQ(predictFollowingPresent(1'000'000'000, 10'000'000, 1'005'000'000), 1'020'000'000);
 }
 
+UMBRIEL_TEST(releaseFrameFreshUsesFollowing) {
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'005'000'000), 1'020'000'000);
+}
+
+UMBRIEL_TEST(releaseFrameStaleUsesNow) {
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'025'000'000), 1'025'000'000);
+}
+
+UMBRIEL_TEST(releaseFrameNeverPresentedUsesNow) { CHECK_EQ(predictReleaseFramePresent(0, 10'000'000, 5), 5); }
+
 UMBRIEL_TEST(strictReleasesAtBoundary) {
   CHECK(timedCommitDueStrict(500, 500));
   CHECK(!timedCommitDueStrict(501, 500));

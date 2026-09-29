@@ -31,6 +31,13 @@ namespace umbriel {
     return predictNextPresent(lastPresent, period, now) + period;
   }
 
+  Nanoseconds predictReleaseFramePresent(Nanoseconds lastPresent, Nanoseconds period, Nanoseconds now) {
+    if (lastPresent > 0 && now - lastPresent <= kPredictionFreshPeriods * period) {
+      return predictFollowingPresent(lastPresent, period, now);
+    }
+    return now;
+  }
+
   bool timedCommitDueStrict(Nanoseconds target, Nanoseconds framePresent) { return target <= framePresent; }
 
   Nanoseconds commitTimingEarlyTolerance(Nanoseconds period) { return period / kCommitTimingEarlyToleranceDivisor; }
