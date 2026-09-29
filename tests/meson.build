@@ -3,6 +3,7 @@
 unit_tests = [
   ['overview-navigation', ['unit/overview_navigation.cpp'], []],
   ['gesture-physics', ['unit/gesture_physics.cpp'], []],
+  ['fifo-queue', ['unit/fifo_queue.cpp'], [umbriel_pure_dep]],
   ['overview-preview-geometry', ['unit/overview_preview_geometry.cpp'], [umbriel_core_dep]],
   ['presented-crop', ['unit/presented_crop.cpp'], []],
   ['scene-node', ['unit/scene_node.cpp'], []],
