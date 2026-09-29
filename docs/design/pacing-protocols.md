@@ -155,17 +155,45 @@ left), so steady frames cost no timer updates. A headless harness has no
 session to lose, so the watchdog's interval is pinned by a unit test
 (`tests/unit/commit_timing.cpp`) rather than a check.
 
-## Stale prediction: never early, up to one period late after idle
+## Predicting the release frame
 
 `PacerRefreshEvent::releasePresent`, which `SurfacePacer` fills at each
 frame done from `commit_timing_policy.h`'s `predictReleaseFramePresent`, is
 the answer to
 "what present will a commit released at this refresh reach?" It extrapolates
 from the pacing output's last recorded `present` event, advancing by whole
-periods. That extrapolation is only trustworthy while the last present is
-recent: `kPredictionFreshPeriods` (2 periods). Once the surface's last
-present is older than that, or it has never presented, the release frame is
-predicted at `now` instead of by extrapolating a possibly-stale phase.
+periods, and depends on whether the frame behind the refresh committed.
+`Output::handleFrame` sends frame done after every frame, committed or not,
+and wlroots keeps `wlr_output.frame_pending` set from a successful commit
+(`output_apply_commit`) until the next frame event (`wlr_output_send_frame`),
+so `SurfacePacer` snapshots it at the frame done:
+
+- **A flip is pending** (`frame_pending`): the released commit's damage waits
+  for that flip's frame event, renders then, and presents a period later —
+  `predictFollowingPresent`, the present after next.
+- **No flip is pending**: the frame followed a flip with nothing new to draw.
+  The released commit's damage gets a frame straight away
+  (`wlr_output_schedule_frame` queues it on an idle source), which flips at
+  the very next vblank — `predictNextPresent`. Assuming a pending flip here
+  would predict a period too late and release the commit a period early.
+
+A frame the commit timer asks for (`SurfacePacer::requestFrame`) always
+commits: `wlr_output_schedule_frame` sets `output->needs_frame`, which makes
+`wlr_scene_output_needs_frame` true, and `wlr_scene_output_build_state`
+renders a buffer even with no damage. So the refresh of a requested frame has
+a flip pending, and the next frame waits for that flip: asking for a frame
+while a head is not yet due never turns into back-to-back frames.
+
+This DRM behaviour is argued from the wlroots 0.20.2 source (`output.c`, the
+DRM page-flip handler), not measured: the harness runs only headless outputs.
+
+### Stale prediction: never early, up to one period late after idle
+
+The extrapolation is only trustworthy while the last present is recent:
+`kPredictionFreshPeriods` (2 periods). Once the surface's last present is
+older than that, or it has never presented, the release frame is predicted
+at `now` instead of by extrapolating a possibly-stale phase, whatever
+`frame_pending` says.
 
 This was found empirically: a headless output that has been idle resumes
 rendering at an arbitrary phase relative to its last recorded present, so
@@ -175,6 +203,22 @@ rule one-sided — a timed commit is never released early, but it can be
 released up to one period late right after an idle stretch, which is the
 same bound normal (non-predictive) pacing gives a surface with no history at
 all.
+
+### Headless
+
+A headless output has no vblank grid. It "presents" a commit at commit time
+(from an idle source) and restarts its frame timer there, so its next frame
+comes one frame delay after that commit. When a frame is requested while the
+output idles, off the phase of its previous presents, that commit moves the
+output's whole frame phase, while the prediction — still fresh by age — steps
+along the old grid. A commit released at that refresh renders at the moved
+frame and can present up to a period before its prediction. A stream that
+targets three periods past each present hits this on every other commit
+(about −16.7 ms at 60 Hz), and two periods past does occasionally under load
+(down to about −12.7 ms), so `protocol/commit_timing_stream` streams only up to
+a lead of one period. A DRM output's requested frame flips at the next vblank
+of the same grid, so the prediction holds there; no headless-specific logic
+exists in `src/pacing/`.
 
 ## Destroy semantics: two different protocol answers, taken as written
 
