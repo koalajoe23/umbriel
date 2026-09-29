@@ -36,6 +36,13 @@ static void handle_output_destroy(struct wl_listener *listener, void *data) {
 		if (surface_output->output == destroyed) {
 			// The output can no longer pace frames for this surface, whether
 			// or not the surface ever gets an explicit leave for it.
+			// Writing to this wlroots-owned entry is intentional and harmless
+			// in either listener order: wlroots destroys it from its own
+			// listener on the same output destroy signal. If that listener
+			// ran first, the entry is already gone and this loop finds
+			// nothing; if ours runs first, the flag only keeps
+			// umbrielfx_surface_frame_pacing_output below from picking the
+			// dying output, and the entry is freed right after.
 			surface_output->suspended = true;
 			break;
 		}
