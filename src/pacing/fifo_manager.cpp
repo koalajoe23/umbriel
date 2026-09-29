@@ -144,28 +144,45 @@ namespace umbriel {
         fifo->handleCommit();
       }
 
-      static void onPacerRefresh(void* owner, const PacerRefreshEvent& /*event*/) {
-        static_cast<Fifo*>(owner)->handlePacerRefresh();
+      static void onPacerRefresh(void* owner, const PacerRefreshEvent& event) {
+        static_cast<Fifo*>(owner)->handlePacerRefresh(event);
       }
 
-      // A commit that waits for the barrier while one is set, or while older commits are still held, is held too.
+      // A commit that waits for the barrier while one is set, while a setter ahead of it has not applied yet, or while
+      // older commits are still held, is held too. Every commit is recorded, so setters are tracked until they apply.
       void handleClientCommit() {
-        if (!m_queue.shouldHold(m_pending.waitBarrier, isSynchronizedSubsurface(m_surface))) {
-          return;
+        const bool hold = m_queue.shouldHold(m_pending.waitBarrier, isSynchronizedSubsurface(m_surface));
+        if (hold) {
+          const std::uint32_t seq = wlr_surface_lock_pending(m_surface);
+          m_queue.hold(HeldCommit{.seq = seq, .setsBarrier = m_pending.setBarrier});
         }
-        const std::uint32_t seq = wlr_surface_lock_pending(m_surface);
-        m_queue.hold(HeldCommit{.seq = seq, .setsBarrier = m_pending.setBarrier});
+        m_queue.committed(m_pending.setBarrier);
         // Makes sure a refresh comes even when nothing else would draw the pacing output.
-        if (SurfacePacer* pacer = m_pacer.pacer()) {
+        if (SurfacePacer* pacer = m_pacer.pacer(); hold && pacer != nullptr) {
           pacer->requestFrame();
         }
       }
 
-      void handleCommit() { m_queue.applied(m_current.setBarrier); }
+      void handleCommit() {
+        if (m_current.setBarrier) {
+          SurfacePacer* pacer = m_pacer.pacer();
+          m_barrierSerial = pacer != nullptr ? pacer->refreshSerial() : 0;
+        }
+        m_queue.applied(m_current.setBarrier);
+      }
 
-      // A refresh clears the barrier and releases held commits up to the next one that sets it again. The pacing
-      // output changing does not flush the queue: it simply follows the new output's refreshes.
-      void handlePacerRefresh() {
+      // A refresh clears the barrier and releases held commits up to the next one that sets it again. A barrier set
+      // at or after this refresh's instant (applied between a frame done and its deferred refresh, or by another
+      // listener of this very refresh, such as commit-timing releasing the setter) was not used by it, so the refresh
+      // does not count for it. The pacing output changing does not flush the queue: it simply follows the new
+      // output's refreshes.
+      void handlePacerRefresh(const PacerRefreshEvent& event) {
+        if (m_queue.barrier() && m_barrierSerial >= event.serial) {
+          if (SurfacePacer* pacer = m_pacer.pacer()) {
+            pacer->requestFrame();
+          }
+          return;
+        }
         const std::vector<std::uint32_t> released = m_queue.refresh();
         // Unlocking can apply a commit synchronously, which re-enters handleCommit and re-arms the barrier.
         for (const std::uint32_t seq : released) {
@@ -204,6 +221,8 @@ namespace umbriel {
       wlr_surface* m_surface = nullptr;
       PacerSubscription m_pacer;
       FifoQueue m_queue;
+      // The pacer's refresh serial when the barrier was last set (see handlePacerRefresh).
+      std::uint64_t m_barrierSerial = 0;
       wlr_addon m_addon{};
       wlr_surface_synced m_synced{};
       FifoState m_pending;

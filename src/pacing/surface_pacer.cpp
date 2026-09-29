@@ -171,6 +171,7 @@ namespace umbriel {
         .when = when,
         .hidden = false,
         .releasePresent = predictReleaseFramePresent(m_lastPresent, period(), when),
+        .serial = ++m_refreshSerial,
     };
     if (m_deferredRefresh == nullptr) {
       m_deferredRefresh = wl_event_loop_add_idle(m_eventLoop, onDeferredRefresh, this);
@@ -204,7 +205,7 @@ namespace umbriel {
     // Re-armed before emitting so a listener that releases the pacer disarms the next tick.
     armHiddenTick();
     const Nanoseconds now = monotonicNow();
-    PacerRefreshEvent refresh{.when = now, .hidden = true, .releasePresent = now};
+    PacerRefreshEvent refresh{.when = now, .hidden = true, .releasePresent = now, .serial = ++m_refreshSerial};
     wl_signal_emit_mutable(&events.refresh, &refresh);
   }
 

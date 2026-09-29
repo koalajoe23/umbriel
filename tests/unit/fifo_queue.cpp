@@ -74,4 +74,68 @@ UMBRIEL_TEST(drainReleasesEverything) {
   CHECK(!queue.barrier());
 }
 
+// In-flight setters: a commit that set the barrier but has not applied yet (another lock holds it, or a refresh just
+// released it) keeps its barrier from counting as active, so a wait_barrier commit behind it must not apply in the same
+// flush.
+
+UMBRIEL_TEST(inFlightSetterHoldsNextWait) {
+  FifoQueue queue;
+  queue.committed(true);
+  CHECK(!queue.barrier());
+  CHECK(queue.shouldHold(true, false));
+}
+
+UMBRIEL_TEST(inFlightNonSetterDoesNotHold) {
+  FifoQueue queue;
+  queue.committed(false);
+  CHECK(!queue.shouldHold(true, false));
+}
+
+UMBRIEL_TEST(appliedSetterLetsNextRefreshRelease) {
+  FifoQueue queue;
+  queue.committed(true);
+  queue.hold({7, true});
+  queue.committed(true);
+  // The setter ahead has not applied: no refresh can count for its barrier yet.
+  CHECK(queue.refresh().empty());
+  queue.applied(true);
+  CHECK(queue.barrier());
+  CHECK_EQ(queue.refresh(), (std::vector<std::uint32_t>{7}));
+}
+
+UMBRIEL_TEST(releasedSetterBlocksUntilApplied) {
+  FifoQueue queue;
+  queue.applied(true);
+  queue.hold({1, true});
+  queue.committed(true);
+  queue.hold({2, false});
+  queue.committed(false);
+  CHECK_EQ(queue.refresh(), (std::vector<std::uint32_t>{1}));
+  // Released but still held by another lock: it has not applied, so commit 2 stays held and new waits queue behind.
+  CHECK(queue.refresh().empty());
+  CHECK(queue.shouldHold(true, false));
+  queue.applied(true);
+  CHECK_EQ(queue.refresh(), (std::vector<std::uint32_t>{2}));
+  CHECK(queue.empty());
+}
+
+UMBRIEL_TEST(laterSetterDoesNotBlockEarlierHeld) {
+  // A setter committed after a held commit is behind it: releasing the held commit cannot apply it early.
+  FifoQueue queue;
+  queue.applied(true);
+  queue.hold({1, false});
+  queue.committed(false);
+  queue.committed(true);
+  CHECK_EQ(queue.refresh(), (std::vector<std::uint32_t>{1}));
+}
+
+UMBRIEL_TEST(appliedSetterRetiresInFlight) {
+  FifoQueue queue;
+  queue.committed(true);
+  queue.applied(true);
+  CHECK_EQ(queue.refresh(), (std::vector<std::uint32_t>{}));
+  CHECK(!queue.barrier());
+  CHECK(!queue.shouldHold(true, false));
+}
+
 int main() { return RUN_TESTS(); }

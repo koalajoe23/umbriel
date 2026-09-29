@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # commit-timing-v1: the global is advertised; a commit targeted 300 ms ahead is held until about its target and then
 # presented, on its own, when a fifo-v1 barrier holds it as well, and when its wp_commit_timer_v1 is destroyed right
-# after the commit (existing constraints stay in force); an out-of-range tv_nsec is invalid_timestamp, a
-# second timestamp for one commit is timestamp_exists, and a second wp_commit_timer_v1 for one surface is
-# commit_timer_exists.
+# after the commit (existing constraints stay in force); two past-due timed commits, the second waiting for the first's
+# barrier, present on distinct refreshes; an out-of-range tv_nsec is invalid_timestamp, a second timestamp for one
+# commit is timestamp_exists, and a second wp_commit_timer_v1 for one surface is commit_timer_exists.
 set -euo pipefail
 
 readonly CLIENT="$UMBRIEL_PACING_CLIENT"
@@ -93,6 +93,25 @@ stop_client
 start_client timing-fifo timing-fifo 300
 start_burst
 assert_presented_near_target timing-fifo
+stop_client
+
+# Two timed commits whose targets have passed are released by one refresh, but the second waits for the barrier the
+# first sets: that barrier is not active until the first applies, so the two present on distinct refreshes.
+start_client timing-fifo-pair timing-fifo-pair
+start_burst
+wait_log '^done$'
+if ! awk '
+    $1 == "presented" { presented[$2] = $3 }
+    END {
+      if (!(0 in presented) || !(1 in presented)) { print "both commits were not presented"; exit 1 }
+      if (presented[1] <= presented[0]) {
+        printf "commit 1 presented at %d, not after commit 0 at %d\n", presented[1], presented[0]
+        exit 1
+      }
+    }' "$CLIENT_LOG"; then
+  echo "timing-fifo-pair log: $(tr '\n' '|' < "$CLIENT_LOG")"
+  exit 1
+fi
 stop_client
 
 # Destroying the timer right after the timed commit leaves its constraint in force.

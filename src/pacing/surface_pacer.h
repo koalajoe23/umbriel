@@ -22,6 +22,8 @@ namespace umbriel {
     // presents recorded before the frame done (the frame's own present may already have arrived by the time the
     // refresh is emitted; headless sends it from an idle source). Equal to `when` for a hidden tick.
     Nanoseconds releasePresent;
+    // This refresh's position among the pacer's refresh instants (see SurfacePacer::refreshSerial).
+    std::uint64_t serial;
   };
 
   // Per-surface pacing mechanism shared by the fifo-v1 and commit-timing-v1 managers. It follows the umbrielfx
@@ -50,6 +52,11 @@ namespace umbriel {
     [[nodiscard]] Nanoseconds period() const;
     // period() once the surface has had a pacing output; 0 until then.
     [[nodiscard]] Nanoseconds lastKnownPeriod() const;
+
+    // The serial of the latest refresh instant: a frame done counts when it happens, not when its deferred refresh is
+    // emitted, and a tick counts just before it is emitted. Content applied while this is S was not used by the
+    // refresh with serial S.
+    [[nodiscard]] std::uint64_t refreshSerial() const { return m_refreshSerial; }
 
     // Asks the pacing output for a frame, so a refresh arrives even when nothing else redraws. No-op while hidden.
     void requestFrame();
@@ -99,6 +106,7 @@ namespace umbriel {
     Nanoseconds m_lastPresentRefresh = 0;
     bool m_hadOutput = false;
     uint32_t m_retainCount = 0;
+    std::uint64_t m_refreshSerial = 0;
     wl_event_loop* m_eventLoop = nullptr;
     wl_event_source* m_hiddenTick = nullptr;
     bool m_hiddenTickArmed = false;

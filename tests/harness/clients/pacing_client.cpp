@@ -19,6 +19,8 @@
 //                            "target 0 <nsec>" before its feedback, then "done"
 //   timing-fifo <offset-ms>  as timing, but also binds a wp_fifo_v1: on "b", a commit that sets the barrier, then the
 //                            targeted commit, which also sets and waits for the barrier
+//   timing-fifo-pair         binds both; on "b", two commits with past-due targets: the first sets the barrier, the
+//                            second sets and waits for it, so the second may only apply a refresh after the first
 //   timer-destroy-mid <offset-ms>
 //                            as timing, but destroys the wp_commit_timer_v1 right after the timed commit
 //   timing-invalid           sets a timestamp whose tv_nsec is out of range, which is a protocol error
@@ -417,6 +419,25 @@ namespace {
     wl_surface_commit(state.surface);
   }
 
+  // Both commits are held for their (already passed) targets and released by the same refresh; the second also waits
+  // for the barrier the first sets, which is not active until the first has applied.
+  void commandTimingFifoPair(State& state, char command) {
+    if (command != 'b' || state.timer == nullptr || state.fifo == nullptr) {
+      return;
+    }
+    if (!prepareTimedCommit(state)) {
+      return;
+    }
+    wp_fifo_v1_set_barrier(state.fifo);
+    wl_surface_commit(state.surface);
+    if (!prepareTimedCommit(state)) {
+      return;
+    }
+    wp_fifo_v1_set_barrier(state.fifo);
+    wp_fifo_v1_wait_barrier(state.fifo);
+    wl_surface_commit(state.surface);
+  }
+
   void mappedTimingInvalid(State& state) {
     if (getTimer(state)) {
       wp_commit_timer_v1_set_timestamp(state.timer, 0, 1, 1'000'000'000U);
@@ -446,6 +467,9 @@ namespace {
       Mode{.name = "fifo-destroy-mid", .parse = parseCount, .mapped = mappedFifo, .command = commandFifoDestroyMid},
       Mode{.name = "timing", .parse = parseOffset, .mapped = mappedTiming, .command = commandTiming},
       Mode{.name = "timing-fifo", .parse = parseOffset, .mapped = mappedTimingFifo, .command = commandTimingFifo},
+      Mode{
+          .name = "timing-fifo-pair", .parse = parseNoArgs, .mapped = mappedTimingFifo, .command = commandTimingFifoPair
+      },
       Mode{
           .name = "timer-destroy-mid", .parse = parseOffset, .mapped = mappedTiming, .command = commandTimerDestroyMid
       },
