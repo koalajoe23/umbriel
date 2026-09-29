@@ -43,6 +43,18 @@ UMBRIEL_TEST(releaseFrameFreshIdleUsesNext) {
   CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'005'000'000, false), 1'010'000'000);
 }
 
+UMBRIEL_TEST(releaseFrameFreshAtTwoPeriods) {
+  // Exactly kPredictionFreshPeriods periods old still counts as fresh.
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'020'000'000, true), 1'040'000'000);
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'020'000'000, false), 1'030'000'000);
+}
+
+UMBRIEL_TEST(releaseFrameIdleAtFlipUsesNextVblank) {
+  // DRM: the frame event of a flip that brought nothing new arrives with that flip's present, so the next present is
+  // one period on.
+  CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'000'000'000, false), 1'010'000'000);
+}
+
 UMBRIEL_TEST(releaseFrameStaleUsesNow) {
   CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'025'000'000, true), 1'025'000'000);
   CHECK_EQ(predictReleaseFramePresent(1'000'000'000, 10'000'000, 1'025'000'000, false), 1'025'000'000);
