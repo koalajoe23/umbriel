@@ -1,0 +1,103 @@
+#pragma once
+
+#include "pacing/commit_timing_policy.h"
+
+#include <cstdint>
+#include <memory>
+#include <wayland-server-core.h>
+
+struct umbrielfx_surface_pacing;
+struct wl_event_source;
+struct wlr_output;
+struct wlr_surface;
+
+namespace umbriel {
+
+  // One pacing instant for a surface: a frame done on its pacing output, or a hidden-surface tick.
+  struct PacerRefreshEvent {
+    Nanoseconds when; // CLOCK_MONOTONIC
+    bool hidden;
+  };
+
+  // Per-surface pacing mechanism shared by the fifo-v1 and commit-timing-v1 managers. It follows the umbrielfx
+  // pacing addon's output, the output its wl_surface.frame callbacks are paced by, records that output's latest
+  // present event for prediction, and emits one refresh signal: on each frame done for that output, and on a timer
+  // while the surface is hidden and something retains the pacer. It knows nothing about either protocol.
+  //
+  // A pacer lives in a wlr_addon on the surface and is freed with the surface; events.destroy fires first so users
+  // unlink their listeners.
+  class SurfacePacer {
+  public:
+    // Finds the surface's pacer, creating it on first use.
+    static SurfacePacer& from(wlr_surface* surface);
+
+    SurfacePacer(const SurfacePacer&) = delete;
+    SurfacePacer& operator=(const SurfacePacer&) = delete;
+
+    // The surface's current pacing output, mirroring the umbrielfx addon; null while hidden.
+    [[nodiscard]] wlr_output* output() const { return m_output; }
+    // The pacing output's refresh period: its last present refresh, else its mode (the current output's, or the last
+    // one's while hidden), else 60 Hz.
+    [[nodiscard]] Nanoseconds period() const;
+    // period() once the surface has had a pacing output; 0 until then.
+    [[nodiscard]] Nanoseconds lastKnownPeriod() const;
+    // The present after the next one strictly past `now`, extrapolated from the last recorded present.
+    [[nodiscard]] Nanoseconds predictFollowingPresent(Nanoseconds now) const;
+
+    // Asks the pacing output for a frame, so a refresh arrives even when nothing else redraws. No-op while hidden.
+    void requestFrame();
+    // While at least one retain is outstanding and the surface is hidden, the hidden tick emits refresh.
+    void retain();
+    void release();
+
+    struct {
+      wl_signal refresh; // const PacerRefreshEvent*
+      wl_signal destroy; // SurfacePacer*
+    } events{};
+
+  private:
+    struct Addon;
+
+    SurfacePacer(wlr_surface* surface, umbrielfx_surface_pacing* pacing);
+    ~SurfacePacer();
+
+    static void onOutputChange(wl_listener* listener, void* data);
+    static void onFrameDone(wl_listener* listener, void* data);
+    static void onPacingDestroy(wl_listener* listener, void* data);
+    static void onOutputPresent(wl_listener* listener, void* data);
+    static void onOutputDestroy(wl_listener* listener, void* data);
+    static int onHiddenTick(void* data);
+
+    void handleOutputChange();
+    void handleFrameDone(void* data);
+    void handleOutputPresent(void* data);
+    void handleOutputDestroy();
+    void handleHiddenTick();
+
+    // Moves the present and destroy subscriptions to `output`, which becomes output().
+    void setOutput(wlr_output* output);
+    // Arms the hidden tick while retained and hidden, disarms it otherwise.
+    void updateHiddenTick();
+    void armHiddenTick();
+
+    std::unique_ptr<Addon> m_addon;
+    umbrielfx_surface_pacing* m_pacing = nullptr;
+    wlr_output* m_output = nullptr;
+    // The last output mode refresh seen, kept while hidden.
+    int32_t m_lastOutputRefreshMhz = 0;
+    // The pacing output's last present event; reset when the pacing output changes.
+    Nanoseconds m_lastPresent = 0;
+    Nanoseconds m_lastPresentRefresh = 0;
+    bool m_hadOutput = false;
+    uint32_t m_retainCount = 0;
+    wl_event_source* m_hiddenTick = nullptr;
+    bool m_hiddenTickArmed = false;
+
+    wl_listener m_outputChange{};
+    wl_listener m_frameDone{};
+    wl_listener m_pacingDestroy{};
+    wl_listener m_outputPresent{};
+    wl_listener m_outputDestroy{};
+  };
+
+} // namespace umbriel

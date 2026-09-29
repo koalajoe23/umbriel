@@ -255,6 +255,63 @@ subsurface_client = executable(
   dependencies: [wayland_client_dep],
 )
 
+# Client code for the frame-pacing protocols pacing-client drives, and the presentation feedback it reports.
+wl_protocol_dir = wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir')
+fifo_client_h = custom_target(
+  'fifo-v1-client-protocol.h',
+  input: wl_protocol_dir / 'staging/fifo/fifo-v1.xml',
+  output: 'fifo-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+fifo_client_c = custom_target(
+  'fifo-v1-client-protocol.c',
+  input: wl_protocol_dir / 'staging/fifo/fifo-v1.xml',
+  output: 'fifo-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+commit_timing_client_h = custom_target(
+  'commit-timing-v1-client-protocol.h',
+  input: wl_protocol_dir / 'staging/commit-timing/commit-timing-v1.xml',
+  output: 'commit-timing-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+commit_timing_client_c = custom_target(
+  'commit-timing-v1-client-protocol.c',
+  input: wl_protocol_dir / 'staging/commit-timing/commit-timing-v1.xml',
+  output: 'commit-timing-v1-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+presentation_time_client_h = custom_target(
+  'presentation-time-client-protocol.h',
+  input: wl_protocol_dir / 'stable/presentation-time/presentation-time.xml',
+  output: 'presentation-time-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+presentation_time_client_c = custom_target(
+  'presentation-time-client-protocol.c',
+  input: wl_protocol_dir / 'stable/presentation-time/presentation-time.xml',
+  output: 'presentation-time-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+# Harness helper that submits fifo-v1 and commit-timing-v1 commits from an xdg toplevel and logs each commit's
+# wp_presentation feedback.
+pacing_client = executable(
+  'pacing-client',
+  [
+    'harness/clients/pacing_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    fifo_client_h,
+    fifo_client_c,
+    commit_timing_client_h,
+    commit_timing_client_c,
+    presentation_time_client_h,
+    presentation_time_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
 # Harness helper that renders one buffer at the preferred fractional scale and
 # publishes its logical size through wp_viewporter, the way a fractional-scale
 # aware toolkit does.
@@ -365,6 +422,7 @@ harness_client_targets = [
   unmap_client,
   popup_client,
   subsurface_client,
+  pacing_client,
   fractional_client,
   idle_inhibit_client,
   lock_client,
