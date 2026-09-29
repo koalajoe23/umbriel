@@ -191,6 +191,9 @@ while a head is not yet due never turns into back-to-back frames.
 
 This DRM behaviour is argued from the wlroots 0.20.2 source (`output.c`, the
 DRM page-flip handler), not measured: the harness runs only headless outputs.
+What is tested is the pacer's side of it: `tests/unit/surface_pacer.cpp` sets
+`frame_pending` by hand and checks that each frame done's refresh carries the
+prediction for that flip state.
 
 ### Stale prediction: never early, up to one period late after idle
 
