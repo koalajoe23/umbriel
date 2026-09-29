@@ -43,6 +43,8 @@ namespace umbriel {
     [[nodiscard]] Nanoseconds lastKnownPeriod() const;
     // The present after the next one strictly past `now`, extrapolated from the last recorded present.
     [[nodiscard]] Nanoseconds predictFollowingPresent(Nanoseconds now) const;
+    // The present a commit released at a refresh at `now` reaches; `now` once the last recorded present is stale.
+    [[nodiscard]] Nanoseconds predictReleaseFramePresent(Nanoseconds now) const;
 
     // Asks the pacing output for a frame, so a refresh arrives even when nothing else redraws. No-op while hidden.
     void requestFrame();

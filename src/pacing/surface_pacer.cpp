@@ -114,6 +114,10 @@ namespace umbriel {
     return umbriel::predictFollowingPresent(m_lastPresent, period(), now);
   }
 
+  Nanoseconds SurfacePacer::predictReleaseFramePresent(Nanoseconds now) const {
+    return umbriel::predictReleaseFramePresent(m_lastPresent, period(), now);
+  }
+
   void SurfacePacer::requestFrame() {
     if (m_output != nullptr) {
       wlr_output_schedule_frame(m_output);

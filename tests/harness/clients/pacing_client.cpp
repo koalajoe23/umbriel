@@ -15,6 +15,15 @@
 //                            wait_barrier and no frame callback, then "done" once all their feedback resolved
 //   fifo-duplicate           asks for two wp_fifo_v1 objects for the surface, which is a protocol error
 //   fifo-destroy-mid <count> as fifo, but destroys the wp_fifo_v1 right after the burst and commits once more
+//   timing <offset-ms>       binds a wp_commit_timer_v1; on "b", one commit targeted <offset-ms> from now, logging
+//                            "target 0 <nsec>" before its feedback, then "done"
+//   timing-fifo <offset-ms>  as timing, but also binds a wp_fifo_v1: on "b", a commit that sets the barrier, then the
+//                            targeted commit, which also sets and waits for the barrier
+//   timer-destroy-mid <offset-ms>
+//                            as timing, but destroys the wp_commit_timer_v1 right after the timed commit
+//   timing-invalid           sets a timestamp whose tv_nsec is out of range, which is a protocol error
+//   timing-duplicate         sets two timestamps for one commit, which is a protocol error
+//   timer-duplicate          asks for two wp_commit_timer_v1 objects for the surface, which is a protocol error
 // Exits non-zero, after a message on stderr, when it cannot produce a commit it was asked for.
 
 #include "commit-timing-v1-client-protocol.h"
@@ -91,6 +100,7 @@ namespace {
     xdg_surface* xdgSurface = nullptr;
     xdg_toplevel* toplevel = nullptr;
     wp_fifo_v1* fifo = nullptr;
+    wp_commit_timer_v1* timer = nullptr;
     const Mode* mode = nullptr;
     bool mapped = false;
     bool running = true;
@@ -98,6 +108,8 @@ namespace {
     bool failed = false;
     // Commits per burst, from the mode's arguments.
     uint32_t burstCount = 0;
+    // How far past the burst's start a timed commit targets, from the mode's arguments.
+    uint64_t targetOffsetNsec = 0;
     // Buffer slots the pool is created with; a mode that holds many commits raises it while parsing.
     uint32_t slotCount = kSpareSlots;
     // Created once; each slot's address is its buffer's listener data, so the vector never grows afterwards.
@@ -114,6 +126,12 @@ namespace {
   void logLine(std::string_view line) {
     std::println("{}", line);
     std::fflush(stdout);
+  }
+
+  uint64_t monotonicNsec() {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ULL) + static_cast<uint64_t>(now.tv_nsec);
   }
 
   // Resolving the last outstanding feedback of a burst ends it.
@@ -214,10 +232,7 @@ namespace {
 
   void feedbackDiscarded(void* data, struct wp_presentation_feedback* /*feedback*/) {
     auto* entry = static_cast<Feedback*>(data);
-    timespec now{};
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    const auto nsec = (static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ULL) + static_cast<uint64_t>(now.tv_nsec);
-    logLine(std::format("discarded {} {}", entry->index, nsec));
+    logLine(std::format("discarded {} {}", entry->index, monotonicNsec()));
     finishFeedback(entry);
   }
 
@@ -312,11 +327,133 @@ namespace {
     }
   }
 
+  // Reads a single target offset in milliseconds.
+  bool parseOffset(State& state, std::span<char*> args) {
+    if (args.size() != 1) {
+      return false;
+    }
+    const std::string_view text = args[0];
+    uint64_t offsetMsec = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), offsetMsec);
+    if (error != std::errc{} || end != text.data() + text.size()) {
+      return false;
+    }
+    state.targetOffsetNsec = offsetMsec * 1'000'000ULL;
+    return true;
+  }
+
+  // Asks for the surface's commit timer. False, having failed the client, when the global is missing.
+  bool getTimer(State& state) {
+    if (state.commitTimingManager == nullptr) {
+      fail(state, "the compositor does not advertise wp_commit_timing_manager_v1");
+      return false;
+    }
+    state.timer = wp_commit_timing_manager_v1_get_timer(state.commitTimingManager, state.surface);
+    return true;
+  }
+
+  void setTimestamp(State& state, uint64_t nsec) {
+    const uint64_t seconds = nsec / 1'000'000'000ULL;
+    wp_commit_timer_v1_set_timestamp(
+        state.timer, static_cast<uint32_t>(seconds >> 32U), static_cast<uint32_t>(seconds),
+        static_cast<uint32_t>(nsec % 1'000'000'000ULL)
+    );
+  }
+
+  void mappedTiming(State& state) { getTimer(state); }
+
+  // Prepares the burst's single feedback commit and gives it a target the mode's offset from now; the caller adds any
+  // other per-commit state and commits.
+  bool prepareTimedCommit(State& state) {
+    state.burstActive = true;
+    const std::optional<uint32_t> index = prepareFeedbackCommit(state);
+    if (!index) {
+      return false;
+    }
+    const uint64_t target = monotonicNsec() + state.targetOffsetNsec;
+    setTimestamp(state, target);
+    logLine(std::format("target {} {}", *index, target));
+    return true;
+  }
+
+  void commandTiming(State& state, char command) {
+    if (command == 'b' && state.timer != nullptr && prepareTimedCommit(state)) {
+      wl_surface_commit(state.surface);
+    }
+  }
+
+  // Destroying the timer leaves the commit's timing constraint in force.
+  void commandTimerDestroyMid(State& state, char command) {
+    if (command != 'b' || state.timer == nullptr || !prepareTimedCommit(state)) {
+      return;
+    }
+    wl_surface_commit(state.surface);
+    wp_commit_timer_v1_destroy(state.timer);
+    state.timer = nullptr;
+  }
+
+  void mappedTimingFifo(State& state) {
+    if (state.fifoManager == nullptr) {
+      fail(state, "the compositor does not advertise wp_fifo_manager_v1");
+      return;
+    }
+    if (getTimer(state)) {
+      state.fifo = wp_fifo_manager_v1_get_fifo(state.fifoManager, state.surface);
+    }
+  }
+
+  // A commit sets the barrier, so the timed commit that follows is held by the fifo as well as by its timestamp.
+  void commandTimingFifo(State& state, char command) {
+    if (command != 'b' || state.timer == nullptr || state.fifo == nullptr) {
+      return;
+    }
+    wp_fifo_v1_set_barrier(state.fifo);
+    wl_surface_commit(state.surface);
+    if (!prepareTimedCommit(state)) {
+      return;
+    }
+    wp_fifo_v1_set_barrier(state.fifo);
+    wp_fifo_v1_wait_barrier(state.fifo);
+    wl_surface_commit(state.surface);
+  }
+
+  void mappedTimingInvalid(State& state) {
+    if (getTimer(state)) {
+      wp_commit_timer_v1_set_timestamp(state.timer, 0, 1, 1'000'000'000U);
+      wl_surface_commit(state.surface);
+    }
+  }
+
+  void mappedTimingDuplicate(State& state) {
+    if (getTimer(state)) {
+      const uint64_t target = monotonicNsec() + 1'000'000'000ULL;
+      setTimestamp(state, target);
+      setTimestamp(state, target);
+      wl_surface_commit(state.surface);
+    }
+  }
+
+  void mappedTimerDuplicate(State& state) {
+    if (getTimer(state)) {
+      wp_commit_timing_manager_v1_get_timer(state.commitTimingManager, state.surface);
+    }
+  }
+
   constexpr std::array kModes = {
       Mode{.name = "map", .parse = parseNoArgs, .mapped = mappedIdle, .command = commandIgnored},
       Mode{.name = "fifo", .parse = parseCount, .mapped = mappedFifo, .command = commandFifo},
       Mode{.name = "fifo-duplicate", .parse = parseNoArgs, .mapped = mappedFifoDuplicate, .command = commandIgnored},
       Mode{.name = "fifo-destroy-mid", .parse = parseCount, .mapped = mappedFifo, .command = commandFifoDestroyMid},
+      Mode{.name = "timing", .parse = parseOffset, .mapped = mappedTiming, .command = commandTiming},
+      Mode{.name = "timing-fifo", .parse = parseOffset, .mapped = mappedTimingFifo, .command = commandTimingFifo},
+      Mode{
+          .name = "timer-destroy-mid", .parse = parseOffset, .mapped = mappedTiming, .command = commandTimerDestroyMid
+      },
+      Mode{.name = "timing-invalid", .parse = parseNoArgs, .mapped = mappedTimingInvalid, .command = commandIgnored},
+      Mode{
+          .name = "timing-duplicate", .parse = parseNoArgs, .mapped = mappedTimingDuplicate, .command = commandIgnored
+      },
+      Mode{.name = "timer-duplicate", .parse = parseNoArgs, .mapped = mappedTimerDuplicate, .command = commandIgnored},
   };
 
   const Mode* findMode(std::string_view name) {
