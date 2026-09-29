@@ -101,7 +101,7 @@ all.
 ## Destroy semantics: two different protocol answers, taken as written
 
 `wp_commit_timer_v1.destroy` follows its XML text: "Existing timing
-constraints are not affected by the destruction of the timer object."
+constraints are not affected by the destruction."
 `CommitTimingManager`'s `handleResourceDestroy` only clears the resource
 pointer; held commits stay in the queue and keep waiting for their targets,
 released by the normal refresh or hidden-tick path. A `get_timer` on the same
