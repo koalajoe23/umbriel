@@ -58,8 +58,8 @@ namespace umbriel {
 
       // Hooks the fifo into its surface. False, with nothing hooked, when the synced state cannot be allocated.
       bool attach() {
-        // Retained while the fifo lives, so a hidden surface keeps ticking and its queue keeps draining; subscribed
-        // before the addon is added (see PacerSubscription::subscribe).
+        // Subscribed before the addon is added (see PacerSubscription::subscribe); retained only while the queue has
+        // work (updateRetain), so a hidden, idle surface runs no tick.
         if (!m_pacer.subscribe(m_surface)) {
           return false;
         }
@@ -161,6 +161,7 @@ namespace umbriel {
         if (SurfacePacer* pacer = m_pacer.pacer(); hold && pacer != nullptr) {
           pacer->requestFrame();
         }
+        updateRetain();
       }
 
       void handleCommit() {
@@ -169,6 +170,7 @@ namespace umbriel {
           m_barrierSerial = pacer != nullptr ? pacer->refreshSerial() : 0;
         }
         m_queue.applied(m_current.setBarrier);
+        updateRetain();
       }
 
       // A refresh clears the barrier and releases held commits up to the next one that sets it again. A barrier set
@@ -192,7 +194,11 @@ namespace umbriel {
         if (!m_queue.empty() && pacer != nullptr) {
           pacer->requestFrame();
         }
+        updateRetain();
       }
+
+      // The pacer ticks (hidden) and watches for stalls (visible) only while a refresh has something to do here.
+      void updateRetain() { m_pacer.setRetained(!m_queue.idle()); }
 
       // The surface is being destroyed: its cached states, held commits included, go with it, so the queue is
       // dropped without unlocking anything.

@@ -76,8 +76,8 @@ namespace umbriel {
       // Hooks the timer into its surface. False, with nothing hooked, when the synced state or the event source
       // cannot be allocated.
       bool attach() {
-        // Retained while the state lives, so a hidden surface keeps ticking and its queue keeps draining;
-        // subscribed before the addon is added (see PacerSubscription::subscribe).
+        // Subscribed before the addon is added (see PacerSubscription::subscribe); retained only while commits are
+        // held, so a hidden, idle surface runs no tick.
         if (!m_pacer.subscribe(m_surface)) {
           return false;
         }
@@ -192,6 +192,7 @@ namespace umbriel {
         }
         const std::uint32_t seq = wlr_surface_lock_pending(m_surface);
         m_queue.push_back(TimedCommit{.seq = seq, .target = *m_pending.target});
+        m_pacer.setRetained(true);
         schedule();
       }
 
@@ -266,6 +267,7 @@ namespace umbriel {
           released.push_back(m_queue.front().seq);
           m_queue.pop_front();
         }
+        m_pacer.setRetained(!m_queue.empty());
         // Unlocking can apply commits synchronously; the queue is already updated, and the timer has no commit
         // listener to re-enter.
         for (const std::uint32_t seq : released) {

@@ -14,13 +14,16 @@ struct wlr_surface;
 
 namespace umbriel {
 
-  // One pacing instant for a surface: a frame done on its pacing output, or a hidden-surface tick.
+  // One pacing instant for a surface: a frame done on its pacing output, a hidden-surface tick, or a stall watchdog
+  // refresh.
   struct PacerRefreshEvent {
     Nanoseconds when; // CLOCK_MONOTONIC
+    // No frame backs this refresh (a hidden tick or the stall watchdog): anything released reaches no known present,
+    // so timing decisions go by the clock alone.
     bool hidden;
     // For a frame done: the present a commit released at this refresh is expected to reach, predicted from the
     // presents recorded before the frame done (the frame's own present may already have arrived by the time the
-    // refresh is emitted; headless sends it from an idle source). Equal to `when` for a hidden tick.
+    // refresh is emitted; headless sends it from an idle source). Equal to `when` when `hidden`.
     Nanoseconds releasePresent;
     // This refresh's position among the pacer's refresh instants (see SurfacePacer::refreshSerial).
     std::uint64_t serial;
@@ -28,8 +31,10 @@ namespace umbriel {
 
   // Per-surface pacing mechanism shared by the fifo-v1 and commit-timing-v1 managers. It follows the umbrielfx
   // pacing addon's output, the output its wl_surface.frame callbacks are paced by, records that output's latest
-  // present event for prediction, and emits one refresh signal: after each frame done for that output, and on a timer
-  // while the surface is hidden and something retains the pacer. It knows nothing about either protocol.
+  // present event for prediction, and emits one refresh signal while something retains it (a manager with work to do):
+  // after each frame done for that output, on a timer while the surface is hidden, and from a stall watchdog while it
+  // is visible but its output has produced no frame for kStallRefreshPeriods periods. It knows nothing about either
+  // protocol.
   //
   // A frame done arrives inside the scene's frame-done tree walk, and a refresh listener may unlock commits whose
   // role handlers reparent or destroy scene nodes, so the refresh for a frame done is emitted from an idle source
@@ -60,7 +65,7 @@ namespace umbriel {
 
     // Asks the pacing output for a frame, so a refresh arrives even when nothing else redraws. No-op while hidden.
     void requestFrame();
-    // While at least one retain is outstanding and the surface is hidden, the hidden tick emits refresh.
+    // Refreshes are emitted only while at least one retain is outstanding; managers retain while they have work.
     void retain();
     void release();
 
@@ -82,6 +87,7 @@ namespace umbriel {
     static void onOutputDestroy(wl_listener* listener, void* data);
     static int onHiddenTick(void* data);
     static void onDeferredRefresh(void* data);
+    static int onStallWatchdog(void* data);
 
     void handleOutputChange();
     void handleFrameDone(void* data);
@@ -89,12 +95,15 @@ namespace umbriel {
     void handleOutputDestroy();
     void handleHiddenTick();
     void handleDeferredRefresh();
+    void handleStallWatchdog();
 
     // Moves the present and destroy subscriptions to `output`, which becomes output().
     void setOutput(wlr_output* output);
-    // Arms the hidden tick while retained and hidden, disarms it otherwise.
-    void updateHiddenTick();
+    // Arms the hidden tick while retained and hidden, disarms it otherwise; arms the stall watchdog while retained and
+    // visible. The watchdog is never disarmed early: once it fires it re-checks and stays unarmed if not needed.
+    void updateTimers();
     void armHiddenTick();
+    void armStallWatchdog(Nanoseconds delay);
 
     std::unique_ptr<Addon> m_addon;
     umbrielfx_surface_pacing* m_pacing = nullptr;
@@ -110,6 +119,10 @@ namespace umbriel {
     wl_event_loop* m_eventLoop = nullptr;
     wl_event_source* m_hiddenTick = nullptr;
     bool m_hiddenTickArmed = false;
+    wl_event_source* m_stallWatchdog = nullptr;
+    bool m_stallWatchdogArmed = false;
+    // The latest refresh instant (frame done or watchdog), or when the pacer was last retained if that is later.
+    Nanoseconds m_lastRefreshAt = 0;
     // The idle source that emits the latest frame done's refresh, and that refresh; the source is null when none is
     // due.
     wl_event_source* m_deferredRefresh = nullptr;

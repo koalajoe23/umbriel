@@ -9,9 +9,10 @@ namespace umbriel {
   class SurfacePacer;
   struct PacerRefreshEvent;
 
-  // A protocol object's hold on its surface's SurfacePacer: retains the pacer, so a hidden surface keeps ticking,
-  // and forwards its refreshes to the owner until released. If the pacer goes first, the subscription unlinks and
-  // never touches it again; pacer() is then null.
+  // A protocol object's hold on its surface's SurfacePacer: forwards the pacer's refreshes to the owner until released,
+  // and retains the pacer while the owner says it has work (setRetained), so a pacer with nothing to do emits nothing
+  // and runs no timer. It holds at most one retain, and drops it on every way out. If the pacer goes first, the
+  // subscription unlinks and never touches it again; pacer() is then null.
   class PacerSubscription {
   public:
     using RefreshHandler = void (*)(void* owner, const PacerRefreshEvent& event);
@@ -22,12 +23,14 @@ namespace umbriel {
     PacerSubscription(const PacerSubscription&) = delete;
     PacerSubscription& operator=(const PacerSubscription&) = delete;
 
-    // Finds or creates the surface's pacer, retains it, and subscribes. False, with nothing held, when the pacer
-    // cannot be allocated. Call it before adding the owner's own surface addon, so on surface teardown that (newer)
-    // addon goes first and the pacer is still alive when the owner releases it.
+    // Finds or creates the surface's pacer and subscribes, without retaining it. False, with nothing held, when the
+    // pacer cannot be allocated. Call it before adding the owner's own surface addon, so on surface teardown that
+    // (newer) addon goes first and the pacer is still alive when the owner releases it.
     [[nodiscard]] bool subscribe(wlr_surface* surface);
-    // Unsubscribes and drops the retain. No-op when not subscribed or once the pacer is gone.
+    // Unsubscribes and drops the retain, if held. No-op when not subscribed or once the pacer is gone.
     void release();
+    // Retains the pacer while `retained` is true, releases it once false. Idempotent; no-op when not subscribed.
+    void setRetained(bool retained);
 
     [[nodiscard]] SurfacePacer* pacer() const { return m_pacer; }
 
@@ -43,6 +46,7 @@ namespace umbriel {
     RefreshHandler m_onRefresh;
     void* m_owner;
     SurfacePacer* m_pacer = nullptr;
+    bool m_retained = false;
     wl_listener m_refresh{};
     wl_listener m_destroy{};
   };

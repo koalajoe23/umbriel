@@ -21,7 +21,6 @@ namespace umbriel {
       return false;
     }
     m_pacer = pacer;
-    m_pacer->retain();
     m_refresh.notify = onRefresh;
     wl_signal_add(&m_pacer->events.refresh, &m_refresh);
     m_destroy.notify = onDestroy;
@@ -34,8 +33,20 @@ namespace umbriel {
       return;
     }
     unlink();
-    m_pacer->release();
+    setRetained(false);
     m_pacer = nullptr;
+  }
+
+  void PacerSubscription::setRetained(bool retained) {
+    if (m_pacer == nullptr || retained == m_retained) {
+      return;
+    }
+    m_retained = retained;
+    if (retained) {
+      m_pacer->retain();
+    } else {
+      m_pacer->release();
+    }
   }
 
   void PacerSubscription::onRefresh(wl_listener* listener, void* data) {
@@ -57,6 +68,7 @@ namespace umbriel {
   void PacerSubscription::handleDestroy() {
     unlink();
     m_pacer = nullptr;
+    m_retained = false;
   }
 
   void PacerSubscription::unlink() {

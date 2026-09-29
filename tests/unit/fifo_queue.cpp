@@ -138,4 +138,37 @@ UMBRIEL_TEST(appliedSetterRetiresInFlight) {
   CHECK(!queue.shouldHold(true, false));
 }
 
+// Idle: nothing for a refresh to do, so the manager lets the pacer stop ticking.
+
+UMBRIEL_TEST(idleUntilWorkArrives) {
+  FifoQueue queue;
+  CHECK(queue.idle());
+  queue.committed(false);
+  CHECK(queue.idle());
+}
+
+UMBRIEL_TEST(busyWhileBarrierSet) {
+  FifoQueue queue;
+  queue.committed(true);
+  queue.applied(true);
+  CHECK(!queue.idle());
+  CHECK(queue.refresh().empty());
+  CHECK(queue.idle());
+}
+
+UMBRIEL_TEST(busyWhileSetterInFlight) {
+  FifoQueue queue;
+  queue.committed(true);
+  CHECK(!queue.idle());
+}
+
+UMBRIEL_TEST(busyWhileHolding) {
+  FifoQueue queue;
+  queue.hold({1, false});
+  queue.committed(false);
+  CHECK(!queue.idle());
+  CHECK_EQ(queue.drain(), (std::vector<std::uint32_t>{1}));
+  CHECK(queue.idle());
+}
+
 int main() { return RUN_TESTS(); }

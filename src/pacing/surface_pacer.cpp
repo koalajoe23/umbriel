@@ -3,6 +3,7 @@
 #include "pacing/pacing_clock.h"
 #include "wlr.h"
 
+#include <algorithm>
 #include <cassert>
 #include <ctime>
 #include <new>
@@ -71,6 +72,7 @@ namespace umbriel {
     wl_display* display = wl_client_get_display(wl_resource_get_client(surface->resource));
     m_eventLoop = wl_display_get_event_loop(display);
     m_hiddenTick = wl_event_loop_add_timer(m_eventLoop, onHiddenTick, this);
+    m_stallWatchdog = wl_event_loop_add_timer(m_eventLoop, onStallWatchdog, this);
 
     setOutput(pacing->output);
   }
@@ -85,6 +87,9 @@ namespace umbriel {
     wl_list_remove(&m_outputDestroy.link);
     if (m_hiddenTick != nullptr) {
       wl_event_source_remove(m_hiddenTick);
+    }
+    if (m_stallWatchdog != nullptr) {
+      wl_event_source_remove(m_stallWatchdog);
     }
     if (m_deferredRefresh != nullptr) {
       wl_event_source_remove(m_deferredRefresh);
@@ -106,8 +111,11 @@ namespace umbriel {
   }
 
   void SurfacePacer::retain() {
-    ++m_retainCount;
-    updateHiddenTick();
+    if (m_retainCount++ == 0) {
+      // The watchdog's grace starts when work does, not at a frame long before it.
+      m_lastRefreshAt = std::max(m_lastRefreshAt, monotonicNow());
+    }
+    updateTimers();
   }
 
   void SurfacePacer::release() {
@@ -115,7 +123,7 @@ namespace umbriel {
     if (m_retainCount > 0) {
       --m_retainCount;
     }
-    updateHiddenTick();
+    updateTimers();
   }
 
   void SurfacePacer::onOutputChange(wl_listener* listener, void* /*data*/) {
@@ -156,6 +164,11 @@ namespace umbriel {
 
   void SurfacePacer::onDeferredRefresh(void* data) { static_cast<SurfacePacer*>(data)->handleDeferredRefresh(); }
 
+  int SurfacePacer::onStallWatchdog(void* data) {
+    static_cast<SurfacePacer*>(data)->handleStallWatchdog();
+    return 0;
+  }
+
   void SurfacePacer::handleOutputChange() { setOutput(m_pacing->output); }
 
   void SurfacePacer::handleFrameDone(void* data) {
@@ -167,6 +180,12 @@ namespace umbriel {
     // prediction is taken now, before this frame's own present can be recorded. Two frame dones before the idle runs
     // collapse into one refresh for the later one.
     const Nanoseconds when = toNanoseconds(*event->when);
+    m_lastRefreshAt = std::max(m_lastRefreshAt, when);
+    if (m_retainCount == 0) {
+      // Nothing to do this frame; the serial still counts the instant.
+      ++m_refreshSerial;
+      return;
+    }
     m_deferredEvent = PacerRefreshEvent{
         .when = when,
         .hidden = false,
@@ -181,6 +200,9 @@ namespace umbriel {
   void SurfacePacer::handleDeferredRefresh() {
     // An idle source is freed once it has run.
     m_deferredRefresh = nullptr;
+    if (m_retainCount == 0) {
+      return;
+    }
     PacerRefreshEvent refresh = m_deferredEvent;
     wl_signal_emit_mutable(&events.refresh, &refresh);
   }
@@ -226,15 +248,20 @@ namespace umbriel {
       m_lastPresentRefresh = 0;
       m_lastOutputRefreshMhz = output->refresh;
       m_hadOutput = true;
+      // The new output's frames are awaited from now on.
+      m_lastRefreshAt = std::max(m_lastRefreshAt, monotonicNow());
       m_outputPresent.notify = onOutputPresent;
       wl_signal_add(&output->events.present, &m_outputPresent);
       m_outputDestroy.notify = onOutputDestroy;
       wl_signal_add(&output->events.destroy, &m_outputDestroy);
     }
-    updateHiddenTick();
+    updateTimers();
   }
 
-  void SurfacePacer::updateHiddenTick() {
+  void SurfacePacer::updateTimers() {
+    if (m_output != nullptr && m_retainCount > 0 && !m_stallWatchdogArmed) {
+      armStallWatchdog(stallRefreshDelay(m_lastRefreshAt, period(), monotonicNow()));
+    }
     if (m_output == nullptr && m_retainCount > 0) {
       if (!m_hiddenTickArmed) {
         armHiddenTick();
@@ -245,6 +272,35 @@ namespace umbriel {
       wl_event_source_timer_update(m_hiddenTick, 0);
     }
     m_hiddenTickArmed = false;
+  }
+
+  // The output has produced no frame done for kStallRefreshPeriods periods while a manager has work: its frames may
+  // have stopped altogether (Output::handleFrame renders nothing while the session has lost the DRM device), so the
+  // pacer refreshes on its own to keep held commits draining. Frames resuming push the deadline out again.
+  void SurfacePacer::handleStallWatchdog() {
+    m_stallWatchdogArmed = false;
+    if (m_output == nullptr || m_retainCount == 0) {
+      return;
+    }
+    const Nanoseconds now = monotonicNow();
+    const Nanoseconds delay = stallRefreshDelay(m_lastRefreshAt, period(), now);
+    if (delay > 0) {
+      armStallWatchdog(delay);
+      return;
+    }
+    m_lastRefreshAt = now;
+    // Re-armed before emitting; a listener that releases the pacer lets it lapse.
+    armStallWatchdog(stallRefreshInterval(period()));
+    PacerRefreshEvent refresh{.when = now, .hidden = true, .releasePresent = now, .serial = ++m_refreshSerial};
+    wl_signal_emit_mutable(&events.refresh, &refresh);
+  }
+
+  void SurfacePacer::armStallWatchdog(Nanoseconds delay) {
+    if (m_stallWatchdog == nullptr) {
+      return;
+    }
+    wl_event_source_timer_update(m_stallWatchdog, timerDelayMsecNotBefore(delay));
+    m_stallWatchdogArmed = true;
   }
 
   void SurfacePacer::armHiddenTick() {

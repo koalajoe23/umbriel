@@ -13,6 +13,9 @@ namespace umbriel {
   inline constexpr Nanoseconds kHiddenFallbackRefreshNsec = 25'000'000; // 40 Hz
   // How many periods a recorded present stays a trustworthy phase for prediction (see `predictReleaseFramePresent`).
   inline constexpr Nanoseconds kPredictionFreshPeriods = 2;
+  // How many periods a working pacer may go without a refresh before its stall watchdog emits one (see
+  // `stallRefreshDelay`).
+  inline constexpr Nanoseconds kStallRefreshPeriods = 4;
   // Tolerance layer over the strict rule (see `timedCommitDue`): period / kCommitTimingEarlyToleranceDivisor.
   inline constexpr Nanoseconds kCommitTimingEarlyToleranceDivisor = 4;
 
@@ -50,5 +53,13 @@ namespace umbriel {
   // When to wake up and start rendering a frame aimed at `target`: two periods early, to cover both composition and
   // the client's own render time.
   [[nodiscard]] Nanoseconds frameWakeup(Nanoseconds target, Nanoseconds period);
+
+  // How long a working, visible pacer goes without a refresh before it emits one itself: kStallRefreshPeriods periods.
+  // fifo-v1 lets the compositor clear a barrier early to ensure client forward progress, which covers an output that
+  // stops producing frames (a session that lost its DRM device renders nothing until it is back).
+  [[nodiscard]] Nanoseconds stallRefreshInterval(Nanoseconds period);
+
+  // How long from `now` until the stall watchdog is due, given the last refresh at `lastRefresh`; 0 once overdue.
+  [[nodiscard]] Nanoseconds stallRefreshDelay(Nanoseconds lastRefresh, Nanoseconds period, Nanoseconds now);
 
 } // namespace umbriel

@@ -41,6 +41,8 @@ namespace umbriel {
     [[nodiscard]] std::vector<std::uint32_t> drain();
     [[nodiscard]] bool barrier() const { return m_barrier; }
     [[nodiscard]] bool empty() const { return m_queue.empty(); }
+    // Nothing a refresh would change: no barrier, no held commit, no setter in flight.
+    [[nodiscard]] bool idle() const { return !m_barrier && m_queue.empty() && m_inFlightSetters.empty(); }
 
   private:
     // A held commit and its position in commit order.

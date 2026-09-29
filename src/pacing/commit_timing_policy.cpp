@@ -52,4 +52,11 @@ namespace umbriel {
 
   Nanoseconds frameWakeup(Nanoseconds target, Nanoseconds period) { return target - 2 * period; }
 
+  Nanoseconds stallRefreshInterval(Nanoseconds period) { return kStallRefreshPeriods * period; }
+
+  Nanoseconds stallRefreshDelay(Nanoseconds lastRefresh, Nanoseconds period, Nanoseconds now) {
+    const Nanoseconds remaining = lastRefresh + stallRefreshInterval(period) - now;
+    return remaining > 0 ? remaining : 0;
+  }
+
 } // namespace umbriel

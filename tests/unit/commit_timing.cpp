@@ -54,6 +54,22 @@ UMBRIEL_TEST(hiddenTickUsesLastPeriod) {
 
 UMBRIEL_TEST(wakeupTwoPeriodsEarly) { CHECK_EQ(frameWakeup(1'000'000'000, 10'000'000), 980'000'000); }
 
+UMBRIEL_TEST(stallRefreshAfterFourPeriods) {
+  CHECK_EQ(kStallRefreshPeriods, 4);
+  CHECK_EQ(stallRefreshInterval(16'666'667), 66'666'668);
+}
+
+UMBRIEL_TEST(stallRefreshDelayCountsFromLastRefresh) {
+  // Right after a refresh the watchdog waits the whole interval; later, only what is left of it.
+  CHECK_EQ(stallRefreshDelay(1'000'000'000, 10'000'000, 1'000'000'000), 40'000'000);
+  CHECK_EQ(stallRefreshDelay(1'000'000'000, 10'000'000, 1'015'000'000), 25'000'000);
+}
+
+UMBRIEL_TEST(stallRefreshDelayZeroOnceOverdue) {
+  CHECK_EQ(stallRefreshDelay(1'000'000'000, 10'000'000, 1'040'000'000), 0);
+  CHECK_EQ(stallRefreshDelay(1'000'000'000, 10'000'000, 2'000'000'000), 0);
+}
+
 // Tolerance group: deleted along with `commitTimingEarlyTolerance` and `timedCommitDue` if the tolerance layer is
 // removed.
 
