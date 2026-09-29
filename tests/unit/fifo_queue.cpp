@@ -18,6 +18,16 @@ UMBRIEL_TEST(ignoresSynchronizedSubsurface) {
   CHECK(!queue.shouldHold(true, true));
 }
 
+UMBRIEL_TEST(appliedWithoutBarrierKeepsBarrier) {
+  // `applied` arms the barrier; it must not disarm it. A later commit that did not itself set the barrier is not
+  // proof the barrier was released, so it must not clear a barrier still awaiting its refresh.
+  FifoQueue queue;
+  queue.applied(true);
+  queue.applied(false);
+  CHECK(queue.barrier());
+  CHECK(queue.shouldHold(true, false));
+}
+
 UMBRIEL_TEST(ignoresCommitsWithoutWait) {
   FifoQueue queue;
   queue.applied(true);

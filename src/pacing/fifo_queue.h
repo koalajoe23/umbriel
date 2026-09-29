@@ -17,8 +17,9 @@ namespace umbriel {
   // a drain releases. Holds no wlroots state; a manager on top applies the hold and unlocks released seqs.
   class FifoQueue {
   public:
-    // A commit waits when it requested `wait_barrier` and a barrier is currently set. Synchronized subsurfaces never
-    // wait: their parent's commit already carries them.
+    // A commit waits when it requested `wait_barrier` and either a barrier is currently set, or older commits are
+    // already queued (clearing the barrier does not let a new commit cut ahead of them). Synchronized subsurfaces
+    // never wait: their parent's commit already carries them.
     [[nodiscard]] bool shouldHold(bool waitBarrier, bool synchronizedSubsurface) const;
     void hold(HeldCommit commit);
     // Records whether the commit that just applied set the barrier, arming it for the next refresh.
