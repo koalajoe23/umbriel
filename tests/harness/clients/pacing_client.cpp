@@ -3,7 +3,8 @@
 //   mapped                          the toplevel's first buffer is committed
 //   refresh-mhz <n>                 a wl_output's current mode refresh rate
 //   presented <index> <nsec>        commit <index> was presented at <nsec> (CLOCK_MONOTONIC)
-//   discarded <index>               commit <index> was never presented
+//   discarded <index> <nsec>        commit <index> was never presented; <nsec> is when that was reported
+//                                   (CLOCK_MONOTONIC)
 //   target <index> <nsec>           commit <index> carries a commit-timing target of <nsec>
 //   protocol-error <interface> <code>
 //   done                            every commit of a burst has resolved its feedback
@@ -28,6 +29,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <format>
 #include <optional>
 #include <poll.h>
@@ -212,7 +214,10 @@ namespace {
 
   void feedbackDiscarded(void* data, struct wp_presentation_feedback* /*feedback*/) {
     auto* entry = static_cast<Feedback*>(data);
-    logLine(std::format("discarded {}", entry->index));
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const auto nsec = (static_cast<uint64_t>(now.tv_sec) * 1'000'000'000ULL) + static_cast<uint64_t>(now.tv_nsec);
+    logLine(std::format("discarded {} {}", entry->index, nsec));
     finishFeedback(entry);
   }
 
