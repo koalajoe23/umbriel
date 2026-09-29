@@ -2,13 +2,13 @@
 
 #include "commit-timing-v1-server-protocol.h"
 #include "pacing/commit_timing_policy.h"
+#include "pacing/pacer_subscription.h"
+#include "pacing/pacing_clock.h"
+#include "pacing/protocol_global.h"
 #include "pacing/surface_pacer.h"
 #include "wlr.h"
 
-#include <algorithm>
-#include <climits>
 #include <cstdint>
-#include <ctime>
 #include <deque>
 #include <limits>
 #include <new>
@@ -20,8 +20,6 @@ namespace umbriel {
   namespace {
 
     constexpr uint32_t kProtocolVersion = 1;
-    constexpr Nanoseconds kNsecPerSec = 1'000'000'000;
-    constexpr Nanoseconds kNsecPerMsec = 1'000'000;
 
     // The commit-timing-v1 part of one content update, double-buffered with the surface state.
     struct TimingState {
@@ -45,12 +43,6 @@ namespace umbriel {
         .commit = nullptr,
     };
 
-    Nanoseconds monotonicNow() {
-      timespec now{};
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      return (static_cast<Nanoseconds>(now.tv_sec) * kNsecPerSec) + now.tv_nsec;
-    }
-
     // The request's split seconds and nanoseconds as one CLOCK_MONOTONIC value, saturating at the far future.
     Nanoseconds timestampFrom(uint32_t secHi, uint32_t secLo, uint32_t nsec) {
       const uint64_t seconds = (static_cast<uint64_t>(secHi) << 32U) | secLo;
@@ -59,14 +51,6 @@ namespace umbriel {
         return std::numeric_limits<Nanoseconds>::max();
       }
       return (static_cast<Nanoseconds>(seconds) * kNsecPerSec) + nsec;
-    }
-
-    // wl_event_source timers count whole milliseconds; the delay rounds up, so the timer never fires before the
-    // instant it was armed for (a hidden release at its target is then never early), at most a millisecond late. It
-    // is never 0, which disarms, and saturates; a timer that fires before a far target just re-arms.
-    int timerDelayMsec(Nanoseconds delay) {
-      const Nanoseconds msec = (std::max<Nanoseconds>(delay, 0) + kNsecPerMsec - 1) / kNsecPerMsec;
-      return static_cast<int>(std::clamp<Nanoseconds>(msec, 1, INT_MAX));
     }
 
     // One commit held for its timestamp.
@@ -82,10 +66,8 @@ namespace umbriel {
     // state drops its queue without unlocking and stays inert until the client destroys the resource.
     class CommitTimer {
     public:
-      CommitTimer(wl_resource* resource, wlr_surface* surface) : m_resource(resource), m_surface(surface) {
-        wl_list_init(&m_pacerRefresh.link);
-        wl_list_init(&m_pacerDestroy.link);
-      }
+      CommitTimer(wl_resource* resource, wlr_surface* surface)
+          : m_resource(resource), m_surface(surface), m_pacer(onPacerRefresh, this) {}
 
       CommitTimer(const CommitTimer&) = delete;
       CommitTimer& operator=(const CommitTimer&) = delete;
@@ -94,31 +76,23 @@ namespace umbriel {
       // Hooks the timer into its surface. False, with nothing hooked, when the synced state or the event source
       // cannot be allocated.
       bool attach() {
-        // The pacer is found or created before the addon, so on surface teardown this (newer) addon goes first
-        // and the pacer is still alive when it is released.
-        SurfacePacer* pacer = nullptr;
-        try {
-          pacer = &SurfacePacer::from(m_surface);
-        } catch (const std::bad_alloc&) {
+        // Retained while the state lives, so a hidden surface keeps ticking and its queue keeps draining;
+        // subscribed before the addon is added (see PacerSubscription::subscribe).
+        if (!m_pacer.subscribe(m_surface)) {
           return false;
         }
         wl_display* display = wl_client_get_display(wl_resource_get_client(m_surface->resource));
         m_timer = wl_event_loop_add_timer(wl_display_get_event_loop(display), onTimer, this);
         if (m_timer == nullptr) {
+          m_pacer.release();
           return false;
         }
         if (!wlr_surface_synced_init(&m_synced, m_surface, &kSyncedImpl, &m_pending, &m_current)) {
           wl_event_source_remove(m_timer);
           m_timer = nullptr;
+          m_pacer.release();
           return false;
         }
-        // Retained while the timer lives, so a hidden surface keeps ticking and its queue keeps draining.
-        m_pacer = pacer;
-        m_pacer->retain();
-        m_pacerRefresh.notify = onPacerRefresh;
-        wl_signal_add(&m_pacer->events.refresh, &m_pacerRefresh);
-        m_pacerDestroy.notify = onPacerDestroy;
-        wl_signal_add(&m_pacer->events.destroy, &m_pacerDestroy);
 
         wlr_addon_init(&m_addon, &m_surface->addons, &kAddonInterface, &kAddonInterface);
         m_clientCommit.notify = onClientCommit;
@@ -170,8 +144,6 @@ namespace umbriel {
         timer->m_pending.target = timestampFrom(secHi, secLo, nsec);
       }
 
-      static void handleDestroy(wl_client* /*client*/, wl_resource* resource) { wl_resource_destroy(resource); }
-
       // The resource is gone, by request or with its client. The protocol leaves existing timing constraints
       // unaffected, so held commits (and a timestamp set for the next commit) keep the state alive until they are
       // released by the normal rules.
@@ -199,16 +171,9 @@ namespace umbriel {
         timer->handleClientCommit();
       }
 
-      static void onPacerRefresh(wl_listener* listener, void* data) {
-        CommitTimer* timer = nullptr;
-        timer = wl_container_of(listener, timer, m_pacerRefresh);
-        timer->handlePacerRefresh(*static_cast<const PacerRefreshEvent*>(data));
-      }
-
-      static void onPacerDestroy(wl_listener* listener, void* /*data*/) {
-        CommitTimer* timer = nullptr;
-        timer = wl_container_of(listener, timer, m_pacerDestroy);
-        timer->handlePacerDestroy();
+      // May free the state (freeIfDone); the subscription touches nothing after forwarding.
+      static void onPacerRefresh(void* owner, const PacerRefreshEvent& event) {
+        static_cast<CommitTimer*>(owner)->handlePacerRefresh(event);
       }
 
       static int onTimer(void* data) {
@@ -216,7 +181,7 @@ namespace umbriel {
         return 0;
       }
 
-      [[nodiscard]] bool visible() const { return m_pacer != nullptr && m_pacer->output() != nullptr; }
+      [[nodiscard]] bool visible() const { return m_pacer.pacer() != nullptr && m_pacer.pacer()->output() != nullptr; }
 
       // A commit with a timestamp is held for it, behind any older held commit. A synchronized subsurface's commit is
       // held too: the protocol makes no exception, and wlroots applies the cached state only once both the parent's
@@ -238,8 +203,10 @@ namespace umbriel {
         if (event.hidden) {
           releaseWhile([&](Nanoseconds target) { return target <= event.when; });
         } else {
-          const Nanoseconds framePresent = m_pacer->predictReleaseFramePresent(event.when);
-          const Nanoseconds period = m_pacer->period();
+          // A visible refresh comes from the pacer, so it is there.
+          const SurfacePacer& pacer = *m_pacer.pacer();
+          const Nanoseconds framePresent = pacer.predictReleaseFramePresent(event.when);
+          const Nanoseconds period = pacer.period();
           releaseWhile([&](Nanoseconds target) { return timedCommitDue(target, framePresent, period); });
         }
         if (freeIfDone()) {
@@ -255,7 +222,7 @@ namespace umbriel {
       void handleTimer() {
         m_timerArmed = false;
         if (visible()) {
-          m_pacer->requestFrame();
+          m_pacer.pacer()->requestFrame();
           return;
         }
         const Nanoseconds now = monotonicNow();
@@ -264,12 +231,6 @@ namespace umbriel {
           return;
         }
         schedule();
-      }
-
-      // The pacer normally outlives this addon; if it goes first, stop listening and never touch it again.
-      void handlePacerDestroy() {
-        detachPacer();
-        m_pacer = nullptr;
       }
 
       // The surface is being destroyed: its cached states, held commits included, go with it, so the queue is
@@ -326,17 +287,18 @@ namespace umbriel {
           armTimer(target - now);
           return;
         }
-        const Nanoseconds wakeup = frameWakeup(target, m_pacer->period());
+        SurfacePacer& pacer = *m_pacer.pacer();
+        const Nanoseconds wakeup = frameWakeup(target, pacer.period());
         if (wakeup <= now) {
           disarmTimer();
-          m_pacer->requestFrame();
+          pacer.requestFrame();
           return;
         }
         armTimer(wakeup - now);
       }
 
       void armTimer(Nanoseconds delay) {
-        wl_event_source_timer_update(m_timer, timerDelayMsec(delay));
+        wl_event_source_timer_update(m_timer, timerDelayMsecNotBefore(delay));
         m_timerArmed = true;
       }
 
@@ -347,20 +309,9 @@ namespace umbriel {
         }
       }
 
-      void detachPacer() {
-        wl_list_remove(&m_pacerRefresh.link);
-        wl_list_init(&m_pacerRefresh.link);
-        wl_list_remove(&m_pacerDestroy.link);
-        wl_list_init(&m_pacerDestroy.link);
-      }
-
       // Unhooks the timer from its surface, leaving it inert.
       void detach() {
-        if (m_pacer != nullptr) {
-          detachPacer();
-          m_pacer->release();
-          m_pacer = nullptr;
-        }
+        m_pacer.release();
         wl_event_source_remove(m_timer);
         m_timer = nullptr;
         m_timerArmed = false;
@@ -372,7 +323,7 @@ namespace umbriel {
 
       wl_resource* m_resource = nullptr;
       wlr_surface* m_surface = nullptr;
-      SurfacePacer* m_pacer = nullptr;
+      PacerSubscription m_pacer;
       std::deque<TimedCommit> m_queue;
       wl_event_source* m_timer = nullptr;
       bool m_timerArmed = false;
@@ -381,33 +332,22 @@ namespace umbriel {
       TimingState m_pending;
       TimingState m_current;
       wl_listener m_clientCommit{};
-      wl_listener m_pacerRefresh{};
-      wl_listener m_pacerDestroy{};
     };
 
     const struct wp_commit_timer_v1_interface CommitTimer::kImplementation = {
         .set_timestamp = CommitTimer::handleSetTimestamp,
-        .destroy = CommitTimer::handleDestroy,
+        .destroy = handleDestroyRequest,
     };
 
   } // namespace
 
   struct CommitTimingManager::Impl {
-    wl_global* global = nullptr;
+    explicit Impl(wl_display* display) : global(display, kGlobalSpec) {}
 
     static const struct wp_commit_timing_manager_v1_interface kImplementation;
+    static const ProtocolGlobalSpec kGlobalSpec;
 
-    static void handleBind(wl_client* client, void* /*data*/, uint32_t version, uint32_t id) {
-      wl_resource* resource =
-          wl_resource_create(client, &wp_commit_timing_manager_v1_interface, std::min(version, kProtocolVersion), id);
-      if (resource == nullptr) {
-        wl_client_post_no_memory(client);
-        return;
-      }
-      wl_resource_set_implementation(resource, &kImplementation, nullptr, nullptr);
-    }
-
-    static void handleDestroy(wl_client* /*client*/, wl_resource* resource) { wl_resource_destroy(resource); }
+    ProtocolGlobal global;
 
     static void handleGetTimer(wl_client* client, wl_resource* manager, uint32_t id, wl_resource* surfaceResource) {
       wlr_surface* surface = wlr_surface_from_resource(surfaceResource);
@@ -448,21 +388,20 @@ namespace umbriel {
   };
 
   const struct wp_commit_timing_manager_v1_interface CommitTimingManager::Impl::kImplementation = {
-      .destroy = CommitTimingManager::Impl::handleDestroy,
+      .destroy = handleDestroyRequest,
       .get_timer = CommitTimingManager::Impl::handleGetTimer,
   };
 
-  CommitTimingManager::CommitTimingManager(wl_display* display) : m_impl(std::make_unique<Impl>()) {
-    m_impl->global =
-        wl_global_create(display, &wp_commit_timing_manager_v1_interface, kProtocolVersion, nullptr, Impl::handleBind);
-  }
+  const ProtocolGlobalSpec CommitTimingManager::Impl::kGlobalSpec = {
+      .interface = &wp_commit_timing_manager_v1_interface,
+      .version = kProtocolVersion,
+      .implementation = &CommitTimingManager::Impl::kImplementation,
+  };
 
-  CommitTimingManager::~CommitTimingManager() {
-    if (m_impl->global != nullptr) {
-      wl_global_destroy(m_impl->global);
-    }
-  }
+  CommitTimingManager::CommitTimingManager(wl_display* display) : m_impl(std::make_unique<Impl>(display)) {}
 
-  bool CommitTimingManager::valid() const { return m_impl->global != nullptr; }
+  CommitTimingManager::~CommitTimingManager() = default;
+
+  bool CommitTimingManager::valid() const { return m_impl->global.valid(); }
 
 } // namespace umbriel

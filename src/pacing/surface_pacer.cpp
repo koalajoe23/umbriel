@@ -1,8 +1,8 @@
 #include "pacing/surface_pacer.h"
 
+#include "pacing/pacing_clock.h"
 #include "wlr.h"
 
-#include <algorithm>
 #include <cassert>
 #include <ctime>
 #include <new>
@@ -10,21 +10,6 @@
 namespace umbriel {
 
   namespace {
-
-    Nanoseconds toNanoseconds(const timespec& time) {
-      return (static_cast<Nanoseconds>(time.tv_sec) * 1'000'000'000) + time.tv_nsec;
-    }
-
-    Nanoseconds monotonicNow() {
-      timespec now{};
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      return toNanoseconds(now);
-    }
-
-    // wl_event_source timers count whole milliseconds; never arm one at 0, which disarms it.
-    int timerDelayMsec(Nanoseconds interval) {
-      return static_cast<int>(std::max<Nanoseconds>(1, (interval + 500'000) / 1'000'000));
-    }
 
     void detach(wl_listener& listener) {
       wl_list_remove(&listener.link);
@@ -249,7 +234,7 @@ namespace umbriel {
     if (m_hiddenTick == nullptr) {
       return;
     }
-    wl_event_source_timer_update(m_hiddenTick, timerDelayMsec(hiddenTickInterval(lastKnownPeriod())));
+    wl_event_source_timer_update(m_hiddenTick, timerDelayMsecNearest(hiddenTickInterval(lastKnownPeriod())));
     m_hiddenTickArmed = true;
   }
 
