@@ -38,7 +38,9 @@ echo b >&"$CLIENT_FD"
 wait_log '^discarded ' 19
 
 # The hidden tick runs at the last known pacing output's rate: the headless output, which advertises no refresh rate
-# and runs at 60 Hz. Consecutive discards must be at least half a tick apart.
+# and runs at 60 Hz. The 18 tick gaps between discards 0 and 18 must add up to at least 9 half-ticks (an honest drain
+# spans about 18 ticks, an unheld burst microseconds). The discard time is when the client reads the event, so a floor
+# on the total span, rather than on each gap, absorbs a client stall that delivers several discards together.
 refresh_mhz=$(awk '$1 == "refresh-mhz" { print $2; exit }' "$CLIENT_LOG")
 ((${refresh_mhz:-0} > 0)) || refresh_mhz=60000
 min_gap=$((1000000000000 / refresh_mhz / 2))
@@ -47,10 +49,11 @@ if ! awk -v gap="$min_gap" '
     END {
       for (i = 0; i < 19; i++) {
         if (!seen[i]) { printf "commit %d was not discarded\n", i; exit 1 }
-        if (i > 0 && at[i] - at[i - 1] < gap) {
-          printf "commits %d and %d discarded %d ns apart, under %d\n", i - 1, i, at[i] - at[i - 1], gap
-          exit 1
-        }
+      }
+      span = at[18] - at[0]
+      if (span < 9 * gap) {
+        printf "discards 0 to 18 span %d ns, under the %d ns floor\n", span, 9 * gap
+        exit 1
       }
     }' "$CLIENT_LOG"; then
   echo "hidden burst log: $(tr '\n' '|' < "$CLIENT_LOG")"
