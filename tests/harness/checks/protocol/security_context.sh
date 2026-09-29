@@ -23,6 +23,8 @@ readonly -a NORMAL_GLOBALS=(
   wp_presentation
   wp_tearing_control_manager_v1
   wp_content_type_manager_v1
+  wp_fifo_manager_v1
+  wp_commit_timing_manager_v1
   wl_output
   xdg_wm_base
   xdg_toplevel_tag_manager_v1
