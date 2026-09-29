@@ -655,6 +655,7 @@ core_sources = files(
   'src/scene/text_buffer.cpp',
   'src/lock/session_lock.cpp',
   'src/overview/overview.cpp',
+  'src/pacing/fifo_manager.cpp',
   'src/pacing/pacing.cpp',
   'src/pacing/surface_pacer.cpp',
   'src/workspace/workspace.cpp',

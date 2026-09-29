@@ -8,7 +8,13 @@
 //   protocol-error <interface> <code>
 //   done                            every commit of a burst has resolved its feedback
 // Single-character commands on stdin start bursts; what each one does depends on the mode.
-// Usage: pacing-client <mode> [args]. Modes: map (maps, logs "mapped", idles).
+// Usage: pacing-client <mode> [args]. Modes:
+//   map                      maps, logs "mapped", idles
+//   fifo <count>             binds a wp_fifo_v1; on "b", <count> commits back to back, each with set_barrier and
+//                            wait_barrier and no frame callback, then "done" once all their feedback resolved
+//   fifo-duplicate           asks for two wp_fifo_v1 objects for the surface, which is a protocol error
+//   fifo-destroy-mid <count> as fifo, but destroys the wp_fifo_v1 right after the burst and commits once more
+// Exits non-zero, after a message on stderr, when it cannot produce a commit it was asked for.
 
 #include "commit-timing-v1-client-protocol.h"
 #include "fifo-v1-client-protocol.h"
@@ -18,14 +24,18 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <format>
+#include <optional>
 #include <poll.h>
 #include <print>
 #include <span>
 #include <string_view>
 #include <sys/mman.h>
+#include <system_error>
 #include <unistd.h>
 #include <vector>
 #include <wayland-client.h>
@@ -34,6 +44,11 @@ namespace {
 
   // Buffers stay small whatever size the window is configured to: a burst keeps one buffer per held commit alive.
   constexpr int kBufferSize = 64;
+  constexpr int kBufferStride = kBufferSize * 4;
+  constexpr size_t kBufferBytes = static_cast<size_t>(kBufferStride) * kBufferSize;
+  // Buffer slots beyond a burst's commit count: the mapping commit's buffer, a trailing commit, and slack for
+  // releases still in flight.
+  constexpr uint32_t kSpareSlots = 4;
 
   struct State;
 
@@ -54,6 +69,13 @@ namespace {
     uint32_t index = 0;
   };
 
+  // One buffer in the client's shared-memory pool, reused once the compositor releases it.
+  struct Slot {
+    wl_buffer* buffer = nullptr;
+    uint32_t* pixels = nullptr;
+    bool busy = false;
+  };
+
   struct State {
     wl_display* display = nullptr;
     wl_compositor* compositor = nullptr;
@@ -66,9 +88,19 @@ namespace {
     wl_surface* surface = nullptr;
     xdg_surface* xdgSurface = nullptr;
     xdg_toplevel* toplevel = nullptr;
+    wp_fifo_v1* fifo = nullptr;
     const Mode* mode = nullptr;
     bool mapped = false;
     bool running = true;
+    // Set when the client could not do what it was asked; main then exits non-zero.
+    bool failed = false;
+    // Commits per burst, from the mode's arguments.
+    uint32_t burstCount = 0;
+    // Buffer slots the pool is created with; a mode that holds many commits raises it while parsing.
+    uint32_t slotCount = kSpareSlots;
+    // Created once; each slot's address is its buffer's listener data, so the vector never grows afterwards.
+    std::vector<Slot> slots;
+    uint32_t nextSlot = 0;
     // Feedback commits so far; the next one gets this index.
     uint32_t nextIndex = 0;
     // Feedback objects still waiting for presented or discarded.
@@ -90,50 +122,70 @@ namespace {
     }
   }
 
-  void bufferRelease(void* /*data*/, wl_buffer* buffer) { wl_buffer_destroy(buffer); }
+  void fail(State& state, std::string_view message) {
+    std::println(stderr, "pacing-client: {}", message);
+    state.failed = true;
+    state.running = false;
+  }
+
+  void bufferRelease(void* data, wl_buffer* /*buffer*/) { static_cast<Slot*>(data)->busy = false; }
 
   constexpr wl_buffer_listener kBufferListener = {
       .release = bufferRelease,
   };
 
-  // A fresh single-colour buffer, destroyed once the compositor releases it. The colour cycles with `seed`, so
-  // consecutive commits always carry different content and each one is damage the compositor has to present.
-  wl_buffer* createBuffer(State& state, uint32_t seed) {
-    constexpr int kStride = kBufferSize * 4;
-    constexpr size_t kBytes = static_cast<size_t>(kStride) * kBufferSize;
+  // Creates the shared-memory pool, one memfd split into state.slotCount buffers.
+  bool createBuffers(State& state) {
+    const size_t bytes = kBufferBytes * state.slotCount;
     const int fd = memfd_create("umbriel-pacing-client", MFD_CLOEXEC);
-    if (fd < 0 || ftruncate(fd, static_cast<off_t>(kBytes)) < 0) {
+    if (fd < 0 || ftruncate(fd, static_cast<off_t>(bytes)) < 0) {
       if (fd >= 0) {
         close(fd);
       }
-      return nullptr;
+      return false;
     }
-    void* pixels = mmap(nullptr, kBytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void* pixels = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (pixels == MAP_FAILED) {
       close(fd);
-      return nullptr;
+      return false;
+    }
+    wl_shm_pool* pool = wl_shm_create_pool(state.shm, fd, static_cast<int>(bytes));
+    close(fd);
+    state.slots.resize(state.slotCount);
+    for (uint32_t i = 0; i < state.slotCount; ++i) {
+      Slot& slot = state.slots[i];
+      const size_t offset = kBufferBytes * i;
+      slot.pixels = static_cast<uint32_t*>(pixels) + (offset / sizeof(uint32_t));
+      slot.buffer = wl_shm_pool_create_buffer(
+          pool, static_cast<int>(offset), kBufferSize, kBufferSize, kBufferStride, WL_SHM_FORMAT_ARGB8888
+      );
+      wl_buffer_add_listener(slot.buffer, &kBufferListener, &slot);
+    }
+    // The buffers keep the pool's memory; the mapping lives as long as the client.
+    wl_shm_pool_destroy(pool);
+    return true;
+  }
+
+  // Attaches the next free buffer, filled with a colour that cycles with `seed` so consecutive commits always carry
+  // different content the compositor has to present, and damages the whole surface, without committing.
+  bool attachNewContent(State& state, uint32_t seed) {
+    Slot* slot = nullptr;
+    for (uint32_t tried = 0; tried < state.slots.size() && slot == nullptr; ++tried) {
+      Slot& candidate = state.slots[state.nextSlot];
+      state.nextSlot = (state.nextSlot + 1) % static_cast<uint32_t>(state.slots.size());
+      if (!candidate.busy) {
+        slot = &candidate;
+      }
+    }
+    if (slot == nullptr) {
+      fail(state, std::format("all {} buffers are still held by the compositor", state.slots.size()));
+      return false;
     }
     const uint32_t channel = (seed * 37U) % 256U;
     const uint32_t color = 0xFF000000U | (channel << 16U) | ((255U - channel) << 8U) | ((seed * 91U) % 256U);
-    std::fill_n(static_cast<uint32_t*>(pixels), kBytes / sizeof(uint32_t), color);
-    munmap(pixels, kBytes);
-
-    wl_shm_pool* pool = wl_shm_create_pool(state.shm, fd, static_cast<int>(kBytes));
-    wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, kBufferSize, kBufferSize, kStride, WL_SHM_FORMAT_ARGB8888);
-    wl_shm_pool_destroy(pool);
-    close(fd);
-    wl_buffer_add_listener(buffer, &kBufferListener, nullptr);
-    return buffer;
-  }
-
-  // Attaches a new buffer and damages the whole surface, without committing.
-  bool attachNewContent(State& state, uint32_t seed) {
-    wl_buffer* buffer = createBuffer(state, seed);
-    if (buffer == nullptr) {
-      std::println(stderr, "pacing-client: failed to allocate a shared-memory buffer");
-      return false;
-    }
-    wl_surface_attach(state.surface, buffer, 0, 0);
+    std::fill_n(slot->pixels, kBufferBytes / sizeof(uint32_t), color);
+    slot->busy = true;
+    wl_surface_attach(state.surface, slot->buffer, 0, 0);
     wl_surface_damage_buffer(state.surface, 0, 0, kBufferSize, kBufferSize);
     return true;
   }
@@ -154,15 +206,13 @@ namespace {
   ) {
     auto* entry = static_cast<Feedback*>(data);
     const uint64_t seconds = (static_cast<uint64_t>(tvSecHi) << 32U) | tvSecLo;
-    std::println("presented {} {}", entry->index, seconds * 1'000'000'000ULL + tvNsec);
-    std::fflush(stdout);
+    logLine(std::format("presented {} {}", entry->index, (seconds * 1'000'000'000ULL) + tvNsec));
     finishFeedback(entry);
   }
 
   void feedbackDiscarded(void* data, struct wp_presentation_feedback* /*feedback*/) {
     auto* entry = static_cast<Feedback*>(data);
-    std::println("discarded {}", entry->index);
-    std::fflush(stdout);
+    logLine(std::format("discarded {}", entry->index));
     finishFeedback(entry);
   }
 
@@ -173,10 +223,13 @@ namespace {
   };
 
   // Attaches new content, asks for presentation feedback, and returns the commit's index. The caller adds any
-  // per-commit protocol state (fifo barriers, timestamps) and then commits with wl_surface_commit.
-  [[maybe_unused]] uint32_t prepareFeedbackCommit(State& state) {
+  // per-commit protocol state (fifo barriers, timestamps) and then commits with wl_surface_commit. Returns nothing,
+  // having failed the client, when no buffer is free.
+  std::optional<uint32_t> prepareFeedbackCommit(State& state) {
+    if (!attachNewContent(state, state.nextIndex + 1)) {
+      return std::nullopt;
+    }
     const uint32_t index = state.nextIndex++;
-    attachNewContent(state, index + 1);
     auto* entry = new Feedback{.state = &state, .feedback = nullptr, .index = index};
     entry->feedback = wp_presentation_feedback(state.presentation, state.surface);
     wp_presentation_feedback_add_listener(entry->feedback, &kFeedbackListener, entry);
@@ -190,8 +243,75 @@ namespace {
   void mappedIdle(State& /*state*/) {}
   void commandIgnored(State& /*state*/, char /*command*/) {}
 
+  // Reads a single positive commit count and sizes the buffer pool to hold that many commits at once.
+  bool parseCount(State& state, std::span<char*> args) {
+    if (args.size() != 1) {
+      return false;
+    }
+    const std::string_view text = args[0];
+    uint32_t count = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), count);
+    if (error != std::errc{} || end != text.data() + text.size() || count == 0) {
+      return false;
+    }
+    state.burstCount = count;
+    state.slotCount = count + kSpareSlots;
+    return true;
+  }
+
+  void mappedFifo(State& state) {
+    if (state.fifoManager == nullptr) {
+      fail(state, "the compositor does not advertise wp_fifo_manager_v1");
+      return;
+    }
+    state.fifo = wp_fifo_manager_v1_get_fifo(state.fifoManager, state.surface);
+  }
+
+  // Commits the burst: every commit sets a barrier and waits for the previous one's, with no frame callbacks.
+  bool commitFifoBurst(State& state) {
+    state.burstActive = true;
+    for (uint32_t i = 0; i < state.burstCount; ++i) {
+      if (!prepareFeedbackCommit(state)) {
+        return false;
+      }
+      wp_fifo_v1_set_barrier(state.fifo);
+      wp_fifo_v1_wait_barrier(state.fifo);
+      wl_surface_commit(state.surface);
+    }
+    return true;
+  }
+
+  void commandFifo(State& state, char command) {
+    if (command == 'b' && state.fifo != nullptr) {
+      commitFifoBurst(state);
+    }
+  }
+
+  void mappedFifoDuplicate(State& state) {
+    if (state.fifoManager == nullptr) {
+      fail(state, "the compositor does not advertise wp_fifo_manager_v1");
+      return;
+    }
+    state.fifo = wp_fifo_manager_v1_get_fifo(state.fifoManager, state.surface);
+    wp_fifo_manager_v1_get_fifo(state.fifoManager, state.surface);
+  }
+
+  void commandFifoDestroyMid(State& state, char command) {
+    if (command != 'b' || state.fifo == nullptr || !commitFifoBurst(state)) {
+      return;
+    }
+    wp_fifo_v1_destroy(state.fifo);
+    state.fifo = nullptr;
+    if (prepareFeedbackCommit(state)) {
+      wl_surface_commit(state.surface);
+    }
+  }
+
   constexpr std::array kModes = {
       Mode{.name = "map", .parse = parseNoArgs, .mapped = mappedIdle, .command = commandIgnored},
+      Mode{.name = "fifo", .parse = parseCount, .mapped = mappedFifo, .command = commandFifo},
+      Mode{.name = "fifo-duplicate", .parse = parseNoArgs, .mapped = mappedFifoDuplicate, .command = commandIgnored},
+      Mode{.name = "fifo-destroy-mid", .parse = parseCount, .mapped = mappedFifo, .command = commandFifoDestroyMid},
   };
 
   const Mode* findMode(std::string_view name) {
@@ -210,7 +330,6 @@ namespace {
       return;
     }
     if (!attachNewContent(state, 0)) {
-      state.running = false;
       return;
     }
     wl_surface_commit(state.surface);
@@ -246,8 +365,7 @@ namespace {
 
   void outputMode(void* /*data*/, wl_output* /*output*/, uint32_t flags, int32_t, int32_t, int32_t refresh) {
     if ((flags & WL_OUTPUT_MODE_CURRENT) != 0) {
-      std::println("refresh-mhz {}", refresh);
-      std::fflush(stdout);
+      logLine(std::format("refresh-mhz {}", refresh));
     }
   }
 
@@ -312,8 +430,7 @@ namespace {
     const wl_interface* interface = nullptr;
     uint32_t id = 0;
     const uint32_t code = wl_display_get_protocol_error(state.display, &interface, &id);
-    std::println("protocol-error {} {}", interface != nullptr ? interface->name : "unknown", code);
-    std::fflush(stdout);
+    logLine(std::format("protocol-error {} {}", interface != nullptr ? interface->name : "unknown", code));
   }
 
   // Reads what stdin has and hands each non-whitespace character to the mode. Returns false once stdin is closed.
@@ -343,13 +460,19 @@ namespace {
           return false;
         }
       }
-      if (wl_display_flush(state.display) < 0 && errno != EAGAIN) {
-        wl_display_cancel_read(state.display);
-        return false;
+      // A burst can queue more than the socket takes at once; the rest goes out once it is writable again.
+      bool flushPending = false;
+      if (wl_display_flush(state.display) < 0) {
+        if (errno != EAGAIN) {
+          wl_display_cancel_read(state.display);
+          return false;
+        }
+        flushPending = true;
       }
 
+      const short displayEvents = flushPending ? static_cast<short>(POLLIN | POLLOUT) : static_cast<short>(POLLIN);
       std::array<pollfd, 2> fds = {{
-          {.fd = wl_display_get_fd(state.display), .events = POLLIN, .revents = 0},
+          {.fd = wl_display_get_fd(state.display), .events = displayEvents, .revents = 0},
           {.fd = stdinOpen ? STDIN_FILENO : -1, .events = POLLIN, .revents = 0},
       }};
       if (poll(fds.data(), fds.size(), -1) < 0) {
@@ -409,6 +532,11 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
+  if (!createBuffers(state)) {
+    std::println(stderr, "pacing-client: failed to allocate the shared-memory buffers");
+    return EXIT_FAILURE;
+  }
+
   state.surface = wl_compositor_create_surface(state.compositor);
   state.xdgSurface = xdg_wm_base_get_xdg_surface(state.wmBase, state.surface);
   xdg_surface_add_listener(state.xdgSurface, &kXdgSurfaceListener, &state);
@@ -425,5 +553,5 @@ int main(int argc, char** argv) {
 
   // Outstanding feedback, buffers, outputs, and the toplevel all go away with the connection.
   wl_display_disconnect(state.display);
-  return clean ? EXIT_SUCCESS : EXIT_FAILURE;
+  return clean && !state.failed ? EXIT_SUCCESS : EXIT_FAILURE;
 }
