@@ -14,14 +14,16 @@ it owns a `FifoManager` and a `CommitTimingManager`, each a manager global
 plus per-surface protocol objects, both built on one `SurfacePacer`
 (`surface_pacer.h`) per `wlr_surface`. The pacer tracks a surface's pacing
 output, records that output's latest present event for prediction, and emits
-one refresh signal — on a frame done for that output, or on a timer while
-hidden. `PacerSubscription` (`pacer_subscription.h`) is the shared retain/
-subscribe/unlink glue the two managers use to hold a pacer alive and listen
-to it; `ProtocolGlobal` (`protocol_global.h`) is the shared "bind creates a
+one refresh signal — after a frame done for that output, on a timer while
+hidden, or from a stall watchdog — but only while a manager with work to do
+retains it. `PacerSubscription` (`pacer_subscription.h`) is the shared
+retain/subscribe/unlink glue the two managers use to listen to a pacer and
+retain it while they have work; `ProtocolGlobal` (`protocol_global.h`) is the shared "bind creates a
 stateless resource" glue for both manager globals. The release rules
 themselves are pure functions with no wlroots types: `fifo_queue.h`
-(hold/release ordering) and `commit_timing_policy.h` (presentation
-prediction, the release decision, hidden-tick interval). `pacing_clock.h`
+(hold/release ordering, in-flight barrier setters) and
+`commit_timing_policy.h` (presentation prediction, the release decision,
+hidden-tick and stall-watchdog intervals). `pacing_clock.h`
 holds the millisecond-rounding helpers `wl_event_source` timers need.
 
 ## Scope decision
@@ -78,10 +80,86 @@ frame (`src/output/output.cpp:1478`). Clearing a fifo barrier on `present`,
 as !4463 does, could stall a visible surface whose content update caused no
 redraw.
 
+## Refreshes are emitted after the scene walk, not inside it
+
+A frame done reaches the pacer from inside the scene's frame-done tree walk
+(`Output::handleFrame` → `wlr_scene_output_send_frame_done` →
+`scene_node_send_frame_done`, a plain `wl_list_for_each`). A refresh listener
+unlocks cached commits, and `wlr_surface_unlock_cached` runs the full role
+commit path (`View::handleCommit` reparents, restacks, snapshots, and tears
+down effect nodes), which could free list links the walk still holds. So
+`SurfacePacer` never emits from the frame-done callback: it records the
+refresh and arms an idle source (once; a second frame done before it runs
+only replaces the recorded refresh), and the idle callback emits it. The
+source is removed with the pacer. `Output` knows nothing of this. Timing is
+unchanged, since released content renders on the next frame either way.
+
+Two details keep it that way. The release-frame prediction is taken at the
+frame done, from the presents recorded before it: headless sends a frame's
+own present from an idle source queued ahead of the deferred refresh, and
+predicting from that present would release a timed commit one period early.
+And each refresh instant gets a serial when it happens
+(`SurfacePacer::refreshSerial`), so the fifo can tell that a barrier applied
+between a frame done and its deferred refresh was not used by that frame
+(next section).
+
+## In-flight barrier setters
+
+fifo-v1 says a `set_barrier` update "will be active for at least one refresh
+cycle". Deciding readiness at `client_commit` from the applied barrier alone
+breaks that when another lock holds the setter: commit A sets the barrier but
+waits on commit-timing (or a syncobj), commit B waits for the barrier and
+finds none set and an empty queue, so it is not held, and when A's other lock
+releases, wlroots applies A and B in the same flush. `FifoQueue` therefore
+records every client commit (`committed`) and tracks setters from commit
+until they apply (`applied`): a wait_barrier commit behind an unapplied setter
+is held, and `refresh()` releases no commit that an unapplied setter is ahead
+of, so a setter a refresh has just released still blocks the commits behind
+it until it applies.
+
+A barrier that applies at or after a refresh's instant was not used by that
+refresh, so `Fifo` does not let that refresh clear it: it records the pacer's
+refresh serial when a barrier is set and skips any refresh whose serial is
+not newer. This covers the deferred-refresh window above and the case where
+another listener of the same refresh applies the setter — commit-timing's
+listener releasing A before the fifo's listener runs. The
+`timing-fifo-pair` case of `protocol/commit_timing` asserts both: without
+either piece, the setter is discarded.
+
+## Retained only while working; the stall watchdog
+
+A pacer emits refreshes and runs timers only while retained, and a manager
+retains it only while it has work: a fifo while its barrier is set, commits
+are held, or a setter is in flight (`FifoQueue::idle`); a commit timer while
+commits are held. `PacerSubscription` holds at most one retain and drops it
+on every way out (release, the owner's detach, the pacer going first).
+Mesa creates a `wp_fifo_v1` for every Vulkan FIFO swapchain, so retaining for
+the object's whole lifetime kept a 40–144 Hz hidden tick running for every
+hidden, idle game or app; now a hidden surface ticks only until its queue
+drains and its last barrier has had a refresh.
+
+While retained and visible, a stall watchdog emits a refresh once
+`kStallRefreshPeriods` (4) periods pass with none (`stallRefreshDelay`).
+fifo-v1 explicitly allows clearing the condition early "to ensure client
+forward progress". It covers the spec's session-inactive case: when the
+session has lost the DRM device, `Output::handleFrame` returns before
+rendering and sends no frame done, while the surface keeps its pacing output,
+so held commits would otherwise stall for a whole VT switch. The spec asked
+for that surface to lose its pacing output and fall back to the hidden tick;
+the watchdog reaches the same end (queues keep draining, at a quarter of the
+rate) without `Output` knowing about pacing, and also covers any other way an
+output stops producing frames. A watchdog refresh counts as clock-only, like
+a hidden tick: commit-timing releases only commits whose target has passed.
+It is re-armed lazily (when it fires it re-checks and re-arms for what is
+left), so steady frames cost no timer updates. A headless harness has no
+session to lose, so the watchdog's interval is pinned by a unit test
+(`tests/unit/commit_timing.cpp`) rather than a check.
+
 ## Stale prediction: never early, up to one period late after idle
 
-`SurfacePacer::predictReleaseFramePresent` (backed by
-`commit_timing_policy.h`'s `predictReleaseFramePresent`) is the answer to
+`PacerRefreshEvent::releasePresent`, which `SurfacePacer` fills at each
+frame done from `commit_timing_policy.h`'s `predictReleaseFramePresent`, is
+the answer to
 "what present will a commit released at this refresh reach?" It extrapolates
 from the pacing output's last recorded `present` event, advancing by whole
 periods. That extrapolation is only trustworthy while the last present is
@@ -196,14 +274,25 @@ section is not imminent and a real client's behavior degrades under VRR.
    `wlr_fifo_manager_v1_create` and `wlr_commit_timing_manager_v1_create` in
    `Server` where `m_pacing` is constructed and reset today
    (`src/server/server.cpp`).
-2. Replace the umbrielfx addon with the MRs' `wlr_fifo_v1_set_output` and
-   `wlr_commit_timer_v1_set_output` calls in
-   `umbrielfx/types/scene/surface.c`, keeping the same capture-scene filter
-   (only surfaces with pacing state attached, gated on the pacing output).
-   Delete `umbrielfx/include/umbrielfx/types/surface_pacing.h` and
+2. Replace the umbrielfx addon with whatever API the merged MRs expose for
+   telling a fifo or commit timer which output paces it (the open MRs'
+   `set_output`-style calls are not a merged API), called from
+   `umbrielfx/types/scene/surface.c` with the same capture-scene filter (only
+   surfaces with pacing state attached, gated on the pacing output).
+   umbrielfx forks wlroots' scene graph, so the MRs' own changes to wlroots'
+   `types/scene/surface.c` do not reach Umbriel: port them into umbrielfx's
+   copy. Delete `umbrielfx/include/umbrielfx/types/surface_pacing.h` and
    `umbrielfx/types/scene/surface_pacing.c`, and `SurfacePacer` and
-   `PacerSubscription` with them.
-3. Keep the harness checks: `tests/harness/checks/protocol/{fifo,fifo_hidden,
-   commit_timing}.sh` and `tests/harness/clients/pacing_client.cpp` assert
-   protocol behavior, not this implementation, and should keep passing
-   unchanged against the wlroots-native globals.
+   `PacerSubscription` with them. Keep `wp_fifo_manager_v1` and
+   `wp_commit_timing_manager_v1` in `kAllowedSecurityContextGlobals`
+   (`src/server/server.cpp`); the interface names do not change.
+3. Keep the harness checks: `tests/harness/checks/protocol/{fifo,
+   commit_timing,commit_timing_stream}.sh` and
+   `tests/harness/clients/pacing_client.cpp` assert protocol behavior, not
+   this implementation, and should keep passing unchanged against the
+   wlroots-native globals. `protocol/fifo_hidden` is different: it asserts
+   Umbriel's hidden-tick policy (a hidden surface drains one commit per
+   tick), which the protocol does not require — it lets a compositor ignore
+   the constraint while hidden. Keep it only if the native implementation
+   adopts the same policy; otherwise reduce it to "the burst drains" or drop
+   it.
