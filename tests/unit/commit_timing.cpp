@@ -22,6 +22,12 @@ UMBRIEL_TEST(predictsStrictlyAfterNow) {
   CHECK_EQ(predictNextPresent(1'000'000'000, 10'000'000, 1'010'000'000), 1'020'000'000);
 }
 
+UMBRIEL_TEST(predictsWhenNowPrecedesLastPresent) {
+  // A clock or present timestamp regression: `now` is behind `lastPresent` by more than one period. k >= 1 still
+  // holds, so the answer is one period past `lastPresent`, never earlier than `lastPresent` itself.
+  CHECK_EQ(predictNextPresent(1'000, 10, 800), 1'010);
+}
+
 UMBRIEL_TEST(followingIsOnePeriodLater) {
   CHECK_EQ(predictFollowingPresent(1'000'000'000, 10'000'000, 1'005'000'000), 1'020'000'000);
 }

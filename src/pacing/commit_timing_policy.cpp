@@ -16,8 +16,13 @@ namespace umbriel {
     if (lastPresent == 0) {
       return now + period;
     }
-    // Smallest lastPresent + k * period (k >= 1) strictly greater than now.
+    // Smallest lastPresent + k * period (k >= 1) strictly greater than now. `now` behind `lastPresent` (elapsed <= 0)
+    // needs no division: k = 1 already clears now, and C++'s truncate-toward-zero division would otherwise give
+    // k <= 0 for elapsed far enough negative, landing before lastPresent itself.
     const Nanoseconds elapsed = now - lastPresent;
+    if (elapsed <= 0) {
+      return lastPresent + period;
+    }
     const Nanoseconds k = elapsed / period + 1;
     return lastPresent + k * period;
   }
