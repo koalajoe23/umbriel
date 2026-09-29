@@ -12,6 +12,7 @@
 #include <wlr/types/wlr_single_pixel_buffer_v1.h>
 #include <wlr/util/transform.h>
 #include "types/wlr_scene.h"
+#include "umbrielfx/types/surface_pacing.h"
 
 static double get_surface_preferred_buffer_scale(struct wlr_surface *surface) {
 	double scale = 1;
@@ -26,7 +27,7 @@ static double get_surface_preferred_buffer_scale(struct wlr_surface *surface) {
 
 // Output used for frame pacing (surface frame callbacks, presentation
 // time feedback, etc), may be NULL
-static struct wlr_output *get_surface_frame_pacing_output(struct wlr_surface *surface) {
+struct wlr_output *umbrielfx_surface_frame_pacing_output(struct wlr_surface *surface) {
 	struct wlr_output *frame_pacing_output = NULL;
 	struct wlr_surface_output *surface_output;
 	wl_list_for_each(surface_output, &surface->current_outputs, link) {
@@ -134,6 +135,11 @@ static void handle_scene_buffer_outputs_update(
 
 	// No reason to update the preferred configuration if we aren't sending leave/enter events.
 	if (suspend) {
+		struct umbrielfx_surface_pacing *pacing = umbrielfx_surface_pacing_find(surface->surface);
+		if (pacing != NULL) {
+			umbrielfx_surface_pacing_set_output(pacing,
+				umbrielfx_surface_frame_pacing_output(surface->surface));
+		}
 		return;
 	}
 
@@ -153,6 +159,14 @@ static void handle_scene_buffer_outputs_update(
 		wlr_color_manager_v1_set_surface_preferred_image_description(scene->color_manager_v1,
 			surface->surface, &img_desc);
 	}
+
+	// Membership (including which outputs are entered) is now fully updated:
+	// this is the pacing output the surface will see going forward.
+	struct umbrielfx_surface_pacing *pacing = umbrielfx_surface_pacing_find(surface->surface);
+	if (pacing != NULL) {
+		umbrielfx_surface_pacing_set_output(pacing,
+			umbrielfx_surface_frame_pacing_output(surface->surface));
+	}
 }
 
 static void handle_scene_buffer_output_sample(
@@ -161,7 +175,7 @@ static void handle_scene_buffer_output_sample(
 		wl_container_of(listener, surface, output_sample);
 	const struct wlr_scene_output_sample_event *event = data;
 	struct wlr_output *output = event->output->output;
-	if (get_surface_frame_pacing_output(surface->surface) != output) {
+	if (umbrielfx_surface_frame_pacing_output(surface->surface) != output) {
 		return;
 	}
 
@@ -184,11 +198,20 @@ static void handle_scene_buffer_frame_done(
 	struct wlr_scene_surface *surface =
 		wl_container_of(listener, surface, frame_done);
 	struct wlr_scene_frame_done_event *event = data;
-	if (get_surface_frame_pacing_output(surface->surface) != event->output->output) {
+	if (umbrielfx_surface_frame_pacing_output(surface->surface) != event->output->output) {
 		return;
 	}
 
 	wlr_surface_send_frame_done(surface->surface, &event->when);
+
+	struct umbrielfx_surface_pacing *pacing = umbrielfx_surface_pacing_find(surface->surface);
+	if (pacing != NULL) {
+		struct umbrielfx_surface_pacing_frame_event pacing_event = {
+			.output = event->output->output,
+			.when = &event->when,
+		};
+		wl_signal_emit_mutable(&pacing->events.frame_done, &pacing_event);
+	}
 }
 
 void wlr_scene_surface_send_frame_done(struct wlr_scene_surface *scene_surface,
@@ -376,7 +399,7 @@ static void handle_scene_surface_surface_commit(
 	// the surface anyway.
 	int lx, ly;
 	bool enabled = wlr_scene_node_coords(&scene_buffer->node, &lx, &ly);
-	struct wlr_output *output = get_surface_frame_pacing_output(surface->surface);
+	struct wlr_output *output = umbrielfx_surface_frame_pacing_output(surface->surface);
 	if (!wl_list_empty(&surface->surface->current.frame_callback_list) && output && enabled) {
 		wlr_output_schedule_frame(output);
 	}
