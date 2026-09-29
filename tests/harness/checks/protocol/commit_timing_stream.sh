@@ -57,11 +57,15 @@ run_stream() {
         bad = 0
         for (i = 0; i < count; i++) {
           if (!(i in presented)) { printf "commit %d was not presented\n", i; bad = 1; continue }
+          d = presented[i] - target[i]
+          if (i == 0 || d < lo) lo = d
+          if (i == 0 || d > hi) hi = d
           if (presented[i] < target[i] - slack) {
             printf "commit %d presented %d ns before its target\n", i, target[i] - presented[i]
             bad = 1
           }
         }
+        printf "'"$label"': presented - target from %d to %d ns\n", lo, hi
         exit bad
       }' "$CLIENT_LOG"; then
     echo "$label log: $(tr '\n' '|' < "$CLIENT_LOG")"
@@ -71,5 +75,10 @@ run_stream() {
 
 run_stream spaced
 run_stream lead 1
+# No stream with a longer lead: it would measure a headless artefact. A headless output presents at commit time and
+# restarts its frame timer there, so a frame requested while it idles leaves the grid of past presents that the
+# prediction steps along, and the commit it releases can present up to a period early (a lead of three does on every
+# other commit; a lead of two does under load). A real DRM output stays on its vblank grid (see "Headless" in
+# docs/design/pacing-protocols.md).
 
 echo "a stream of timed commits never presents more than half a period before its targets"
