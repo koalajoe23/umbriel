@@ -69,7 +69,8 @@ namespace umbriel {
     wl_signal_add(&pacing->events.destroy, &m_pacingDestroy);
 
     wl_display* display = wl_client_get_display(wl_resource_get_client(surface->resource));
-    m_hiddenTick = wl_event_loop_add_timer(wl_display_get_event_loop(display), onHiddenTick, this);
+    m_eventLoop = wl_display_get_event_loop(display);
+    m_hiddenTick = wl_event_loop_add_timer(m_eventLoop, onHiddenTick, this);
 
     setOutput(pacing->output);
   }
@@ -85,6 +86,9 @@ namespace umbriel {
     if (m_hiddenTick != nullptr) {
       wl_event_source_remove(m_hiddenTick);
     }
+    if (m_deferredRefresh != nullptr) {
+      wl_event_source_remove(m_deferredRefresh);
+    }
     wlr_addon_finish(&m_addon->addon);
   }
 
@@ -94,14 +98,6 @@ namespace umbriel {
   }
 
   Nanoseconds SurfacePacer::lastKnownPeriod() const { return m_hadOutput ? period() : 0; }
-
-  Nanoseconds SurfacePacer::predictFollowingPresent(Nanoseconds now) const {
-    return umbriel::predictFollowingPresent(m_lastPresent, period(), now);
-  }
-
-  Nanoseconds SurfacePacer::predictReleaseFramePresent(Nanoseconds now) const {
-    return umbriel::predictReleaseFramePresent(m_lastPresent, period(), now);
-  }
 
   void SurfacePacer::requestFrame() {
     if (m_output != nullptr) {
@@ -158,6 +154,8 @@ namespace umbriel {
     return 0;
   }
 
+  void SurfacePacer::onDeferredRefresh(void* data) { static_cast<SurfacePacer*>(data)->handleDeferredRefresh(); }
+
   void SurfacePacer::handleOutputChange() { setOutput(m_pacing->output); }
 
   void SurfacePacer::handleFrameDone(void* data) {
@@ -165,7 +163,24 @@ namespace umbriel {
     if (m_output == nullptr || event->output != m_output) {
       return;
     }
-    PacerRefreshEvent refresh{.when = toNanoseconds(*event->when), .hidden = false};
+    // Inside the scene's frame-done walk: only record the refresh here, and emit it once the walk is over. The
+    // prediction is taken now, before this frame's own present can be recorded. Two frame dones before the idle runs
+    // collapse into one refresh for the later one.
+    const Nanoseconds when = toNanoseconds(*event->when);
+    m_deferredEvent = PacerRefreshEvent{
+        .when = when,
+        .hidden = false,
+        .releasePresent = predictReleaseFramePresent(m_lastPresent, period(), when),
+    };
+    if (m_deferredRefresh == nullptr) {
+      m_deferredRefresh = wl_event_loop_add_idle(m_eventLoop, onDeferredRefresh, this);
+    }
+  }
+
+  void SurfacePacer::handleDeferredRefresh() {
+    // An idle source is freed once it has run.
+    m_deferredRefresh = nullptr;
+    PacerRefreshEvent refresh = m_deferredEvent;
     wl_signal_emit_mutable(&events.refresh, &refresh);
   }
 
@@ -188,7 +203,8 @@ namespace umbriel {
     }
     // Re-armed before emitting so a listener that releases the pacer disarms the next tick.
     armHiddenTick();
-    PacerRefreshEvent refresh{.when = monotonicNow(), .hidden = true};
+    const Nanoseconds now = monotonicNow();
+    PacerRefreshEvent refresh{.when = now, .hidden = true, .releasePresent = now};
     wl_signal_emit_mutable(&events.refresh, &refresh);
   }
 

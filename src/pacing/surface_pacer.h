@@ -7,6 +7,7 @@
 #include <wayland-server-core.h>
 
 struct umbrielfx_surface_pacing;
+struct wl_event_loop;
 struct wl_event_source;
 struct wlr_output;
 struct wlr_surface;
@@ -17,12 +18,20 @@ namespace umbriel {
   struct PacerRefreshEvent {
     Nanoseconds when; // CLOCK_MONOTONIC
     bool hidden;
+    // For a frame done: the present a commit released at this refresh is expected to reach, predicted from the
+    // presents recorded before the frame done (the frame's own present may already have arrived by the time the
+    // refresh is emitted; headless sends it from an idle source). Equal to `when` for a hidden tick.
+    Nanoseconds releasePresent;
   };
 
   // Per-surface pacing mechanism shared by the fifo-v1 and commit-timing-v1 managers. It follows the umbrielfx
   // pacing addon's output, the output its wl_surface.frame callbacks are paced by, records that output's latest
-  // present event for prediction, and emits one refresh signal: on each frame done for that output, and on a timer
+  // present event for prediction, and emits one refresh signal: after each frame done for that output, and on a timer
   // while the surface is hidden and something retains the pacer. It knows nothing about either protocol.
+  //
+  // A frame done arrives inside the scene's frame-done tree walk, and a refresh listener may unlock commits whose
+  // role handlers reparent or destroy scene nodes, so the refresh for a frame done is emitted from an idle source
+  // once the walk has returned, never from within it.
   //
   // A pacer lives in a wlr_addon on the surface and is freed with the surface; events.destroy fires first so users
   // unlink their listeners.
@@ -41,10 +50,6 @@ namespace umbriel {
     [[nodiscard]] Nanoseconds period() const;
     // period() once the surface has had a pacing output; 0 until then.
     [[nodiscard]] Nanoseconds lastKnownPeriod() const;
-    // The present after the next one strictly past `now`, extrapolated from the last recorded present.
-    [[nodiscard]] Nanoseconds predictFollowingPresent(Nanoseconds now) const;
-    // The present a commit released at a refresh at `now` reaches; `now` once the last recorded present is stale.
-    [[nodiscard]] Nanoseconds predictReleaseFramePresent(Nanoseconds now) const;
 
     // Asks the pacing output for a frame, so a refresh arrives even when nothing else redraws. No-op while hidden.
     void requestFrame();
@@ -69,12 +74,14 @@ namespace umbriel {
     static void onOutputPresent(wl_listener* listener, void* data);
     static void onOutputDestroy(wl_listener* listener, void* data);
     static int onHiddenTick(void* data);
+    static void onDeferredRefresh(void* data);
 
     void handleOutputChange();
     void handleFrameDone(void* data);
     void handleOutputPresent(void* data);
     void handleOutputDestroy();
     void handleHiddenTick();
+    void handleDeferredRefresh();
 
     // Moves the present and destroy subscriptions to `output`, which becomes output().
     void setOutput(wlr_output* output);
@@ -92,8 +99,13 @@ namespace umbriel {
     Nanoseconds m_lastPresentRefresh = 0;
     bool m_hadOutput = false;
     uint32_t m_retainCount = 0;
+    wl_event_loop* m_eventLoop = nullptr;
     wl_event_source* m_hiddenTick = nullptr;
     bool m_hiddenTickArmed = false;
+    // The idle source that emits the latest frame done's refresh, and that refresh; the source is null when none is
+    // due.
+    wl_event_source* m_deferredRefresh = nullptr;
+    PacerRefreshEvent m_deferredEvent{};
 
     wl_listener m_outputChange{};
     wl_listener m_frameDone{};

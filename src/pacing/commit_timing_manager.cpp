@@ -205,9 +205,8 @@ namespace umbriel {
         } else {
           // A visible refresh comes from the pacer, so it is there.
           const SurfacePacer& pacer = *m_pacer.pacer();
-          const Nanoseconds framePresent = pacer.predictReleaseFramePresent(event.when);
           const Nanoseconds period = pacer.period();
-          releaseWhile([&](Nanoseconds target) { return timedCommitDue(target, framePresent, period); });
+          releaseWhile([&](Nanoseconds target) { return timedCommitDue(target, event.releasePresent, period); });
         }
         if (freeIfDone()) {
           return;
