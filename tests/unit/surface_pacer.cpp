@@ -139,10 +139,12 @@ namespace {
         wl_display_destroy_clients(display);
         wl_display_destroy(display);
       }
-      for (const int fd : sockets) {
-        if (fd >= 0) {
-          close(fd);
-        }
+      // sockets[0] belongs to the client once it exists, and wl_display_destroy_clients closed it.
+      if (client == nullptr && sockets[0] >= 0) {
+        close(sockets[0]);
+      }
+      if (sockets[1] >= 0) {
+        close(sockets[1]);
       }
     }
 
