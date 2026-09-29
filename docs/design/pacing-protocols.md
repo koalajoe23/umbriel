@@ -163,8 +163,9 @@ the answer to
 "what present will a commit released at this refresh reach?" It extrapolates
 from the pacing output's last recorded `present` event, advancing by whole
 periods, and depends on whether the frame behind the refresh committed.
-`Output::handleFrame` sends frame done after every frame, committed or not,
-and wlroots keeps `wlr_output.frame_pending` set from a successful commit
+`Output::handleFrame` sends frame done after every frame it renders or
+skips, committed or not (only its two early returns, a frame the session
+does not allow and an output with no size yet, send none), and wlroots keeps `wlr_output.frame_pending` set from a successful commit
 (`output_apply_commit`) until the next frame event (`wlr_output_send_frame`),
 so `SurfacePacer` snapshots it at the frame done:
 
@@ -176,6 +177,10 @@ so `SurfacePacer` snapshots it at the frame done:
   (`wlr_output_schedule_frame` queues it on an idle source), which flips at
   the very next vblank — `predictNextPresent`. Assuming a pending flip here
   would predict a period too late and release the commit a period early.
+  A frame whose commit failed (`commitFailed` in `Output::handleFrame`) also
+  leaves no flip pending, but its retry waits `kFrameRetryDelayMs` on a
+  timer, so the released commit can only present later than predicted,
+  never earlier.
 
 A frame the commit timer asks for (`SurfacePacer::requestFrame`) always
 commits: `wlr_output_schedule_frame` sets `output->needs_frame`, which makes
@@ -212,13 +217,20 @@ comes one frame delay after that commit. When a frame is requested while the
 output idles, off the phase of its previous presents, that commit moves the
 output's whole frame phase, while the prediction — still fresh by age — steps
 along the old grid. A commit released at that refresh renders at the moved
-frame and can present up to a period before its prediction. A stream that
+frame and can present up to a period before its prediction. Steady frames
+drift too: the headless backend computes its frame delay in whole
+milliseconds (`frame_delay = 1000000 / refresh` in
+`backend/headless/output.c`, 16 ms at 60 Hz) against the pacer's 16.667 ms
+period, so each frame lands about 0.67 ms earlier on the extrapolated grid
+than the one before. A stream that
 targets three periods past each present hits this on every other commit
 (about −16.7 ms at 60 Hz), and two periods past does occasionally under load
 (down to about −12.7 ms), so `protocol/commit_timing_stream` streams only up to
 a lead of one period. A DRM output's requested frame flips at the next vblank
-of the same grid, so the prediction holds there; no headless-specific logic
-exists in `src/pacing/`.
+of the same grid, so the prediction holds there (fixed refresh, no tearing;
+see "Known limitation: VRR and tearing": with VRR or async flips an idle DRM
+output flips roughly at commit time, the same off-grid artefact as
+headless); no headless-specific logic exists in `src/pacing/`.
 
 ## Destroy semantics: two different protocol answers, taken as written
 
