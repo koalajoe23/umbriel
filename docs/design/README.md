@@ -19,6 +19,7 @@ boundaries, or regression-sensitive behavior.
 - [Client buffer constraints](client-buffer-constraints.md)
 - [Scene helper ownership](scene-helper-ownership.md)
 - [DRM GPU exclusion](drm-device-policy.md)
+- [Pacing protocols](pacing-protocols.md)
 
 ## Harness-only IPC
 
