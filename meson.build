@@ -660,6 +660,7 @@ pure_sources = files(
   'src/view/effects_rules.cpp',
   'src/view/floating.cpp',
   'src/view/drag_physics.cpp',
+  'src/pacing/fifo_queue.cpp',
 )
 
 umbriel_pure_deps = [
