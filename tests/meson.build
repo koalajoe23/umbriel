@@ -11,6 +11,7 @@ unit_tests = [
   ['scene-clip', ['unit/scene_clip.cpp'], [wayland_server_dep]],
   ['xwayland-outputs', ['unit/xwayland_outputs.cpp'], [umbriel_core_dep]],
   ['presentation', ['unit/presentation.cpp'], [umbriel_core_dep]],
+  ['surface-pacer', ['unit/surface_pacer.cpp'], [umbriel_core_dep]],
   ['animation', ['unit/animation.cpp'], [umbriel_core_dep]],
   ['application-scope', ['unit/application_scope.cpp'], [umbriel_core_dep], [], ['-Wl,--wrap=umbrielCloseRange']],
   ['shader-source', ['unit/shader_source.cpp'], []],

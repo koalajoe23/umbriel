@@ -1,0 +1,318 @@
+#include "pacing/surface_pacer.h"
+
+#include "pacing/pacing_clock.h"
+#include "wlr.h"
+
+#include <algorithm>
+#include <cassert>
+#include <ctime>
+#include <new>
+
+namespace umbriel {
+
+  namespace {
+
+    void detach(wl_listener& listener) {
+      wl_list_remove(&listener.link);
+      wl_list_init(&listener.link);
+    }
+
+  } // namespace
+
+  // The surface's addon set owns the pacer through this entry.
+  struct SurfacePacer::Addon {
+    static void destroy(wlr_addon* found) {
+      Addon* addon = nullptr;
+      addon = wl_container_of(found, addon, addon);
+      delete addon->pacer;
+    }
+
+    static constexpr wlr_addon_interface kInterface = {
+        .name = "umbriel_surface_pacer",
+        .destroy = destroy,
+    };
+
+    wlr_addon addon{};
+    SurfacePacer* pacer = nullptr;
+  };
+
+  SurfacePacer& SurfacePacer::from(wlr_surface* surface) {
+    if (wlr_addon* found = wlr_addon_find(&surface->addons, &Addon::kInterface, &Addon::kInterface)) {
+      Addon* addon = nullptr;
+      addon = wl_container_of(found, addon, addon);
+      return *addon->pacer;
+    }
+    // Created before this pacer's own addon, so on surface destruction the (newer) pacer addon is torn down first.
+    umbrielfx_surface_pacing* pacing = umbrielfx_surface_pacing_get(surface);
+    if (pacing == nullptr) {
+      throw std::bad_alloc();
+    }
+    // Owned by the surface's addon set; freed by Addon::destroy.
+    auto* pacer = new SurfacePacer(surface, pacing);
+    return *pacer;
+  }
+
+  SurfacePacer::SurfacePacer(wlr_surface* surface, umbrielfx_surface_pacing* pacing)
+      : m_addon(std::make_unique<Addon>()), m_pacing(pacing) {
+    wl_signal_init(&events.refresh);
+    wl_signal_init(&events.destroy);
+    wl_list_init(&m_outputPresent.link);
+    wl_list_init(&m_outputDestroy.link);
+
+    m_addon->pacer = this;
+    wlr_addon_init(&m_addon->addon, &surface->addons, &Addon::kInterface, &Addon::kInterface);
+
+    m_outputChange.notify = onOutputChange;
+    wl_signal_add(&pacing->events.output_change, &m_outputChange);
+    m_frameDone.notify = onFrameDone;
+    wl_signal_add(&pacing->events.frame_done, &m_frameDone);
+    m_pacingDestroy.notify = onPacingDestroy;
+    wl_signal_add(&pacing->events.destroy, &m_pacingDestroy);
+
+    wl_display* display = wl_client_get_display(wl_resource_get_client(surface->resource));
+    m_eventLoop = wl_display_get_event_loop(display);
+    m_hiddenTick = wl_event_loop_add_timer(m_eventLoop, onHiddenTick, this);
+    m_stallWatchdog = wl_event_loop_add_timer(m_eventLoop, onStallWatchdog, this);
+
+    setOutput(pacing->output);
+  }
+
+  SurfacePacer::~SurfacePacer() {
+    wl_signal_emit_mutable(&events.destroy, this);
+
+    wl_list_remove(&m_outputChange.link);
+    wl_list_remove(&m_frameDone.link);
+    wl_list_remove(&m_pacingDestroy.link);
+    wl_list_remove(&m_outputPresent.link);
+    wl_list_remove(&m_outputDestroy.link);
+    if (m_hiddenTick != nullptr) {
+      wl_event_source_remove(m_hiddenTick);
+    }
+    if (m_stallWatchdog != nullptr) {
+      wl_event_source_remove(m_stallWatchdog);
+    }
+    if (m_deferredRefresh != nullptr) {
+      wl_event_source_remove(m_deferredRefresh);
+    }
+    wlr_addon_finish(&m_addon->addon);
+  }
+
+  Nanoseconds SurfacePacer::period() const {
+    const int32_t modeRefreshMhz = m_output != nullptr ? m_output->refresh : m_lastOutputRefreshMhz;
+    return refreshPeriod(m_lastPresentRefresh, modeRefreshMhz);
+  }
+
+  Nanoseconds SurfacePacer::lastKnownPeriod() const { return m_hadOutput ? period() : 0; }
+
+  void SurfacePacer::requestFrame() {
+    if (m_output != nullptr) {
+      wlr_output_schedule_frame(m_output);
+    }
+  }
+
+  void SurfacePacer::retain() {
+    if (m_retainCount++ == 0) {
+      // The watchdog's grace starts when work does, not at a frame long before it.
+      m_lastRefreshAt = std::max(m_lastRefreshAt, monotonicNow());
+    }
+    updateTimers();
+  }
+
+  void SurfacePacer::release() {
+    assert(m_retainCount > 0);
+    if (m_retainCount > 0) {
+      --m_retainCount;
+    }
+    updateTimers();
+  }
+
+  void SurfacePacer::onOutputChange(wl_listener* listener, void* /*data*/) {
+    SurfacePacer* self = nullptr;
+    self = wl_container_of(listener, self, m_outputChange);
+    self->handleOutputChange();
+  }
+
+  void SurfacePacer::onFrameDone(wl_listener* listener, void* data) {
+    SurfacePacer* self = nullptr;
+    self = wl_container_of(listener, self, m_frameDone);
+    self->handleFrameDone(data);
+  }
+
+  void SurfacePacer::onPacingDestroy(wl_listener* listener, void* /*data*/) {
+    SurfacePacer* self = nullptr;
+    self = wl_container_of(listener, self, m_pacingDestroy);
+    // The pacer cannot outlive the hook it mirrors; normally its own addon goes first and this never runs.
+    delete self;
+  }
+
+  void SurfacePacer::onOutputPresent(wl_listener* listener, void* data) {
+    SurfacePacer* self = nullptr;
+    self = wl_container_of(listener, self, m_outputPresent);
+    self->handleOutputPresent(data);
+  }
+
+  void SurfacePacer::onOutputDestroy(wl_listener* listener, void* /*data*/) {
+    SurfacePacer* self = nullptr;
+    self = wl_container_of(listener, self, m_outputDestroy);
+    self->handleOutputDestroy();
+  }
+
+  int SurfacePacer::onHiddenTick(void* data) {
+    static_cast<SurfacePacer*>(data)->handleHiddenTick();
+    return 0;
+  }
+
+  void SurfacePacer::onDeferredRefresh(void* data) { static_cast<SurfacePacer*>(data)->handleDeferredRefresh(); }
+
+  int SurfacePacer::onStallWatchdog(void* data) {
+    static_cast<SurfacePacer*>(data)->handleStallWatchdog();
+    return 0;
+  }
+
+  void SurfacePacer::handleOutputChange() { setOutput(m_pacing->output); }
+
+  void SurfacePacer::handleFrameDone(void* data) {
+    const auto* event = static_cast<const umbrielfx_surface_pacing_frame_event*>(data);
+    if (m_output == nullptr || event->output != m_output) {
+      return;
+    }
+    // Inside the scene's frame-done walk: only record the refresh here, and emit it once the walk is over. The
+    // prediction is taken now, before this frame's own present can be recorded, and so is whether this frame
+    // committed: Output::handleFrame sends frame done after every frame, committed or not, and wlroots keeps
+    // frame_pending set from a successful commit until the next frame event, so it tells whether a released commit
+    // waits behind a pending flip or gets a frame of its own straight away. Two frame dones before the idle runs
+    // collapse into one refresh for the later one.
+    const Nanoseconds when = toNanoseconds(*event->when);
+    m_lastRefreshAt = std::max(m_lastRefreshAt, when);
+    if (m_retainCount == 0) {
+      // Nothing to do this frame; the serial still counts the instant.
+      ++m_refreshSerial;
+      return;
+    }
+    m_deferredEvent = PacerRefreshEvent{
+        .when = when,
+        .hidden = false,
+        .releasePresent = predictReleaseFramePresent(m_lastPresent, period(), when, m_output->frame_pending),
+        .serial = ++m_refreshSerial,
+    };
+    if (m_deferredRefresh == nullptr) {
+      m_deferredRefresh = wl_event_loop_add_idle(m_eventLoop, onDeferredRefresh, this);
+    }
+  }
+
+  void SurfacePacer::handleDeferredRefresh() {
+    // An idle source is freed once it has run.
+    m_deferredRefresh = nullptr;
+    if (m_retainCount == 0) {
+      return;
+    }
+    PacerRefreshEvent refresh = m_deferredEvent;
+    wl_signal_emit_mutable(&events.refresh, &refresh);
+  }
+
+  void SurfacePacer::handleOutputPresent(void* data) {
+    const auto* event = static_cast<const wlr_output_event_present*>(data);
+    if (!event->presented) {
+      return;
+    }
+    m_lastPresent = toNanoseconds(event->when);
+    m_lastPresentRefresh = event->refresh;
+  }
+
+  // Hidden until umbrielfx reports the surface's next pacing output.
+  void SurfacePacer::handleOutputDestroy() { setOutput(nullptr); }
+
+  void SurfacePacer::handleHiddenTick() {
+    m_hiddenTickArmed = false;
+    if (m_output != nullptr || m_retainCount == 0) {
+      return;
+    }
+    // Re-armed before emitting so a listener that releases the pacer disarms the next tick.
+    const Nanoseconds now = monotonicNow();
+    armHiddenTick(nextHiddenTick(m_hiddenTickDeadline, hiddenTickInterval(lastKnownPeriod()), now));
+    PacerRefreshEvent refresh{.when = now, .hidden = true, .releasePresent = now, .serial = ++m_refreshSerial};
+    wl_signal_emit_mutable(&events.refresh, &refresh);
+  }
+
+  void SurfacePacer::setOutput(wlr_output* output) {
+    if (output == m_output) {
+      return;
+    }
+    if (m_output != nullptr) {
+      m_lastOutputRefreshMhz = m_output->refresh;
+    }
+    detach(m_outputPresent);
+    detach(m_outputDestroy);
+
+    m_output = output;
+    if (output != nullptr) {
+      // The previous present belonged to another output, or to this one before it hid the surface.
+      m_lastPresent = 0;
+      m_lastPresentRefresh = 0;
+      m_lastOutputRefreshMhz = output->refresh;
+      m_hadOutput = true;
+      // The new output's frames are awaited from now on.
+      m_lastRefreshAt = std::max(m_lastRefreshAt, monotonicNow());
+      m_outputPresent.notify = onOutputPresent;
+      wl_signal_add(&output->events.present, &m_outputPresent);
+      m_outputDestroy.notify = onOutputDestroy;
+      wl_signal_add(&output->events.destroy, &m_outputDestroy);
+    }
+    updateTimers();
+  }
+
+  void SurfacePacer::updateTimers() {
+    if (m_output != nullptr && m_retainCount > 0 && !m_stallWatchdogArmed) {
+      armStallWatchdog(stallRefreshDelay(m_lastRefreshAt, period(), monotonicNow()));
+    }
+    if (m_output == nullptr && m_retainCount > 0) {
+      if (!m_hiddenTickArmed) {
+        armHiddenTick(monotonicNow() + hiddenTickInterval(lastKnownPeriod()));
+      }
+      return;
+    }
+    if (m_hiddenTickArmed && m_hiddenTick != nullptr) {
+      wl_event_source_timer_update(m_hiddenTick, 0);
+    }
+    m_hiddenTickArmed = false;
+  }
+
+  // The output has produced no frame done for kStallRefreshPeriods periods while a manager has work: its frames may
+  // have stopped altogether (Output::handleFrame renders nothing while the session has lost the DRM device), so the
+  // pacer refreshes on its own to keep held commits draining. Frames resuming push the deadline out again.
+  void SurfacePacer::handleStallWatchdog() {
+    m_stallWatchdogArmed = false;
+    if (m_output == nullptr || m_retainCount == 0) {
+      return;
+    }
+    const Nanoseconds now = monotonicNow();
+    const Nanoseconds delay = stallRefreshDelay(m_lastRefreshAt, period(), now);
+    if (delay > 0) {
+      armStallWatchdog(delay);
+      return;
+    }
+    m_lastRefreshAt = now;
+    // Re-armed before emitting; a listener that releases the pacer lets it lapse.
+    armStallWatchdog(stallRefreshInterval(period()));
+    PacerRefreshEvent refresh{.when = now, .hidden = true, .releasePresent = now, .serial = ++m_refreshSerial};
+    wl_signal_emit_mutable(&events.refresh, &refresh);
+  }
+
+  void SurfacePacer::armStallWatchdog(Nanoseconds delay) {
+    if (m_stallWatchdog == nullptr) {
+      return;
+    }
+    wl_event_source_timer_update(m_stallWatchdog, timerDelayMsecNotBefore(delay));
+    m_stallWatchdogArmed = true;
+  }
+
+  void SurfacePacer::armHiddenTick(Nanoseconds deadline) {
+    if (m_hiddenTick == nullptr) {
+      return;
+    }
+    m_hiddenTickDeadline = deadline;
+    wl_event_source_timer_update(m_hiddenTick, timerDelayMsecNearest(deadline - monotonicNow()));
+    m_hiddenTickArmed = true;
+  }
+
+} // namespace umbriel
