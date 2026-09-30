@@ -659,6 +659,7 @@ core_sources = files(
   'src/scene/text_buffer.cpp',
   'src/lock/session_lock.cpp',
   'src/overview/overview.cpp',
+  'src/pacing/surface_pacer.cpp',
   'src/workspace/workspace.cpp',
   'src/workspace/scratchpad.cpp',
   'src/cli/outputs.cpp',
