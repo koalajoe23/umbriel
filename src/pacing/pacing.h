@@ -6,7 +6,7 @@ struct wl_display;
 
 namespace umbriel {
 
-  // The frame-pacing protocols (fifo-v1 so far), the only pacing type Server sees. It owns the protocol
+  // The frame-pacing protocols (fifo-v1, commit-timing-v1), the only pacing type Server sees. It owns the protocol
   // managers; each surface's timing comes from its SurfacePacer.
   class Pacing {
   public:
