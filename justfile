@@ -141,6 +141,13 @@ check-stress name n="32": (_ensure-configured mode)
         exit 1
     fi
     mapfile -t matches < <(bash tests/harness/check.sh ./build-{{mode}}/umbriel --list {{name}})
+    # A full name wins over the longer names it is a fragment of (protocol/fifo, protocol/fifo_hidden).
+    for match in "${matches[@]}"; do
+        if [[ $match == "{{name}}" ]]; then
+            matches=("$match")
+            break
+        fi
+    done
     if ((${#matches[@]} != 1)); then
         echo "check-stress: '{{name}}' must match exactly one check, matched ${#matches[@]}: ${matches[*]}" >&2
         exit 2
