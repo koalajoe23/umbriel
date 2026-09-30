@@ -63,7 +63,7 @@ namespace umbriel {
     // Security-context clients only receive reviewed, ordinary application
     // protocols. New globals stay unavailable until they are classified here.
     // [[security_context_rule]] widens the set for matching clients.
-    constexpr std::array<std::string_view, 30> kAllowedSecurityContextGlobals{
+    constexpr std::array<std::string_view, 32> kAllowedSecurityContextGlobals{
         "wl_shm",
         "wl_drm",
         "zwp_linux_dmabuf_v1",
@@ -77,6 +77,8 @@ namespace umbriel {
         "wp_presentation",
         "wp_tearing_control_manager_v1",
         "wp_content_type_manager_v1",
+        "wp_fifo_manager_v1",
+        "wp_commit_timing_manager_v1",
         "wl_output",
         "wp_color_manager_v1",
         "xdg_wm_base",
