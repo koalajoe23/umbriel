@@ -18,6 +18,7 @@
 #include "lock/session_lock.h"
 #include "output/output.h"
 #include "overview/overview.h"
+#include "pacing/pacing.h"
 #include "scene/cheatsheet.h"
 #include "scene/color.h"
 #include "scene/config_banner.h"
@@ -510,6 +511,10 @@ namespace umbriel {
       throw std::runtime_error(std::string("umbrielfx scene helpers are not linked correctly: ") + mismatch);
     }
     m_scene = wlr_scene_create();
+    m_pacing = std::make_unique<Pacing>(m_display);
+    if (!m_pacing->valid()) {
+      throw std::runtime_error("failed to create frame-pacing protocols");
+    }
     if (linuxDmabuf != nullptr) {
       wlr_scene_set_linux_dmabuf_v1(m_scene, linuxDmabuf);
     }
@@ -820,6 +825,7 @@ namespace umbriel {
     }
     wl_display_destroy_clients(m_display);
     m_wineColorManager.reset();
+    m_pacing.reset();
     // Chrome components destroy scene nodes in their destructors, so they must go before the scene tree does; otherwise
     // the destructor body frees the nodes and the member destructors touch already-freed memory.
     m_quitConfirm.reset();
