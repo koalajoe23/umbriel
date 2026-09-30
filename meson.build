@@ -765,6 +765,8 @@ core_sources = files(
   'src/scene/tab_label_cache.cpp',
   'src/lock/session_lock.cpp',
   'src/overview/overview.cpp',
+  'src/pacing/pacer_subscription.cpp',
+  'src/pacing/protocol_global.cpp',
   'src/pacing/surface_pacer.cpp',
   'src/workspace/workspace.cpp',
   'src/workspace/tab_presenter.cpp',
