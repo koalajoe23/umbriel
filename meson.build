@@ -390,6 +390,19 @@ xdg_output_server_c = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+fifo_server_h = custom_target(
+  'fifo-v1-server-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/fifo/fifo-v1.xml',
+  output: 'fifo-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+fifo_server_c = custom_target(
+  'fifo-v1-server-protocol.c',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/fifo/fifo-v1.xml',
+  output: 'fifo-v1-server-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 viewporter_client_h = custom_target(
   'viewporter-client-protocol.h',
   input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'stable/viewporter/viewporter.xml',
@@ -765,7 +778,9 @@ core_sources = files(
   'src/scene/tab_label_cache.cpp',
   'src/lock/session_lock.cpp',
   'src/overview/overview.cpp',
+  'src/pacing/fifo_manager.cpp',
   'src/pacing/pacer_subscription.cpp',
+  'src/pacing/pacing.cpp',
   'src/pacing/protocol_global.cpp',
   'src/pacing/surface_pacer.cpp',
   'src/workspace/workspace.cpp',
@@ -808,6 +823,8 @@ umbriel_core = static_library(
     color_management_server_c,
     xdg_output_server_h,
     xdg_output_server_c,
+    fifo_server_h,
+    fifo_server_c,
   ],
   include_directories: include_directories('src'),
   link_with: umbriel_pure,

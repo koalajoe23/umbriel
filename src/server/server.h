@@ -133,6 +133,7 @@ namespace umbriel {
   class LayerSurface;
   class Output;
   class Overview;
+  class Pacing;
   class Seat;
   class SessionLock;
   class View;
@@ -659,6 +660,7 @@ namespace umbriel {
     wlr_security_context_manager_v1* m_securityContextManager = nullptr;
     std::unique_ptr<WineColorManager> m_wineColorManager;
     std::unique_ptr<SyncobjUnmapRelease> m_syncobjUnmapRelease;
+    std::unique_ptr<Pacing> m_pacing;
     EffectRegistry m_effects;
     EffectSelection m_effectSelection;
     EffectSlot m_cursorEffectSlot;
