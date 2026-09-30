@@ -661,6 +661,7 @@ pure_sources = files(
   'src/view/floating.cpp',
   'src/view/drag_physics.cpp',
   'src/pacing/fifo_queue.cpp',
+  'src/pacing/commit_timing_policy.cpp',
 )
 
 umbriel_pure_deps = [
