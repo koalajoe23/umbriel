@@ -48,6 +48,7 @@ umbrielfx_sources = files(
   'types/scene/scene_guard.c',
   'types/scene/subsurface_tree.c',
   'types/scene/surface.c',
+  'types/scene/surface_pacing.c',
   'types/scene/wlr_scene.c',
   'types/scene/xdg_shell.c',
   'util/array.c',
@@ -241,6 +242,22 @@ if build_tests
   test(
     'capture-pacing',
     umbrielfx_capture_pacing_test,
+    suite: 'umbrielfx',
+  )
+
+  umbrielfx_pacing_hook_test = executable(
+    'umbrielfx-pacing-hook-test',
+    'tests/pacing_hook.c',
+    c_args: umbrielfx_c_args,
+    dependencies: umbrielfx_deps,
+    include_directories: [umbrielfx_inc, umbrielfx_internal_inc],
+    link_with: umbrielfx_lib,
+    build_by_default: false,
+  )
+
+  test(
+    'pacing-hook',
+    umbrielfx_pacing_hook_test,
     suite: 'umbrielfx',
   )
 
