@@ -402,9 +402,15 @@ start_instance() {
   # teardown instead of joining the harness's own group where it cannot be
   # signalled. The wrapper reports the group id it leads and then execs the
   # compositor in place, so SERVER_PID stays the compositor.
+  #
+  # XDG_CACHE_HOME keeps the compositor's umbriel.log inside the instance:
+  # inherited, every check would append to the developer's own
+  # ~/.cache/umbriel/umbriel.log and a suite run would rotate their session's
+  # log away. A kept failure directory then holds it as evidence too.
   local pgid_file=$RUNTIME_DIR/instance.pgid
   setsid env -u WAYLAND_DISPLAY -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    XDG_CACHE_HOME="$RUNTIME_DIR/cache" \
     WLR_BACKENDS=headless \
     WLR_LIBINPUT_NO_DEVICES=1 \
     WLR_HEADLESS_OUTPUTS="$outputs" \
@@ -518,12 +524,15 @@ stop_instance() {
 # suite. This is not a convenience: only IPC subcommands honour UMBRIEL_SOCKET,
 # while `umbriel outputs` and every helper client are Wayland clients that
 # resolve XDG_RUNTIME_DIR and WAYLAND_DISPLAY, so an inherited session
-# environment silently points them at the developer's live compositor.
+# environment silently points them at the developer's live compositor. A
+# compositor the body starts itself logs into the instance as well, like the
+# harness's own (see start_instance).
 run_check_body() {
   local name=$1 output_file=$2
   local pgid_file=$RUNTIME_DIR/check.pgid
   setsid env -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
+    XDG_CACHE_HOME="$RUNTIME_DIR/cache" \
     WAYLAND_DISPLAY=wayland-0 \
     bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pgid_file" \
     timeout -k 5 "$CHECK_TIMEOUT" bash "$CHECKS_DIR/$name.sh" > "$output_file" 2>&1 &
@@ -761,7 +770,7 @@ if ((failed > 0)); then
   for index in "${!FAILED_NAMES[@]}"; do
     printf '%s\n' "    ${C_FAIL}·${C_OFF} ${FAILED_NAMES[index]} ${C_DIM}(${KEPT_DIRS[index]})${C_OFF}"
   done
-  printf '%s\n' "  ${C_DIM}each directory holds that check's compositor.log, config, and client logs${C_OFF}"
+  printf '%s\n' "  ${C_DIM}each directory holds that check's compositor.log, cache/umbriel/umbriel.log, config, and client logs${C_OFF}"
   exit 1
 fi
 printf '%s\n' "  ${C_PASS}${C_BOLD}${passed} passed${C_OFF} ${C_DIM}·${C_OFF} ${C_DIM}${total_time}${C_OFF}"
