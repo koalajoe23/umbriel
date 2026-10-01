@@ -1,11 +1,33 @@
+#include <stdio.h>
 #include <stdlib.h>
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_compositor.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/util/addon.h>
+#include <wlr/util/log.h>
 
 #include "types/wlr_scene.h"
 #include "umbrielfx/types/surface_pacing.h"
+
+static const char *output_name(const struct wlr_output *output) {
+	return output != NULL && output->name != NULL ? output->name : "-";
+}
+
+// Writes the surface's entered outputs, suspended ones marked, as
+// "DP-1 eDP-1(suspended)".
+static void describe_entered_outputs(struct wlr_surface *surface, char *buf, size_t size) {
+	size_t used = 0;
+	buf[0] = '\0';
+	struct wlr_surface_output *surface_output;
+	wl_list_for_each(surface_output, &surface->current_outputs, link) {
+		int written = snprintf(buf + used, size - used, "%s%s%s", used > 0 ? " " : "",
+			output_name(surface_output->output), surface_output->suspended ? "(suspended)" : "");
+		if (written < 0 || (size_t)written >= size - used) {
+			return;
+		}
+		used += (size_t)written;
+	}
+}
 
 static void surface_pacing_addon_destroy(struct wlr_addon *addon) {
 	struct umbrielfx_surface_pacing *pacing = wl_container_of(addon, pacing, addon);
@@ -30,6 +52,8 @@ static void handle_output_destroy(struct wl_listener *listener, void *data) {
 	struct umbrielfx_surface_pacing *pacing =
 		wl_container_of(listener, pacing, output_destroy);
 	struct wlr_output *destroyed = pacing->output;
+	wlr_log(WLR_DEBUG, "pacing output %s of surface %p destroyed", output_name(destroyed),
+		(void *)pacing->surface);
 
 	struct wlr_surface_output *surface_output;
 	wl_list_for_each(surface_output, &pacing->surface->current_outputs, link) {
@@ -82,6 +106,13 @@ void umbrielfx_surface_pacing_set_output(struct umbrielfx_surface_pacing *pacing
 		return;
 	}
 
+	if (wlr_log_get_verbosity() >= WLR_DEBUG) {
+		char entered[256];
+		describe_entered_outputs(pacing->surface, entered, sizeof(entered));
+		wlr_log(WLR_DEBUG, "pacing output of surface %p: %s -> %s (entered: %s)",
+			(void *)pacing->surface, output_name(pacing->output), output_name(output),
+			entered[0] != '\0' ? entered : "none");
+	}
 	pacing->output = output;
 	surface_pacing_watch_output(pacing);
 	wl_signal_emit_mutable(&pacing->events.output_change, NULL);

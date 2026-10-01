@@ -174,7 +174,8 @@ require a running-session check.
 A `tracy` build carries CPU zones at those boundaries through
 [`src/core/tracy.h`](../../src/core/tracy.h): `Output::handleFrame`,
 `Output::flushDirty`, `Output::render`, `Server::tickAnimations`, and
-`WineColorManager::applySurfaceDescriptions`. umbrielfx carries paired CPU and
+`WineColorManager::applySurfaceDescriptions`, plus the frame-pacing zones and
+plots listed in [Pacing protocols](pacing-protocols.md#diagnostics). umbrielfx carries paired CPU and
 GPU zones across its render pass. Every `wlr_scene_output_build_state` exit
 emits a frame mark, including the scanout one, so a capture separates
 scanned-out frames from composited ones: a scanned-out frame has a frame mark

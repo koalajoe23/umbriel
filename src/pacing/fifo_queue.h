@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <vector>
@@ -41,6 +42,7 @@ namespace umbriel {
     [[nodiscard]] std::vector<std::uint32_t> drain();
     [[nodiscard]] bool barrier() const { return m_barrier; }
     [[nodiscard]] bool empty() const { return m_queue.empty(); }
+    [[nodiscard]] std::size_t size() const { return m_queue.size(); }
     // Nothing a refresh would change: no barrier, no held commit, no setter in flight.
     [[nodiscard]] bool idle() const { return !m_barrier && m_queue.empty() && m_inFlightSetters.empty(); }
 

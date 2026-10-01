@@ -124,6 +124,10 @@ namespace umbriel {
     Nanoseconds m_hiddenTickDeadline = 0;
     wl_event_source* m_stallWatchdog = nullptr;
     bool m_stallWatchdogArmed = false;
+    // When the oldest frame requested from the pacing output since its last frame done was asked for; 0 for none.
+    Nanoseconds m_frameRequestedAt = 0;
+    // The current stall has been logged; cleared when the pacing output's frames resume or the output changes.
+    bool m_stallReported = false;
     // The latest refresh instant (frame done or watchdog), or when the pacer was last retained if that is later.
     Nanoseconds m_lastRefreshAt = 0;
     // The idle source that emits the latest frame done's refresh, and that refresh; the source is null when none is

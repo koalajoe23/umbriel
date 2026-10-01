@@ -1,5 +1,7 @@
 #include "pacing/surface_pacer.h"
 
+#include "core/log.h"
+#include "core/tracy.h"
 #include "pacing/pacing_clock.h"
 #include "wlr.h"
 
@@ -11,6 +13,8 @@
 namespace umbriel {
 
   namespace {
+
+    constexpr Logger kLog("pacing");
 
     void detach(wl_listener& listener) {
       wl_list_remove(&listener.link);
@@ -106,6 +110,9 @@ namespace umbriel {
 
   void SurfacePacer::requestFrame() {
     if (m_output != nullptr) {
+      if (m_frameRequestedAt == 0) {
+        m_frameRequestedAt = monotonicNow();
+      }
       wlr_output_schedule_frame(m_output);
     }
   }
@@ -184,6 +191,11 @@ namespace umbriel {
     // collapse into one refresh for the later one.
     const Nanoseconds when = toNanoseconds(*event->when);
     m_lastRefreshAt = std::max(m_lastRefreshAt, when);
+    m_frameRequestedAt = 0;
+    if (m_stallReported) {
+      m_stallReported = false;
+      kLog.debug("output '{}' produces frames again", m_output->name);
+    }
     if (m_retainCount == 0) {
       // Nothing to do this frame; the serial still counts the instant.
       ++m_refreshSerial;
@@ -201,6 +213,7 @@ namespace umbriel {
   }
 
   void SurfacePacer::handleDeferredRefresh() {
+    UMBRIEL_ZONE("SurfacePacer::frameRefresh");
     // An idle source is freed once it has run.
     m_deferredRefresh = nullptr;
     if (m_retainCount == 0) {
@@ -223,6 +236,7 @@ namespace umbriel {
   void SurfacePacer::handleOutputDestroy() { setOutput(nullptr); }
 
   void SurfacePacer::handleHiddenTick() {
+    UMBRIEL_ZONE("SurfacePacer::hiddenTick");
     m_hiddenTickArmed = false;
     if (m_output != nullptr || m_retainCount == 0) {
       return;
@@ -245,6 +259,8 @@ namespace umbriel {
     detach(m_outputDestroy);
 
     m_output = output;
+    m_frameRequestedAt = 0;
+    m_stallReported = false;
     if (output != nullptr) {
       // The previous present belonged to another output, or to this one before it hid the surface.
       m_lastPresent = 0;
@@ -281,6 +297,7 @@ namespace umbriel {
   // have stopped altogether (Output::handleFrame renders nothing while the session has lost the DRM device), so the
   // pacer refreshes on its own to keep held commits draining. Frames resuming push the deadline out again.
   void SurfacePacer::handleStallWatchdog() {
+    UMBRIEL_ZONE("SurfacePacer::stallWatchdog");
     m_stallWatchdogArmed = false;
     if (m_output == nullptr || m_retainCount == 0) {
       return;
@@ -290,6 +307,16 @@ namespace umbriel {
     if (delay > 0) {
       armStallWatchdog(delay);
       return;
+    }
+    // The watchdog also ticks while nothing has asked for a frame (a timed commit waiting for a target further out
+    // than its frame wakeup), so only a frame that was asked for and never came is a stall worth reporting.
+    if (!m_stallReported && m_frameRequestedAt != 0 && now - m_frameRequestedAt >= stallRefreshInterval(period())) {
+      m_stallReported = true;
+      kLog.info(
+          "output '{}' produced no frame for {} ms after one was requested; paced surfaces refresh on a timer until it "
+          "does",
+          m_output->name, (now - m_frameRequestedAt) / kNsecPerMsec
+      );
     }
     m_lastRefreshAt = now;
     // Re-armed before emitting; a listener that releases the pacer lets it lapse.
