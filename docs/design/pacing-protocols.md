@@ -337,6 +337,34 @@ reasonable guess than a guarantee. This is accepted scope, not a bug to fix
 here (see "Out of scope" above); revisit only if the removal in the next
 section is not imminent and a real client's behavior degrades under VRR.
 
+## Diagnostics
+
+Pacing follows the project's two diagnostics channels (CONTRIBUTING.md,
+"Debugging" and "Profiling"); it has no switch of its own.
+
+`umbriel.log`, which records debug lines in every build, gets the rare state
+changes under the `pacing` section, plus umbrielfx's scene view through
+`wlr_log`. Surfaces are named by their `wlr_surface` pointer, which matches
+wlroots' own `New wlr_surface 0x...` line.
+
+| Level | What | Why it matters |
+| --- | --- | --- |
+| debug (umbrielfx) | `pacing output of surface ...: A -> B (entered: ...)`, with each entered output and whether it is suspended; `pacing output ... destroyed` | Which output paces a surface, and why it went hidden or visible |
+| debug | `wp_fifo_v1` and `wp_commit_timer_v1` created, destroyed (with the commits a fifo releases or a timer leaves holding), a lingering timer taken over, a surface destroyed under one | A client recreating its swapchain shows as a destroy and create pair |
+| debug | Each protocol error posted, by name | Which request a disconnected client got wrong |
+| info | `output '...' produced no frame for N ms after one was requested`, once per stall; a debug line when frames resume | A requested frame never came (a session that lost the DRM device, as on a VT switch), so the stall watchdog paces the surface. Not logged: the watchdog ticking while a timed commit waits for a distant target and nothing has asked for a frame, and an output powered off with `dpms-off`, which hides its surfaces so the hidden tick paces them |
+| error | Out of memory creating either object | The client gets `no_memory` |
+
+Per-frame work goes to Tracy instead, where it lines up with
+`Output::handleFrame` and umbrielfx's render-pass zones: zones for each refresh
+source (`SurfacePacer::frameRefresh`, `::hiddenTick`, `::stallWatchdog`) and
+for the handlers that hold and release commits (`Fifo::handleClientCommit`,
+`Fifo::handlePacerRefresh`, `CommitTimer::handleClientCommit`,
+`CommitTimer::handlePacerRefresh`, `CommitTimer::handleTimer`), and two plots:
+`fifo-v1 held commits` after each refresh, and `commit-timing head target -
+release present (ms)` at each refresh, about two periods while a client runs
+ahead of its targets and negative once one has slipped.
+
 ## Removal when wlroots ships both protocols
 
 1. Delete `src/pacing/` and its unit tests (`tests/unit/fifo_queue.cpp`,

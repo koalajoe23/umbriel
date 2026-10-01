@@ -1,5 +1,7 @@
 #include "pacing/fifo_manager.h"
 
+#include "core/log.h"
+#include "core/tracy.h"
 #include "fifo-v1-server-protocol.h"
 #include "pacing/fifo_queue.h"
 #include "pacing/pacer_subscription.h"
@@ -14,6 +16,8 @@
 namespace umbriel {
 
   namespace {
+
+    constexpr Logger kLog("pacing");
 
     constexpr uint32_t kProtocolVersion = 1;
 
@@ -111,6 +115,10 @@ namespace umbriel {
         wlr_surface* surface = fifo->m_surface;
         if (surface != nullptr) {
           const std::vector<std::uint32_t> released = fifo->m_queue.drain();
+          kLog.debug(
+              "wp_fifo_v1 destroyed for surface {}, releasing {} held commits", static_cast<const void*>(surface),
+              released.size()
+          );
           fifo->detach();
           // Unlocking can apply commits synchronously; the fifo no longer listens, so none reach it.
           for (const std::uint32_t seq : released) {
@@ -151,6 +159,7 @@ namespace umbriel {
       // A commit that waits for the barrier while one is set, while a setter ahead of it has not applied yet, or while
       // older commits are still held, is held too. Every commit is recorded, so setters are tracked until they apply.
       void handleClientCommit() {
+        UMBRIEL_ZONE("Fifo::handleClientCommit");
         const bool hold = m_queue.shouldHold(m_pending.waitBarrier, isSynchronizedSubsurface(m_surface));
         if (hold) {
           const std::uint32_t seq = wlr_surface_lock_pending(m_surface);
@@ -179,6 +188,7 @@ namespace umbriel {
       // does not count for it. The pacing output changing does not flush the queue: it simply follows the new
       // output's refreshes.
       void handlePacerRefresh(const PacerRefreshEvent& event) {
+        UMBRIEL_ZONE("Fifo::handlePacerRefresh");
         if (m_queue.barrier() && m_barrierSerial >= event.serial) {
           if (SurfacePacer* pacer = m_pacer.pacer()) {
             pacer->requestFrame();
@@ -194,6 +204,7 @@ namespace umbriel {
         if (!m_queue.empty() && pacer != nullptr) {
           pacer->requestFrame();
         }
+        UMBRIEL_PLOT("fifo-v1 held commits", static_cast<int64_t>(m_queue.size()));
         updateRetain();
       }
 
@@ -203,6 +214,10 @@ namespace umbriel {
       // The surface is being destroyed: its cached states, held commits included, go with it, so the queue is
       // dropped without unlocking anything.
       void handleSurfaceDestroy() {
+        kLog.debug(
+            "surface {} destroyed under its wp_fifo_v1 with {} held commits", static_cast<const void*>(m_surface),
+            m_queue.size()
+        );
         m_queue = FifoQueue{};
         detach();
       }
@@ -218,6 +233,7 @@ namespace umbriel {
       }
 
       void postSurfaceDestroyed() {
+        kLog.debug("wp_fifo_v1 request after its surface was destroyed: posting surface_destroyed");
         wl_resource_post_error(
             m_resource, WP_FIFO_V1_ERROR_SURFACE_DESTROYED, "the wp_fifo_v1's surface no longer exists"
         );
@@ -256,6 +272,7 @@ namespace umbriel {
     static void handleGetFifo(wl_client* client, wl_resource* manager, uint32_t id, wl_resource* surfaceResource) {
       wlr_surface* surface = wlr_surface_from_resource(surfaceResource);
       if (Fifo::surfaceHasFifo(surface)) {
+        kLog.debug("second wp_fifo_v1 for surface {}: posting already_exists", static_cast<const void*>(surface));
         wl_resource_post_error(
             manager, WP_FIFO_MANAGER_V1_ERROR_ALREADY_EXISTS, "the surface already has a wp_fifo_v1 object"
         );
@@ -263,11 +280,13 @@ namespace umbriel {
       }
       wl_resource* resource = wl_resource_create(client, &wp_fifo_v1_interface, wl_resource_get_version(manager), id);
       if (resource == nullptr) {
+        kLog.error("out of memory creating a wp_fifo_v1 for surface {}", static_cast<const void*>(surface));
         wl_client_post_no_memory(client);
         return;
       }
       auto* fifo = new (std::nothrow) Fifo(resource, surface);
       if (fifo == nullptr || !fifo->attach()) {
+        kLog.error("out of memory creating a wp_fifo_v1 for surface {}", static_cast<const void*>(surface));
         delete fifo;
         wl_resource_destroy(resource);
         wl_client_post_no_memory(client);
@@ -275,6 +294,7 @@ namespace umbriel {
       }
       // Owned by the resource; freed by Fifo::handleResourceDestroy.
       wl_resource_set_implementation(resource, &Fifo::kImplementation, fifo, Fifo::handleResourceDestroy);
+      kLog.debug("wp_fifo_v1 created for surface {}", static_cast<const void*>(surface));
     }
   };
 

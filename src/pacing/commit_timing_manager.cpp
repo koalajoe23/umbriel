@@ -1,6 +1,8 @@
 #include "pacing/commit_timing_manager.h"
 
 #include "commit-timing-v1-server-protocol.h"
+#include "core/log.h"
+#include "core/tracy.h"
 #include "pacing/commit_timing_policy.h"
 #include "pacing/pacer_subscription.h"
 #include "pacing/pacing_clock.h"
@@ -18,6 +20,8 @@
 namespace umbriel {
 
   namespace {
+
+    constexpr Logger kLog("pacing");
 
     constexpr uint32_t kProtocolVersion = 1;
 
@@ -126,16 +130,19 @@ namespace umbriel {
       handleSetTimestamp(wl_client* /*client*/, wl_resource* resource, uint32_t secHi, uint32_t secLo, uint32_t nsec) {
         CommitTimer* timer = fromResource(resource);
         if (timer->m_surface == nullptr) {
+          kLog.debug("wp_commit_timer_v1 request after its surface was destroyed: posting surface_destroyed");
           wl_resource_post_error(
               resource, WP_COMMIT_TIMER_V1_ERROR_SURFACE_DESTROYED, "the wp_commit_timer_v1's surface no longer exists"
           );
           return;
         }
         if (nsec >= kNsecPerSec) {
+          kLog.debug("wp_commit_timer_v1 timestamp with tv_nsec {}: posting invalid_timestamp", nsec);
           wl_resource_post_error(resource, WP_COMMIT_TIMER_V1_ERROR_INVALID_TIMESTAMP, "tv_nsec is out of range");
           return;
         }
         if (timer->m_pending.target.has_value()) {
+          kLog.debug("second wp_commit_timer_v1 timestamp before a commit: posting timestamp_exists");
           wl_resource_post_error(
               resource, WP_COMMIT_TIMER_V1_ERROR_TIMESTAMP_EXISTS, "the pending commit already has a timestamp"
           );
@@ -150,6 +157,14 @@ namespace umbriel {
       static void handleResourceDestroy(wl_resource* resource) {
         CommitTimer* timer = fromResource(resource);
         timer->m_resource = nullptr;
+        if (timer->m_surface != nullptr && !timer->m_queue.empty()) {
+          kLog.debug(
+              "wp_commit_timer_v1 destroyed for surface {}; its {} held commits keep their targets",
+              static_cast<const void*>(timer->m_surface), timer->m_queue.size()
+          );
+        } else {
+          kLog.debug("wp_commit_timer_v1 destroyed for surface {}", static_cast<const void*>(timer->m_surface));
+        }
         timer->freeIfDone();
       }
 
@@ -187,6 +202,7 @@ namespace umbriel {
       // held too: the protocol makes no exception, and wlroots applies the cached state only once both the parent's
       // commit and this lock have released it.
       void handleClientCommit() {
+        UMBRIEL_ZONE("CommitTimer::handleClientCommit");
         if (!m_pending.target.has_value()) {
           return;
         }
@@ -201,6 +217,13 @@ namespace umbriel {
       // a hidden tick releases those whose target has passed. The pacing output changing
       // does not flush the queue: it simply follows the new output's refreshes.
       void handlePacerRefresh(const PacerRefreshEvent& event) {
+        UMBRIEL_ZONE("CommitTimer::handlePacerRefresh");
+        // How far the head's target lies past the present a commit released now would reach: about two periods while
+        // a client runs ahead of its targets, negative once a target has slipped.
+        UMBRIEL_PLOT(
+            "commit-timing head target - release present (ms)",
+            m_queue.empty() ? 0.0 : static_cast<double>(m_queue.front().target - event.releasePresent) / 1e6
+        );
         if (event.hidden) {
           releaseWhile([&](Nanoseconds target) { return target <= event.when; });
         } else {
@@ -220,6 +243,7 @@ namespace umbriel {
       // While visible the timer only asks for the frames whose refreshes release the head; while hidden, with no
       // frames to wait for, it releases the head itself once its target has passed.
       void handleTimer() {
+        UMBRIEL_ZONE("CommitTimer::handleTimer");
         m_timerArmed = false;
         if (visible()) {
           m_pacer.pacer()->requestFrame();
@@ -236,6 +260,10 @@ namespace umbriel {
       // The surface is being destroyed: its cached states, held commits included, go with it, so the queue is
       // dropped without unlocking anything.
       void handleSurfaceDestroy() {
+        kLog.debug(
+            "surface {} destroyed under its wp_commit_timer_v1 with {} held commits",
+            static_cast<const void*>(m_surface), m_queue.size()
+        );
         m_queue.clear();
         detach();
         if (m_resource == nullptr) {
@@ -354,6 +382,9 @@ namespace umbriel {
       wlr_surface* surface = wlr_surface_from_resource(surfaceResource);
       CommitTimer* lingering = CommitTimer::fromSurface(surface);
       if (lingering != nullptr && lingering->hasResource()) {
+        kLog.debug(
+            "second wp_commit_timer_v1 for surface {}: posting commit_timer_exists", static_cast<const void*>(surface)
+        );
         wl_resource_post_error(
             manager, WP_COMMIT_TIMING_MANAGER_V1_ERROR_COMMIT_TIMER_EXISTS,
             "the surface already has a wp_commit_timer_v1 object"
@@ -363,6 +394,7 @@ namespace umbriel {
       wl_resource* resource =
           wl_resource_create(client, &wp_commit_timer_v1_interface, wl_resource_get_version(manager), id);
       if (resource == nullptr) {
+        kLog.error("out of memory creating a wp_commit_timer_v1 for surface {}", static_cast<const void*>(surface));
         wl_client_post_no_memory(client);
         return;
       }
@@ -372,10 +404,15 @@ namespace umbriel {
         wl_resource_set_implementation(
             resource, &CommitTimer::kImplementation, lingering, CommitTimer::handleResourceDestroy
         );
+        kLog.debug(
+            "wp_commit_timer_v1 created for surface {}, taking over its lingering timing state",
+            static_cast<const void*>(surface)
+        );
         return;
       }
       auto* timer = new (std::nothrow) CommitTimer(resource, surface);
       if (timer == nullptr || !timer->attach()) {
+        kLog.error("out of memory creating a wp_commit_timer_v1 for surface {}", static_cast<const void*>(surface));
         delete timer;
         wl_resource_destroy(resource);
         wl_client_post_no_memory(client);
@@ -385,6 +422,7 @@ namespace umbriel {
       wl_resource_set_implementation(
           resource, &CommitTimer::kImplementation, timer, CommitTimer::handleResourceDestroy
       );
+      kLog.debug("wp_commit_timer_v1 created for surface {}", static_cast<const void*>(surface));
     }
   };
 
