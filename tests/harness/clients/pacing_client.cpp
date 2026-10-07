@@ -29,6 +29,10 @@
 //                            more per commit modulo a period, so every target lies ahead at a varying phase
 //   timer-destroy-mid <offset-ms>
 //                            as timing, but destroys the wp_commit_timer_v1 right after the timed commit
+//   wsi-fifo <count>         binds both; on "b", <count> frames back to back the way Mesa's and NVIDIA's Vulkan WSI
+//                            present in FIFO mode: a commit targeted a period after the previous frame's target (less
+//                            a 500 us margin) that sets and waits for the barrier, then an empty commit that only
+//                            waits for it; then "done"
 //   timing-invalid           sets a timestamp whose tv_nsec is out of range, which is a protocol error
 //   timing-duplicate         sets two timestamps for one commit, which is a protocol error
 //   timer-duplicate          asks for two wp_commit_timer_v1 objects for the surface, which is a protocol error
@@ -515,6 +519,32 @@ namespace {
     wl_surface_commit(state.surface);
   }
 
+  // Mesa's wsi_wl_swapchain_queue_present with fifo-v1 and commit-timing-v1, which NVIDIA's Vulkan WSI matches: the
+  // empty second commit gives the compositor a later content update, so the timed one's feedback resolves (discarded)
+  // even on a surface nothing shows, where it would otherwise wait for a present that never comes.
+  void commandWsiFifo(State& state, char command) {
+    if (command != 'b' || state.timer == nullptr || state.fifo == nullptr) {
+      return;
+    }
+    constexpr uint64_t kTargetMarginNsec = 500'000;
+    state.burstActive = true;
+    const uint64_t start = monotonicNsec();
+    for (uint32_t i = 0; i < state.burstCount; ++i) {
+      const std::optional<uint32_t> index = prepareFeedbackCommit(state);
+      if (!index) {
+        return;
+      }
+      const uint64_t target = start + (i * refreshPeriodNsec(state)) - kTargetMarginNsec;
+      setTimestamp(state, target);
+      logLine(std::format("target {} {}", *index, target));
+      wp_fifo_v1_set_barrier(state.fifo);
+      wp_fifo_v1_wait_barrier(state.fifo);
+      wl_surface_commit(state.surface);
+      wp_fifo_v1_wait_barrier(state.fifo);
+      wl_surface_commit(state.surface);
+    }
+  }
+
   void mappedTimingInvalid(State& state) {
     if (getTimer(state)) {
       wp_commit_timer_v1_set_timestamp(state.timer, 0, 1, 1'000'000'000U);
@@ -551,6 +581,7 @@ namespace {
       Mode{
           .name = "timer-destroy-mid", .parse = parseOffset, .mapped = mappedTiming, .command = commandTimerDestroyMid
       },
+      Mode{.name = "wsi-fifo", .parse = parseCount, .mapped = mappedTimingFifo, .command = commandWsiFifo},
       Mode{.name = "timing-invalid", .parse = parseNoArgs, .mapped = mappedTimingInvalid, .command = commandIgnored},
       Mode{
           .name = "timing-duplicate", .parse = parseNoArgs, .mapped = mappedTimingDuplicate, .command = commandIgnored

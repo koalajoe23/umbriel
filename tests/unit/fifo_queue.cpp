@@ -138,6 +138,35 @@ UMBRIEL_TEST(appliedSetterRetiresInFlight) {
   CHECK(!queue.shouldHold(true, false));
 }
 
+UMBRIEL_TEST(wsiFramePairs) {
+  // Mesa's and NVIDIA's Vulkan WSI send each FIFO frame as a timed commit that sets and waits for the barrier, then an
+  // empty commit that only waits. Commit-timing holds each timed commit, so the fifo sees it only as a setter in
+  // flight.
+  FifoQueue queue;
+  CHECK(!queue.shouldHold(true, false));
+  queue.committed(true); // timed frame 0
+  CHECK(queue.shouldHold(true, false));
+  queue.hold({1, false}); // empty commit 0
+  queue.committed(false);
+  CHECK(queue.shouldHold(true, false));
+  queue.hold({2, true}); // timed frame 1
+  queue.committed(true);
+  queue.hold({3, false}); // empty commit 1
+  queue.committed(false);
+  // Frame 0 has not applied: no refresh counts for it yet.
+  CHECK(queue.refresh().empty());
+  queue.applied(true);
+  // Frame 0 had its refresh: its empty commit and frame 1 go together, stopping at frame 1's barrier.
+  CHECK_EQ(queue.refresh(), (std::vector<std::uint32_t>{1, 2}));
+  queue.applied(false);
+  // Frame 1 is still held by commit-timing: its empty commit waits until it applies and has a refresh.
+  CHECK(queue.refresh().empty());
+  queue.applied(true);
+  // The last empty commit is released too, so the last frame is followed by a later content update.
+  CHECK_EQ(queue.refresh(), (std::vector<std::uint32_t>{3}));
+  CHECK(queue.idle());
+}
+
 // Idle: nothing for a refresh to do, so the manager lets the pacer stop ticking.
 
 UMBRIEL_TEST(idleUntilWorkArrives) {
