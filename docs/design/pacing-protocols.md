@@ -126,6 +126,57 @@ listener releasing A before the fifo's listener runs. The
 `timing-fifo-pair` case of `protocol/commit_timing` asserts both: without
 either piece, the setter is discarded.
 
+## Vulkan WSI frame pairs: the trailing empty commit
+
+Mesa's Vulkan WSI (`wsi_wl_swapchain_queue_present` in
+`src/vulkan/wsi/wsi_common_wayland.c`), when the compositor offers both
+protocols, sends every FIFO-mode frame as two content updates:
+
+```
+set_timestamp(t) + attach + set_barrier + wait_barrier -> commit   // the frame
+wait_barrier                                           -> commit   // empty
+```
+
+`t` is the next phase-locked refresh after the last presented frame, less a
+500 µs margin. The empty update exists for forward progress. Its comment says:
+on an occluded surface the timed update's time and fifo constraints are met,
+but nothing presents it and no later update discards it, so
+`vkWaitForPresentKHR` would wait forever. The empty update is that later
+update. Both updates wait on the barrier so the empty one cannot cause a
+spurious `discarded` for the frame before it (Mesa `b9c8afae33`,
+[MR !32121](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/32121);
+the pattern came in with
+[MR !26150](https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/26150),
+Mesa 24.3). With fifo-v1 but no commit-timing, Mesa sends one update per frame.
+
+NVIDIA's closed Vulkan WSI (fifo-v1 since 580.65.06) sends the same pair,
+with the same 500 µs margin. A trace of Minecraft 26.3 on its Vulkan
+backend (NVIDIA 615.71.09) showed 5154 `set_barrier`, 10308 `wait_barrier`,
+5147 `set_timestamp` and 10314 commits. On its OpenGL backend, NVIDIA's
+`egl-wayland2` sent `set_barrier` on every commit but never `wait_barrier`
+and never `set_timestamp`, and paced with frame callbacks instead. Mesa's
+OpenGL (`libEGL_mesa`) does not use fifo-v1 at all. So the fifo hold path
+matters for Vulkan clients, not OpenGL ones.
+
+Two things in Umbriel make the pair work:
+
+- **The empty update is held like any other.** `FifoQueue` does not look at
+  buffers. The empty update waits behind its frame, which commit-timing
+  still holds, as an in-flight setter. The refresh that counts for the frame
+  releases the empty update together with the next frame
+  (`wsiFramePairs` in `tests/unit/fifo_queue.cpp`).
+- **Applying it discards an unshown frame.** wlroots 0.20.2's presentation
+  `move_state` destroys the current feedback whenever a later state applies,
+  even one with no feedback of its own. A frame the scene never sampled is
+  then sent `discarded`. On a hidden surface the hidden tick releases the
+  empty update, so the last frame of a burst resolves too.
+
+`protocol/fifo_wsi` drives this pattern through `pacing-client wsi-fifo`.
+Visible, every frame presents on its own refresh. Hidden, every frame is
+discarded, the last one included. Without the empty commit the hidden half
+times out with the last frame unresolved; that was checked by removing it
+from the client.
+
 ## Retained only while working; the stall watchdog
 
 A pacer emits refreshes and runs timers only while retained, and a manager
@@ -384,7 +435,7 @@ ahead of its targets and negative once one has slipped.
    `PacerSubscription` with them. Keep `wp_fifo_manager_v1` and
    `wp_commit_timing_manager_v1` in `kAllowedSecurityContextGlobals`
    (`src/server/server.cpp`); the interface names do not change.
-3. Keep the harness checks: `tests/harness/checks/protocol/{fifo,
+3. Keep the harness checks: `tests/harness/checks/protocol/{fifo,fifo_wsi,
    commit_timing,commit_timing_stream}.sh` and
    `tests/harness/clients/pacing_client.cpp` assert protocol behavior, not
    this implementation, and should keep passing unchanged against the
