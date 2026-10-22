@@ -31,9 +31,16 @@ namespace umbriel {
   }
 
   void ViewPresentation::animateTo(int width, int height, int durationMs, const AnimationCurve& curve) {
-    m_animW.snap(m_width);
+    // A tween still presenting this size keeps its speed through the retarget; anything else starts from the size
+    // shown.
+    const auto restart = [](AnimatedValue& anim, int shown) {
+      if (!anim.animating() || std::lround(anim.current()) != shown) {
+        anim.snap(shown);
+      }
+    };
+    restart(m_animW, m_width);
     m_animW.retarget(width, durationMs, curve);
-    m_animH.snap(m_height);
+    restart(m_animH, m_height);
     m_animH.retarget(height, durationMs, curve);
   }
 
@@ -42,9 +49,12 @@ namespace umbriel {
     m_animH.snap(height);
   }
 
-  bool ViewPresentation::tick(uint64_t nowMsec) {
+  bool ViewPresentation::tick(double nowMsec) {
     const bool movedW = m_animW.tick(nowMsec);
     const bool movedH = m_animH.tick(nowMsec);
+    // A carried-speed spring settles on its own solver; stop it once no pixel can change.
+    static_cast<void>(m_animW.finishSpringTail(1.0));
+    static_cast<void>(m_animH.finishSpringTail(1.0));
     if (!movedW && !movedH) {
       return false;
     }

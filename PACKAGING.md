@@ -59,6 +59,11 @@ meson test -C build
 `jemalloc` is optional and recommended on glibc. The `jemalloc` Meson feature
 defaults to `auto`. It is skipped on non-glibc systems.
 
+The `localed` Meson feature defaults to `auto` and links libsystemd when it is
+found. `-Dlocaled=disabled` builds without it; keyboards with no XKB
+configuration then use libxkbcommon's defaults instead of the
+systemd-localed keymap.
+
 ## umbrielfx
 
 Umbriel's scene graph and GLES2 renderer live in `umbrielfx/`, a hard fork of
@@ -80,8 +85,9 @@ distribution-provided LTO and archive member pruning.
 - wayland-server 1.24 or newer, plus the Wayland client library
 - wayland-protocols 1.47 or newer
 - xkbcommon
-- libinput 1.23 or newer
+- libinput 1.27 or newer
 - libudev, required for native `[drm]` GPU exclusion support
+- libsystemd 243 or newer, required to read the systemd-localed keymap for keyboards with no XKB configuration
 - pixman 0.43 or newer
 - libdrm 2.4.129 or newer
 - libdisplay-info 0.3 or newer
@@ -89,7 +95,7 @@ distribution-provided LTO and archive member pruning.
 - tomlplusplus
 - nlohmann-json
 - xcb, xcb-icccm, and xcb-ewmh
-- xcb-render when the `tests` feature is enabled
+- xcb-render and xcb-xfixes when the `tests` feature is enabled
 - EGL, GLES2, and GBM
 - lcms2, optional; without it `umbrielfx` rejects client ICC profiles and keeps only its parametric color transforms
 - jemalloc on glibc, optional
@@ -210,20 +216,32 @@ manager-provided environment.
 The managed path imports the resulting login environment, including `PATH`,
 then starts `umbriel.service`. Login-profile values take precedence over
 variables with the same names generated from `environment.d`, while values
-present only in the user manager remain available. Once ready, Umbriel
-publishes its graphical session variables and validated `[environment]`
-assignments to the systemd user manager, then starts
-`umbriel-session.target`. The imported login-environment values are also copied
+present only in the user manager remain available. The service uses
+`Type=notify` and queues `umbriel-session.target` and
+`graphical-session.target` in the initial startup transaction, ordered after
+the compositor. Umbriel waits for publication of its graphical session
+variables and validated `[environment]` assignments to the systemd user
+manager before sending `READY=1` and launching configured startup commands.
+The graphical and IPC sockets are available before readiness is reported.
+Services ordered after `graphical-session.target` therefore wait for the
+published environment without requiring portal service overrides. A failed
+environment import prevents the managed compositor from reporting ready.
+The imported login-environment values are also copied
 to traditional D-Bus activation. Arbitrary configured values are not copied
 there. Imported login-environment and configured values remain in the user
-manager for its lifetime. The launcher activates `umbriel-shutdown.target` and
-removes the graphical variables after Umbriel exits.
+manager for its lifetime. User quits in the packaged `umbriel.service` activate
+`umbriel-shutdown.target` before the compositor exits. The service is ordered
+before `graphical-session.target`, so session services stop first. If shutdown
+control is unavailable or the request fails, the compositor terminates directly.
+The launcher also activates the shutdown target and removes the graphical
+variables after Umbriel exits.
 
 In a managed native session, Umbriel creates a separate transient scope under
 `app.slice` for the `-s` startup command and every autostart, event hook, and
 `spawn:` command. Each scope is part of `umbriel-session.target` and bound to
-the systemd unit that owns the compositor, normally `umbriel.service`. Stopping
-either one, or an unexpected compositor exit, cleans up the scope, including
+the systemd unit that owns the compositor, normally `umbriel.service`. Each scope
+is ordered after its owner so the application stops before the compositor.
+Stopping either one, or an unexpected compositor exit, cleans up the scope, including
 when session-target activation fails.
 An application failure or OOM kill does not propagate in the other direction,
 so it cannot stop `umbriel.service`. `systemd-run` waits for scope creation

@@ -36,7 +36,7 @@ namespace umbriel {
     size_t active = 0;
     // The tabs the bar shows: every one, or a scrolled run of them when there are more than it has slots for.
     TabStrip strip;
-    // Space between the bar and the border of the window it sits over, the layout gap the column reserved with it.
+    // Space between the bar and the border of the window it sits over, the bar gap the column reserved with it.
     int gap = 0;
     bool operator==(const TabBarModel&) const = default;
   };

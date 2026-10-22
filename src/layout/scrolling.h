@@ -2,6 +2,7 @@
 
 #include "layout/layout.h"
 
+#include <array>
 #include <optional>
 #include <vector>
 
@@ -37,6 +38,10 @@ namespace umbriel {
     [[nodiscard]] int maxScroll(int viewportPrimary) const {
       return std::max(0, totalWidth(viewportPrimary) - viewportPrimary);
     }
+    // Scroll offsets where a strip gesture can rest on `columnIndex`: flush with the viewport's leading and trailing
+    // edges, within [0, maxScroll]. A column at least as wide as the viewport (fullscreen, maximize-to-edges) overhangs
+    // it by an edge pad on each side, so both are the offset covering the viewport, as ensureVisible places it.
+    [[nodiscard]] std::array<double, 2> snapScrolls(int columnIndex, int viewportPrimary) const;
 
     void insertView(View* view, int columnIndex) override;
     void insertViewIntoColumn(View* view, int columnIndex, int rowIndex) override;

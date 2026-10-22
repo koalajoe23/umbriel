@@ -76,13 +76,30 @@ Use this only for actions that are safe without an unlocked session.
 ## Keyboard shortcuts inhibition
 
 Games and remote desktop clients can ask Umbriel to pass keyboard shortcuts
-through. Pointer and wheel binds are unaffected.
+through. You can also enable passthrough manually with
+`shortcuts-inhibit-toggle`, even when the focused client has not requested it.
+Keys that would trigger ordinary bindings then reach the client. Pointer and
+wheel binds are unaffected.
 
 Keep one escape binding available:
 
 ```toml
 "Mod+Shift+Escape" = { action = "shortcuts-inhibit-toggle", allow_when_inhibited = true, repeat = false }
 ```
+
+Press the binding again to restore ordinary shortcuts. Bindings marked
+`allow_when_inhibited = true` remain available in either mode.
+
+Manual passthrough belongs to the exact keyboard-focused surface. It pauses
+when focus moves to another surface and resumes when that surface regains
+focus. Popups and other surfaces do not inherit it. Destroying the surface
+clears its manual state. The toggle requires an unlocked session with a focused
+surface; locking preserves the setting for when focus returns after unlocking.
+
+When the client already has a shortcuts inhibitor, the toggle activates or
+deactivates that inhibitor. If the client creates one while manual passthrough
+is active, one toggle disables both sources together. Destroying a client
+inhibitor does not clear an existing manual setting.
 
 ## Cooldown
 
@@ -197,6 +214,22 @@ Any non-modifier key or mouse button closes it. Normal bound actions still run.
 ```
 
 ## Example: media and brightness keys
+
+With the Noctalia shell, route these keys through its IPC: the volume and
+brightness OSDs show, and the binds stay available while the session is locked.
+
+```toml
+"XF86AudioRaiseVolume" = { action = "spawn:noctalia msg volume-up", allow_when_locked = true }
+"XF86AudioLowerVolume" = { action = "spawn:noctalia msg volume-down", allow_when_locked = true }
+"XF86AudioMute" = { action = "spawn:noctalia msg volume-mute", allow_when_locked = true, repeat = false }
+"XF86AudioPlay" = { action = "spawn:noctalia msg media toggle", allow_when_locked = true, repeat = false }
+"XF86AudioNext" = { action = "spawn:noctalia msg media next", allow_when_locked = true }
+"XF86AudioPrev" = { action = "spawn:noctalia msg media previous", allow_when_locked = true }
+"XF86MonBrightnessUp" = { action = "spawn:noctalia msg brightness-up", allow_when_locked = true }
+"XF86MonBrightnessDown" = { action = "spawn:noctalia msg brightness-down", allow_when_locked = true }
+```
+
+Without the shell, spawn the usual utilities directly:
 
 ```toml
 "XF86AudioRaiseVolume" = "spawn:wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%+"

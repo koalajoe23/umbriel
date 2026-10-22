@@ -2,6 +2,7 @@
 
 #include "config/config.h"
 #include "layout/dwindle.h"
+#include "layout/floating.h"
 #include "layout/master.h"
 #include "layout/scrolling.h"
 
@@ -11,6 +12,7 @@
 #include <limits>
 #include <memory>
 #include <ranges>
+#include <utility>
 
 extern "C" {
 #include <wlr/util/box.h>
@@ -80,7 +82,7 @@ namespace umbriel {
     if (m_config == nullptr || !tabBarShown(*m_config, tabs, bar)) {
       return 0;
     }
-    return m_config->tabs.barHeight + m_config->gap;
+    return m_config->tabs.barHeight + m_config->tabs.barGap;
   }
 
   wlr_box Layout::tabbedBox(const wlr_box& box, size_t tabs, std::optional<bool> bar) const {
@@ -215,9 +217,11 @@ namespace umbriel {
     case LayoutMode::Master:
       return std::make_unique<MasterStackLayout>();
     case LayoutMode::Scrolling:
-    default:
       return std::make_unique<ScrollingLayout>();
+    case LayoutMode::Floating:
+      return std::make_unique<FloatingLayout>();
     }
+    std::unreachable();
   }
 
   uint32_t resizeEdgesForPoint(const wlr_box& box, double cx, double cy) {

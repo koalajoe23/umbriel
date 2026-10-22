@@ -24,10 +24,13 @@ are required, `[bracket]` forms are optional.
 | `[<scratchpad>]` | Scratchpad name. The bare form selects the implicit `default` scratchpad, which exists only when no named scratchpads are configured |
 | `<fraction>` | `0.1` to `1.0` of the column extent, or of the usable area for a floating window |
 | `<delta>` | Signed `-0.9` to `0.9`; the result clamps to `0.1` to `1.0` |
-| `<scrolling\|dwindle\|master\|toggle[:mode1,mode2,...]>` | Layout mode for `workspace-set-layout`; `toggle` cycles scrolling, dwindle, master; `toggle:mode1,mode2,...` cycles only the listed modes (two or more, each once) in order, switching to the first from an unlisted mode, as in `toggle:scrolling,master` |
+| `<nits>[/<output>]` | SDR reference white in cd/m2, `80` to `1000`; append `/output` to select one output, otherwise the preferred output |
+| `<scrolling\|dwindle\|master\|floating\|toggle[:mode1,mode2,...]>` | Layout mode for `workspace-set-layout`; `toggle` cycles scrolling, dwindle, master, floating; `toggle:mode1,mode2,...` cycles only the listed modes (two or more, each once) in order, switching to the first from an unlisted mode, as in `toggle:scrolling,master` |
 | `<normal\|tabbed>` | How `column-set-display` shows the rows around the focused window: stacked, or as a tab group |
 | `<index>` | Tab position for `column-focus-tab`, counted from `1` within the focused tab group; negative counts back from the last tab, `-1` |
 | `[skip-confirmation]` | `session-quit` only: quit without the on-screen confirmation |
+| `<anchor>/<x>/<y>[/<window-id>]` | `window-move-to` only: an anchor from [Floating position](window-rules.md#floating-position) and signed offsets in logical pixels. Right and bottom anchors measure inward from those edges; the result is kept inside the usable area |
+| `<delta-x>/<delta-y>[/<window-id>]` | `window-move-by` only: signed offsets in logical pixels from the current position, kept inside the usable area |
 
 Effect `set` and `cycle` split at the first `/`; everything after it is the
 window id or output name. For example, `effect-screen-set:cinema/vendor/panel`
@@ -125,6 +128,7 @@ Sizing rules per layout live in [Sizing behavior](layout.md#sizing-behavior).
 | `layout-scroll-left` | Scroll the strip toward its start |
 | `layout-scroll-right` | Scroll the strip toward its end |
 | `layout-scroll-up` | Scroll the strip toward its start |
+| `layout-toggle-split` | Toggle the focused tile's dwindle split direction |
 | `window-center` | Center the focused floating window on its output |
 | `window-consume-from-left` | Pull the left column's window into the focused column |
 | `window-consume-from-right` | Pull the right column's window into the focused column |
@@ -142,24 +146,28 @@ Sizing rules per layout live in [Sizing behavior](layout.md#sizing-behavior).
 | `window-modify-secondary-extent:<delta>` | Change the focused area's secondary extent by a fraction |
 | `window-modify-width-left:<delta>` | Resize the focused column from its left edge |
 | `window-modify-width-right:<delta>` | Resize the focused column from its right edge |
-| `window-move-down` | Move the focused window down in its column |
-| `window-move-left` | Move the focused window left |
+| `window-move-by:<delta-x>/<delta-y>[/<window-id>]` | Move the floating window by logical pixels |
+| `window-move-down` | Move down in its column, or a float to the bottom edge |
+| `window-move-left` | Move the focused window left, or a float to the left edge |
 | `window-move-or-output-down` | Move down, or the column to the output below |
 | `window-move-or-output-left` | Move the column left, or to the output left |
 | `window-move-or-output-right` | Move the column right, or to the output right |
 | `window-move-or-output-up` | Move up, or the column to the output above |
 | `window-move-or-workspace-down` | Move down, or to the next workspace at the edge |
 | `window-move-or-workspace-up` | Move up, or to the previous workspace at the edge |
-| `window-move-right` | Move the focused window right |
+| `window-move-right` | Move the focused window right, or a float to the right edge |
+| `window-move-to:<anchor>/<x>/<y>[/<window-id>]` | Move the floating window to an anchored position |
 | `window-move-to-output-down` | Move the focused window to the output below |
 | `window-move-to-output-left` | Move the focused window to the output left |
 | `window-move-to-output-next` | Move the focused window to the next output |
 | `window-move-to-output-previous` | Move the focused window to the previous output |
 | `window-move-to-output-right` | Move the focused window to the output right |
 | `window-move-to-output-up` | Move the focused window to the output above |
-| `window-move-up` | Move the focused window up in its column |
+| `window-move-up` | Move up in its column, or a float to the top edge |
 | `window-set-primary-extent:<fraction>` | Set the focused area's primary extent fraction |
 | `window-set-secondary-extent:<fraction>` | Set the focused area's secondary extent fraction |
+| `window-snap:<left\|right\|top\|bottom\|top_left\|top_right\|bottom_left\|bottom_right>` | Snap the floating window, or restore it when already there |
+| `window-unsnap` | Restore the floating window's size before snapping |
 | `window-swap-down` | Swap with the window below |
 | `window-swap-left` | Swap with the window to the left |
 | `window-swap-next` | Swap with the next window in layout order |
@@ -167,7 +175,15 @@ Sizing rules per layout live in [Sizing behavior](layout.md#sizing-behavior).
 | `window-swap-right` | Swap with the window to the right |
 | `window-swap-up` | Swap with the window above |
 
+`window-snap` works on ordinary floating windows in any layout. It rejects tiled,
+fullscreen, pinned, and scratchpad windows, and regions smaller than the client's
+minimum size. Repeating the same region restores the normal box. Maximize and
+fullscreen preserve the snap placement; manual movement or resizing ends it.
+
 ## Windows
+
+`window-toggle-floating` requires a tiling layout. Windows in a floating layout
+already float and cannot be tiled individually.
 
 | Action | Effect |
 |--------|--------|
@@ -179,11 +195,28 @@ Sizing rules per layout live in [Sizing behavior](layout.md#sizing-behavior).
 | `column-toggle-tab-bar` | Show or hide the focused tab group's bar |
 | `column-toggle-tabbed` | Tab the rows around the focused window, or stack its tabs |
 | `window-close:[<window-id>]` | Close the focused window, or the given window |
+| `window-kill:[<window-id>]` | Kill the process owning the focused or given window |
 | `window-toggle-floating:[<window-id>]` | Float or tile the focused window, or the given window |
 | `window-toggle-fullscreen` | Toggle fullscreen or exit a window covering the focus |
 | `window-toggle-maximize` | Toggle full width for the focused column |
 | `window-toggle-maximize-to-edges` | Toggle maximize without gaps, struts, or borders |
 | `window-toggle-pinned` | Pin the focused window above other windows |
+
+`window-close` asks the application to close a window. `window-kill` sends
+`SIGKILL` to the process owning the window, even if it ignores close requests.
+This terminates all windows owned by that process and can lose unsaved work.
+If the client PID is unavailable, the action returns an error.
+
+No window ID is needed: a bare `window-kill` targets the focused window,
+including a focused scratchpad window. For example:
+
+```toml
+[keybinds]
+"Mod+Shift+Q" = { action = "window-kill", repeat = false }
+```
+
+Use `umbriel msg window-kill` from a terminal, or append `:<window-id>` to
+target a specific window using an ID from `umbriel windows`.
 
 For Xwayland windows, fullscreen entered with `window-toggle-fullscreen`
 remains compositor-owned until an Umbriel action exits it. Fullscreen entered
@@ -229,7 +262,7 @@ described in [Workspace selectors](workspaces.md#workspace-selectors).
 | `workspace-move-up` | Move the focused workspace up the list |
 | `workspace-next` | Switch to the next workspace on this output |
 | `workspace-previous` | Switch to the previous workspace on this output |
-| `workspace-set-layout:<scrolling\|dwindle\|master\|toggle[:mode1,mode2,...]>` | Set the active workspace's layout mode |
+| `workspace-set-layout:<scrolling\|dwindle\|master\|floating\|toggle[:mode1,mode2,...]>` | Set the active workspace's layout mode |
 | `workspace-swap-active-output-down` | Swap active workspace windows with the output below |
 | `workspace-swap-active-output-left` | Swap active workspace windows with the output left |
 | `workspace-swap-active-output-next` | Swap active workspace windows with the next output |
@@ -257,6 +290,8 @@ are described in [Overview](workspaces-overview.md).
 | `cheatsheet-open` | Show the keybind cheatsheet |
 | `cheatsheet-toggle` | Show or hide the keybind cheatsheet |
 | `config-reload` | Reload the configuration file |
+| `cursor-hide` | Hide the cursor until pointer activity |
+| `cursor-show` | Show the cursor and restart its inactivity timeout |
 | `dpms-off:[<output>]` | Power off one output, or every output when bare |
 | `dpms-on:[<output>]` | Power on one output, or every output when bare |
 | `effect-border-cycle:[<pool>][/<window-id>]` | Cycle the current or named border pool |
@@ -278,6 +313,7 @@ are described in [Overview](workspaces-overview.md).
 | `keyboard-layout-next` | Switch one keyboard to its next configured layout |
 | `output-disable:<output>` | Remove an output from the desktop |
 | `output-enable:<output>` | Add an output to the desktop |
+| `output-sdr-white:<nits>[/<output>]` | Set an output's live SDR reference white in cd/m2 |
 | `output-toggle:<output>` | Add or remove an output from the desktop |
 | `session-quit:[skip-confirmation]` | Quit the session, confirming first unless told to skip |
 | `shortcuts-inhibit-toggle` | Toggle shortcuts inhibition for the focused surface |
@@ -296,6 +332,7 @@ Column and extent actions adapt to the active layout:
 | Secondary extent | Changes a row | Adjusts vertical splits | Changes a row |
 | Layout scrolling | Pans the strip | No effect | No effect |
 | Master count | No effect | No effect | Moves a window between master and stack |
+| Toggle split | Refused | Flips the focused tile's split between side by side and stacked | Refused |
 | Tabs | Tabs the focused column | Refused | Tabs the focused master or stack area |
 
 See [Layout](layout.md) for geometry, directions, and resizing behavior.

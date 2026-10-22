@@ -872,6 +872,18 @@ namespace umbriel {
         - (viewportPrimary - columnWidth(columnIndex, viewportPrimary)) / 2.0;
   }
 
+  std::array<double, 2> ScrollingLayout::snapScrolls(int columnIndex, int viewportPrimary) const {
+    const auto x = static_cast<double>(columnX(columnIndex, viewportPrimary));
+    const auto width = static_cast<double>(columnWidth(columnIndex, viewportPrimary));
+    const auto viewport = static_cast<double>(viewportPrimary);
+    const auto max = static_cast<double>(maxScroll(viewportPrimary));
+    if (width >= viewport) {
+      const double cover = std::clamp(x + (width - viewport) / 2.0, 0.0, max);
+      return {cover, cover};
+    }
+    return {std::clamp(x, 0.0, max), std::clamp(x + width - viewport, 0.0, max)};
+  }
+
   void ScrollingLayout::clampScroll(int viewportPrimary) {
     double low = 0.0;
     auto high = static_cast<double>(maxScroll(viewportPrimary));

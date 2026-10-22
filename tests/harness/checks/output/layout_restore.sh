@@ -99,7 +99,34 @@ wait_for_width() {
 }
 
 geometry_snapshot() {
-  "$UMBRIEL" windows --json | jq -Sc '[.[] | {title, x, y, w, h}] | sort_by(.title)'
+  "$UMBRIEL" windows --json | jq -Sc --arg prefix "${1:-}" \
+    '[.[] | select(.title | startswith($prefix)) | {title, x, y, w, h}] | sort_by(.title)'
+}
+
+assert_evacuated_workspaces() {
+  local phase=$1 scroll dwindle master workspaces
+  wait_for_windows_query '
+    ([.[] | select(.title | startswith("scroll-")) | .workspace] | unique) as $scroll |
+    ([.[] | select(.title | startswith("dwindle-")) | .workspace] | unique) as $dwindle |
+    ([.[] | select(.title | startswith("master-")) | .workspace] | unique) as $master |
+    ([.[] | select(.title | startswith("refuge-")) | .workspace] | unique) as $native |
+    ($scroll | length) == 1 and ($dwindle | length) == 1 and ($master | length) == 1 and
+    ([$scroll[0], $dwindle[0], $master[0]] | unique | length) == 3 and
+    all([$scroll[0], $dwindle[0], $master[0]][]; . as $source | $native | index($source) == null) and
+    all(.[]; .workspace | startswith("HEADLESS-2:"))
+  ' "$phase merged evacuated source workspaces or the populated refuge"
+  scroll=$(field_of scroll-b workspace)
+  dwindle=$(field_of dwindle-a workspace)
+  master=$(field_of master-a workspace)
+  workspaces=$("$UMBRIEL" workspaces --json)
+  if ! jq -e --arg scroll "$scroll" --arg dwindle "$dwindle" --arg master "$master" '
+    any(.[]; .id == $scroll and .named == false and .layout == "scrolling") and
+    any(.[]; .id == $dwindle and .named == false and .layout == "dwindle") and
+    any(.[]; .id == $master and .named == false and .layout == "master")
+  ' <<< "$workspaces" > /dev/null; then
+    echo "$phase did not preserve each temporary workspace layout: $workspaces"
+    return 1
+  fi
 }
 
 wait_for_stable_geometry() {
@@ -123,9 +150,9 @@ wait_for_stable_geometry() {
 }
 
 wait_for_geometry_snapshot() {
-  local expected=$1 current= stable=0
+  local expected=$1 prefix=${2:-} current= stable=0
   for _ in $(seq 80); do
-    current=$(geometry_snapshot)
+    current=$(geometry_snapshot "$prefix")
     if [[ $current == "$expected" ]]; then
       stable=$((stable + 1))
       ((stable >= 3)) && return 0
@@ -368,7 +395,7 @@ wait_for_windows_query '
 ' "refuge scrolling width or topology did not reach the requested state"
 
 # Make focus history disagree with the layout orders. Finish on HEADLESS-2
-# workspace 1 so every HEADLESS-1 view is evacuated into that populated refuge.
+# workspace 1 so evacuation must leave that populated active workspace intact.
 for title in scroll-c scroll-b scroll-a dwindle-c dwindle-b dwindle-a master-c master-b master-a; do
   focus_window "$title"
 done
@@ -380,15 +407,15 @@ for title in "${titles[@]}"; do
   wait_for_home "$title" "${expected_home[$title]}"
 done
 before=$(wait_for_stable_geometry)
+refuge_before=$(geometry_snapshot refuge-)
 remap_id=$(field_of scroll-a id)
 
-# Remove both physical outputs. HEADLESS-1 first shares the populated dynamic
-# workspace 1 on HEADLESS-2. Recreate the refuge first, then the original home,
+# Remove both physical outputs. HEADLESS-1 first gets separate temporary
+# workspaces on HEADLESS-2. Recreate the refuge first, then the original home,
 # matching the order seen during VT and suspend recovery.
 "$UMBRIEL" output-destroy HEADLESS-1 > /dev/null
-for title in "${h1_titles[@]}"; do
-  wait_for_home "$title" HEADLESS-2/1
-done
+assert_evacuated_workspaces destruction
+wait_for_geometry_snapshot "$refuge_before" refuge-
 "$UMBRIEL" msg "window-close:$remap_id" > /dev/null
 wait_for_count "$((count - 1))"
 if ! grep -q '^unmapped$' "$remap_log"; then
@@ -409,9 +436,8 @@ if [[ $created != HEADLESS-2 ]]; then
   echo "expected refuge output HEADLESS-2, got '$created'"
   exit 1
 fi
-for title in "${mapped_h1_titles[@]}"; do
-  wait_for_home "$title" HEADLESS-2/1
-done
+assert_evacuated_workspaces refuge-recreation
+wait_for_geometry_snapshot "$refuge_before" refuge-
 for title in "${h2_layout_titles[@]}" "${h2_survivor_titles[@]}"; do
   wait_for_home "$title" "${expected_home[$title]}"
 done

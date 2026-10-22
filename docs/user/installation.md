@@ -170,6 +170,31 @@ avoid selecting a commit whose binaries are not available yet:
 }
 ```
 
+### Using bundled effects
+
+The module links the bundled effect presets into the system profile, so they are available at a path that stays the same across rebuilds and updates:
+
+```
+/run/current-system/sw/share/umbriel/effects
+```
+
+Use it in place of `/usr/share/umbriel/effects` when including a preset:
+
+```toml
+[include]
+files = [
+  "/run/current-system/sw/share/umbriel/effects/border/pulse/effect.toml",
+]
+```
+
+Only the `effects` directory is linked. The example `config.toml` is not, since it is of little use for a declarative setup; it is still available in the package under `share/umbriel`.
+
+If you generate the config from Nix, you can reference the package directly instead, which doesn't depend on the module's link:
+
+```nix
+"${config.programs.umbriel.package}/share/umbriel/effects/border/pulse/effect.toml"
+```
+
 ## Manual build
 
 Manual installations have no automatic upgrade path. Prefer a distribution
@@ -219,8 +244,45 @@ In a managed native session, Umbriel places startup, autostart, event, and
 `spawn:` commands in scopes bound to the compositor service, so they are
 cleaned up when the session ends. This requires systemd 254 or newer.
 
+The compositor service queues the graphical session targets at startup and
+reports readiness only after its display and IPC sockets are available and
+its session environment has been published to systemd and D-Bus. Services
+ordered after `graphical-session.target`, including desktop portals, wait for
+that readiness notification. Configured startup commands also wait for the
+environment import to finish.
+
 Run `umbriel` directly only for a nested development session or an explicitly
 unmanaged launch.
+
+## Screen sharing
+
+Screen sharing in Discord, browsers, and other portal-aware applications needs
+[`xdg-desktop-portal-umbriel`](https://github.com/noctalia-dev/xdg-desktop-portal-umbriel).
+
+### Picker missing after login
+
+Start the session through `start-umbriel` and install the matching
+`umbriel.service` alongside the compositor binary. The packaged service uses
+`Type=notify` to hold the graphical session targets until Umbriel is ready;
+portal services with `After=graphical-session.target` then inherit the
+published session environment. No portal service override is required for
+this startup ordering.
+
+If the picker is still missing, inspect the service and portal logs:
+
+```sh
+systemctl --user cat umbriel.service
+journalctl --user -b \
+  -u xdg-desktop-portal.service \
+  -u xdg-desktop-portal-umbriel.service \
+  -u xdg-desktop-portal-gtk.service \
+  --no-pager
+```
+
+A portal that was already running before the session startup transaction can
+retain an earlier environment. Umbriel does not automatically restart portal
+services. Nested and unmanaged launches do not provide the packaged service's
+readiness ordering.
 
 ## Logs
 
@@ -228,6 +290,10 @@ Umbriel writes its main log to `$XDG_CACHE_HOME/umbriel/umbriel.log`. If
 `XDG_CACHE_HOME` is unset, the fallback path is
 `~/.cache/umbriel/umbriel.log`. The previous file is retained as
 `umbriel.log.1` when the current log reaches 1 MiB.
+
+Messages from wlroots appear with the `[wlr]` tag at info level and above. To
+include wlroots debug output when reporting a rendering or display problem,
+start Umbriel with `UMBRIEL_WLR_DEBUG=1` set in its environment.
 
 When standard output or standard error is connected to a TTY, raw writes from
 Umbriel and its child processes are redirected to

@@ -1,7 +1,11 @@
 // By default, maps a small layer surface and starts a Wayland data-device drag when its left mouse button is pressed.
 // Target mode maps an xdg toplevel that accepts the offered text and reports enter and drop events. Tear-off mode maps
 // an xdg source, then requests an input activation token with the saved press serial and maps another toplevel after
-// the drag is cancelled over empty space. The headless harness drives the source press through pointer-client.
+// the drag is cancelled over empty space. Toplevel mode attaches a real window
+// and accepts stdin commands: o unmaps the origin, u unmaps the carried window,
+// r remaps it, a attaches twice, d destroys the drag, b duplicates its source,
+// s destroys the source, c uses it as a selection, g destroys the factory,
+// t destroys the carried role, and q exits. The harness owns all input devices.
 
 #include <wayland-client.h>
 
@@ -10,6 +14,7 @@
 #undef namespace
 #include "xdg-activation-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
+#include "xdg-toplevel-drag-v1-client-protocol.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -17,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <poll.h>
 #include <print>
 #include <string>
 #include <string_view>
@@ -53,6 +59,12 @@ namespace {
     wl_pointer* pointer = nullptr;
     wl_data_device_manager* dataDeviceManager = nullptr;
     wl_data_device* dataDevice = nullptr;
+    xdg_toplevel_drag_manager_v1* dragManager = nullptr;
+    xdg_toplevel_drag_v1* toplevelDrag = nullptr;
+    bool toplevelMode = false;
+    bool existingToplevel = false;
+    bool attachAfterMap = false;
+    bool attachBeforeStart = false;
     xdg_activation_v1* activation = nullptr;
     xdg_activation_token_v1* activationRequest = nullptr;
     zwlr_layer_shell_v1* layerShell = nullptr;
@@ -126,6 +138,9 @@ namespace {
     std::println("{}", result);
     std::fflush(stdout);
 
+    if (state.toplevelMode) {
+      return;
+    }
     if (state.tearOffMode) {
       requestTearOffToken(state);
       mapDetached(state);
@@ -313,6 +328,14 @@ namespace {
     wl_data_source_add_listener(state.source, &kDataSourceListener, &state);
     wl_data_source_offer(state.source, "text/plain");
     wl_data_source_set_actions(state.source, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+    if (state.toplevelMode) {
+      state.toplevelDrag = xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(state.dragManager, state.source);
+      if (state.existingToplevel) {
+        xdg_toplevel_drag_v1_attach(state.toplevelDrag, state.toplevel, 20, 30);
+      } else if (state.attachBeforeStart) {
+        mapDetached(state);
+      }
+    }
 
     state.iconSurface = wl_compositor_create_surface(state.compositor);
     wl_data_device_start_drag(state.dataDevice, state.source, state.surface, state.iconSurface, serial);
@@ -332,6 +355,9 @@ namespace {
     wl_surface_commit(state.iconSurface);
 
     state.dragStarted = true;
+    if (state.toplevelMode && !state.existingToplevel && !state.attachBeforeStart) {
+      mapDetached(state);
+    }
     std::println("drag-started");
     std::fflush(stdout);
   }
@@ -418,6 +444,10 @@ namespace {
       wl_surface_commit(state.detachedSurface);
       if (!state.detachedMapped) {
         state.detachedMapped = true;
+        if (state.toplevelMode && state.attachAfterMap) {
+          wl_display_roundtrip(state.display);
+          xdg_toplevel_drag_v1_attach(state.toplevelDrag, state.detachedToplevel, 20, 30);
+        }
         std::println("tear-off-mapped");
         std::fflush(stdout);
       }
@@ -453,10 +483,8 @@ namespace {
   };
 
   void mapDetached(State& state) {
-    if (!state.tearOffMode
-        || !state.dragFinished
-        || state.activationToken.empty()
-        || state.detachedSurface != nullptr) {
+    if (state.detachedSurface != nullptr
+        || (!state.toplevelMode && (!state.tearOffMode || !state.dragFinished || state.activationToken.empty()))) {
       return;
     }
     state.detachedSurface = wl_compositor_create_surface(state.compositor);
@@ -464,9 +492,15 @@ namespace {
     xdg_surface_add_listener(state.detachedXdgSurface, &kXdgSurfaceListener, &state);
     state.detachedToplevel = xdg_surface_get_toplevel(state.detachedXdgSurface);
     xdg_toplevel_add_listener(state.detachedToplevel, &kToplevelListener, &state);
-    xdg_toplevel_set_title(state.detachedToplevel, "tear-off-window");
+    xdg_toplevel_set_title(state.detachedToplevel, state.toplevelMode ? "toplevel-drag-window" : "tear-off-window");
     xdg_toplevel_set_app_id(state.detachedToplevel, "tear-off-window");
-    xdg_activation_v1_activate(state.activation, state.activationToken.c_str(), state.detachedSurface);
+    if (state.toplevelMode) {
+      if (!state.attachAfterMap) {
+        xdg_toplevel_drag_v1_attach(state.toplevelDrag, state.detachedToplevel, 20, 30);
+      }
+    } else {
+      xdg_activation_v1_activate(state.activation, state.activationToken.c_str(), state.detachedSurface);
+    }
     wl_surface_commit(state.detachedSurface);
   }
 
@@ -485,6 +519,10 @@ namespace {
     } else if (std::strcmp(interface, wl_data_device_manager_interface.name) == 0) {
       state.dataDeviceManager = static_cast<wl_data_device_manager*>(
           wl_registry_bind(registry, name, &wl_data_device_manager_interface, std::min(version, 3U))
+      );
+    } else if (std::strcmp(interface, xdg_toplevel_drag_manager_v1_interface.name) == 0) {
+      state.dragManager = static_cast<xdg_toplevel_drag_manager_v1*>(
+          wl_registry_bind(registry, name, &xdg_toplevel_drag_manager_v1_interface, 1)
       );
     } else if (std::strcmp(interface, xdg_activation_v1_interface.name) == 0) {
       state.activation =
@@ -522,15 +560,23 @@ int main(int argc, char* argv[]) {
   const bool targetMode = argc >= 2 && std::string_view(argv[1]) == "target";
   const bool cursorRefresh = argc == 2 && std::string_view(argv[1]) == "cursor-refresh";
   const bool tearOffMode = argc == 2 && std::string_view(argv[1]) == "tear-off";
-  if ((!targetMode && argc > 1 && !cursorRefresh && !tearOffMode) || (targetMode && argc > 3)) {
-    std::println(stderr, "usage: drag-client [cursor-refresh | tear-off | target [title]]");
+  const bool toplevelMode = argc >= 2 && std::string_view(argv[1]) == "toplevel";
+  if ((!targetMode && argc > 1 && !cursorRefresh && !tearOffMode && !toplevelMode) || (targetMode && argc > 3)) {
+    std::println(stderr, "usage: drag-client [cursor-refresh | tear-off | target [title] | toplevel [variant]]");
     return EXIT_FAILURE;
   }
 
   State state;
+  state.toplevelMode = toplevelMode;
+  state.existingToplevel = toplevelMode && argc == 3 && std::string_view(argv[2]) == "existing";
+  state.attachAfterMap = toplevelMode && argc == 3 && std::string_view(argv[2]) == "after-map";
+  state.attachBeforeStart = toplevelMode && argc == 3 && std::string_view(argv[2]) == "before-start";
   state.targetMode = targetMode;
   state.tearOffMode = tearOffMode;
   state.title = targetMode && argc == 3 ? argv[2] : (tearOffMode ? "tear-off-source" : "drag-target");
+  if (toplevelMode) {
+    state.title = "toplevel-drag-source";
+  }
   state.waitForPointerRefresh = cursorRefresh;
   state.display = wl_display_connect(nullptr);
   if (state.display == nullptr) {
@@ -547,7 +593,9 @@ int main(int argc, char* argv[]) {
   const bool sourceGlobals = !state.targetMode
       && state.pointer != nullptr
       && state.subcompositor != nullptr
-      && (state.tearOffMode ? state.wmBase != nullptr && state.activation != nullptr : state.layerShell != nullptr);
+      && (state.toplevelMode ? state.wmBase != nullptr && state.dragManager != nullptr
+                             : (state.tearOffMode ? state.wmBase != nullptr && state.activation != nullptr
+                                                  : state.layerShell != nullptr));
   if (state.compositor == nullptr
       || state.shm == nullptr
       || state.seat == nullptr
@@ -559,12 +607,12 @@ int main(int argc, char* argv[]) {
 
   state.dataDevice = wl_data_device_manager_get_data_device(state.dataDeviceManager, state.seat);
   wl_data_device_add_listener(state.dataDevice, &kDataDeviceListener, &state);
-  const bool xdgSource = state.targetMode || state.tearOffMode;
+  const bool xdgSource = state.targetMode || state.tearOffMode || state.toplevelMode;
   state.windowBuffer = createBuffer(
       state, xdgSource ? kTargetWidth : kSurfaceSize, xdgSource ? kTargetHeight : kSurfaceSize,
       state.targetMode ? 0xFF55AA77 : 0xFF4477CC
   );
-  if (state.tearOffMode) {
+  if (state.tearOffMode || state.toplevelMode) {
     state.detachedBuffer = createBuffer(state, kTargetWidth, kTargetHeight, 0xFFAA5577);
   }
   if (!state.targetMode) {
@@ -572,7 +620,7 @@ int main(int argc, char* argv[]) {
     state.iconChildBuffer = createBuffer(state, kIconChildSize, kIconChildSize, 0xFFCC44FF);
   }
   if (state.windowBuffer.resource == nullptr
-      || (state.tearOffMode && state.detachedBuffer.resource == nullptr)
+      || ((state.tearOffMode || state.toplevelMode) && state.detachedBuffer.resource == nullptr)
       || (!state.targetMode && (state.iconBuffer.resource == nullptr || state.iconChildBuffer.resource == nullptr))) {
     std::println(stderr, "drag-client: failed to allocate shared-memory buffers");
     return EXIT_FAILURE;
@@ -600,10 +648,110 @@ int main(int argc, char* argv[]) {
   }
   wl_surface_commit(state.surface);
 
-  while (!state.complete && wl_display_dispatch(state.display) >= 0) {
+  while (!state.complete) {
+    if (!state.toplevelMode) {
+      if (wl_display_dispatch(state.display) < 0) {
+        break;
+      }
+      continue;
+    }
+    if (wl_display_dispatch_pending(state.display) < 0 || wl_display_flush(state.display) < 0) {
+      break;
+    }
+    pollfd fds[] = {{wl_display_get_fd(state.display), POLLIN, 0}, {STDIN_FILENO, POLLIN, 0}};
+    if (poll(fds, 2, -1) < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    if ((fds[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0 && wl_display_dispatch(state.display) < 0) {
+      break;
+    }
+    if ((fds[1].revents & POLLHUP) != 0) {
+      break;
+    }
+    if ((fds[1].revents & POLLIN) == 0) {
+      continue;
+    }
+    char command = 0;
+    if (read(STDIN_FILENO, &command, 1) != 1) {
+      break;
+    }
+    if (command == '\n') {
+      continue;
+    }
+    switch (command) {
+    case 'o':
+      wl_surface_attach(state.surface, nullptr, 0, 0);
+      wl_surface_commit(state.surface);
+      break;
+    case 'u':
+      wl_surface_attach(state.detachedSurface, nullptr, 0, 0);
+      wl_surface_commit(state.detachedSurface);
+      wl_display_roundtrip(state.display);
+      state.detachedMapped = false;
+      break;
+    case 'r':
+      xdg_toplevel_set_title(state.detachedToplevel, "toplevel-drag-window");
+      xdg_toplevel_set_app_id(state.detachedToplevel, "toplevel-drag-window");
+      xdg_toplevel_drag_v1_attach(state.toplevelDrag, state.detachedToplevel, 20, 30);
+      wl_surface_commit(state.detachedSurface);
+      break;
+    case 'a':
+      xdg_toplevel_drag_v1_attach(
+          state.toplevelDrag, state.existingToplevel ? state.toplevel : state.detachedToplevel, 20, 30
+      );
+      break;
+    case 'd':
+      xdg_toplevel_drag_v1_destroy(state.toplevelDrag);
+      state.toplevelDrag = nullptr;
+      break;
+    case 'b':
+      xdg_toplevel_drag_manager_v1_get_xdg_toplevel_drag(state.dragManager, state.source);
+      break;
+    case 's':
+      wl_data_source_destroy(state.source);
+      state.source = nullptr;
+      break;
+    case 'c':
+      wl_data_device_set_selection(state.dataDevice, state.source, state.dragSerial);
+      break;
+    case 'g':
+      xdg_toplevel_drag_manager_v1_destroy(state.dragManager);
+      state.dragManager = nullptr;
+      break;
+    case 't':
+      xdg_toplevel_destroy(state.detachedToplevel);
+      state.detachedToplevel = nullptr;
+      break;
+    case 'q':
+      state.complete = true;
+      break;
+    default:
+      state.failed = true;
+      state.complete = true;
+      break;
+    }
+    if (wl_display_roundtrip(state.display) < 0) {
+      break;
+    }
+    std::println("command {}", command);
+    std::fflush(stdout);
+  }
+  if (wl_display_get_error(state.display) != 0) {
+    const wl_interface* interface = nullptr;
+    uint32_t id = 0;
+    const uint32_t code = wl_display_get_protocol_error(state.display, &interface, &id);
+    std::println("protocol-error {} {}", interface != nullptr ? interface->name : "none", code);
+    std::fflush(stdout);
+    state.failed = true;
   }
   wl_display_roundtrip(state.display);
 
+  if (state.toplevelDrag != nullptr) {
+    xdg_toplevel_drag_v1_destroy(state.toplevelDrag);
+  }
   if (state.source != nullptr) {
     wl_data_source_destroy(state.source);
   }

@@ -88,9 +88,9 @@ Included files are applied in list order. The including file is applied last:
 
 Every file must contain valid TOML. Duplicate device or workspace selectors,
 and an effect preset defined in two files, are errors even when they come from
-different files: at startup Umbriel uses the default configuration and shows
-an error banner (unless the configuration sets `[drm]`, which refuses to
-start), and a reload keeps the previous configuration.
+different files. At startup, any configuration error makes Umbriel use the
+default configuration and show an error banner; a reload keeps the previous
+configuration.
 
 If any included file defines `[drm]`, also declare `[drm]` in the main file.
 This prevents an incomplete GPU exclusion policy from loading when an include
@@ -104,8 +104,10 @@ autostart = ["noctalia", "kitty"]
 mod_key = "Super"
 xwayland = true
 xwayland_native_resolution = false
+xwayland_xsettings = true
 show_cheatsheet = true
 focus_on_activate = false
+attach_modal_dialogs = true
 honor_restored_maximize = false
 ```
 
@@ -115,8 +117,10 @@ honor_restored_maximize = false
 | `mod_key` | string | Super, or Alt when nested | Modifier represented by `Mod` in keybinds. |
 | `xwayland` | bool | `true` | Start Xwayland lazily for X11 applications. Changes require a restart. |
 | `xwayland_native_resolution` | bool | `false` | Show outputs to X11 applications at their physical resolution, so they render sharp on scaled outputs. Changes require a restart. |
+| `xwayland_xsettings` | bool | `true` | Announce the interface scale and cursor theme to X11 applications through XSETTINGS. Turn it off to run your own XSETTINGS manager, such as `xsettingsd`. Changes require a restart. |
 | `show_cheatsheet` | bool | `true` | Show the keybind cheatsheet when Umbriel starts. |
 | `focus_on_activate` | bool | `false` | Let application activation requests focus and reveal their target. |
+| `attach_modal_dialogs` | bool | `true` | Attach a modal dialog to its parent, so it follows the parent and holds its input. See [Dialogs](layout.md#dialogs). |
 | `honor_restored_maximize` | bool | `false` | Honor maximize requests an application makes while its window opens, until it acknowledges its opening layout. |
 
 `Xwayland` must be installed and available on `PATH` when X11 support is
@@ -129,6 +133,14 @@ each output at its physical size instead: a `3840x2160` output at scale `1.25`
 appears to them as `3840x2160` rather than `3072x1728`. Their windows render at
 one pixel per screen pixel and stay sharp, but X11 applications that do not
 scale their own interface look smaller on scaled outputs. Games benefit most.
+
+With `xwayland_xsettings = true`, Umbriel tells X11 applications that read
+XSETTINGS, such as GTK, Chromium, Electron, and Steam, the scale to draw their
+interface at: the largest output scale with `xwayland_native_resolution = true`,
+and `1` without it. It also announces `[input.cursor]` `theme` and `size`, the
+size scaled the same way. At native resolution X11 has one scale for every
+output, so on outputs with a smaller scale these applications look larger than
+native ones.
 
 ## DRM devices
 

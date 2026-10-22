@@ -51,6 +51,7 @@ in
           # So `just debug` / meson outside `nix develop` can find headers via pkg-config.
           pkgs.tomlplusplus
         ];
+        environment.pathsToLink = [ "/share/umbriel/effects" ];
 
         # Required for greetd / noctalia-greeter to discover the session (Name=Umbriel).
         # Plain systemPackages .desktop files are not enough; NixOS aggregates via this.

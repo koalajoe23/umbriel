@@ -36,12 +36,17 @@ namespace umbriel {
     // Opacity of the blur effect itself. Keep this independent from surface
     // opacity so compositor opacity matches equivalent client alpha.
     void setAlpha(float alpha);
+    // Forces a live blur of everything below, overriding the optimized option, for a surface drawn over scene
+    // content the cached background blur lacks.
+    void setLive(bool live);
     // Disable the node (unmap path); update() re-enables.
     void hide();
 
   private:
     wlr_scene_blur* m_node = nullptr;
     bool m_masked = false;
+    bool m_optimized = false;
+    bool m_live = false;
     float m_alpha = 1.0F;
   };
 

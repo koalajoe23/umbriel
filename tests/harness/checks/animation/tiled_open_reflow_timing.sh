@@ -52,6 +52,11 @@ enabled = true
 duration_ms = 600
 curve = "linear"
 
+[animation.windows_resize]
+enabled = true
+duration_ms = 600
+curve = "linear"
+
 [[window_rule]]
 match.title = "^tiled-maximized-opener$"
 default_maximize = true

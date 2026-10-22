@@ -44,6 +44,7 @@ namespace umbriel {
     float color[4]{};
     premultiplied(color, config().colors.insertHint, 0.0F);
     m_rect = wlr_scene_rect_create(m_tree, 1, 1, color);
+    m_rect->accepts_input = false;
     wlr_scene_node_set_enabled(&m_tree->node, false);
   }
 
@@ -92,7 +93,7 @@ namespace umbriel {
     m_output = nullptr;
   }
 
-  bool HintRect::tickAnimations(uint64_t nowMsec) {
+  bool HintRect::tickAnimations(double nowMsec) {
     const bool alphaTicked = m_alpha.tick(nowMsec);
     const bool xTicked = m_x.tick(nowMsec);
     const bool yTicked = m_y.tick(nowMsec);

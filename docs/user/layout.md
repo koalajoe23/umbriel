@@ -15,10 +15,45 @@ mode = "scrolling"
 | `scrolling` | Fixed-size columns in a scrollable strip | Keeping many windows readable without shrinking all of them |
 | `dwindle` | Each new window splits an existing tile | Flexible recursive tiling |
 | `master` | Primary windows beside a stack | Keeping one or more main windows prominent |
+| `floating` | Independently positioned, overlapping windows | Moving and resizing windows freely |
 
 Change the current workspace at runtime with
 `workspace-set-layout:<mode>`. See [Actions](actions.md#argument-forms) and
 [Workspace Rules](workspaces.md#workspace-rules).
+
+## Floating layout
+
+```toml
+[layout]
+mode = "floating"
+
+[appearance.title_bar]
+mode = "on"
+```
+
+Every ordinary window opens floating at its preferred size. Oversized automatic
+windows are reduced proportionally to fit the usable area, including title bars
+and margins. Client-driven size changes keep automatic placement centered until
+you move the window. New windows start at the center and shift diagonally when
+they would completely cover another window whose upper-left corner is visible.
+Placement includes title bars and borders. The offset clears the decorated title
+bar, with a minimum of 32 logical pixels, and wraps to fresh diagonals at the
+output boundary, including when several windows open simultaneously. Dialogs
+center over their parent; explicit position rules take precedence.
+
+Enable title bars to move windows without a modifier and use their close and maximize buttons. Dragging updates
+the window position continuously, so maximize and restore use its current
+position even while the pointer is held. Snap animations start where you release
+the window and keep the normal restore box from before the drag. The configured
+`appearance.drag_opacity` still applies. Enable `[input] window_snapping = true`
+for half-screen drop zones on all four edges and quarter-screen drop zones in
+all four corners.
+
+Directional focus uses window geometry, including overlapping windows.
+`window-toggle-floating` is rejected in this layout. Switching to a tiling layout
+re-tiles windows floated by the layout, while windows explicitly floated by a
+rule or before entering this layout stay floating. Moving a layout-floated window
+to a tiling workspace also tiles it there.
 
 ## Shared settings
 
@@ -27,13 +62,15 @@ Change the current workspace at runtime with
 gap = 8
 extent_presets = [0.333, 0.5, 0.667]
 new_exits_fullscreen = []  # "tiled", "floating", "pinned", "all", or an array such as ["tiled", "floating"]
+client_maximize = "column"  # or "edges"
 ```
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `gap` | `8` | Gap between windows in logical pixels. |
-| `extent_presets` | `[0.333, 0.5, 0.667]` | Fractions used by primary and secondary extent cycle actions. |
+| `extent_presets` | `[0.333, 0.5, 0.667]` | Fractions used by primary and secondary extent cycle actions, in any order; cycling steps by size. |
 | `new_exits_fullscreen` | `[]` | Kinds of arriving window that make a fullscreen window on the workspace leave fullscreen. See [Leaving fullscreen](#leaving-fullscreen). |
+| `client_maximize` | `"column"` | What a tiled window's own maximize button does: `"column"` fills the column like `window-toggle-maximize`, `"edges"` fills the usable area without struts, gaps, or borders like `window-toggle-maximize-to-edges`. See [Maximize and fullscreen](#maximize-and-fullscreen). |
 
 ### Leaving fullscreen
 
@@ -212,6 +249,10 @@ toward a single neighbor that shares its split trades sides with that neighbor.
 To exchange two windows without changing any tile, use the `window-swap-*`
 actions.
 
+`layout-toggle-split` flips the split holding the focused tile between side by
+side and stacked, keeping its ratio. The flipped split stays fixed, like one
+made by a directional drop.
+
 Dwindle has no multi-window columns. Moving one into Dwindle places its windows
 as separate tiles.
 
@@ -353,14 +394,52 @@ the application's minimum and maximum size hints. Resizing a maximized floating
 window leaves maximization and keeps the new size. Extent actions do nothing
 while the window is fullscreen.
 
+`window-move-left`, `window-move-right`, `window-move-up`, and
+`window-move-down` move a floating window to that edge of the output's usable
+area and keep its position on the other axis. The edge sits inside the layout
+struts, `gap`, and borders, so the window lines up with tiles at that edge. At
+the edge already, the `-or-output` and `-or-workspace` variants send the window
+to the neighboring output or workspace.
+
+Focusing a floating window reveals the workspace's floating windows above
+fullscreen without taking the fullscreen window out of fullscreen. Clicking or
+explicitly focusing the fullscreen window covers independent floats again.
+With focus follows mouse enabled, hovering the fullscreen window transfers
+keyboard focus while leaving the floats visible; clicking it covers them.
+
+An independent floating window does not take focus by default when it opens over
+fullscreen. Set `default_focused = true` in a
+[window rule](window-rules.md) to focus and reveal it automatically. Parented
+dialogs and application activation requests retain their usual focus behavior.
+
+### Dialogs
+
 Parented dialogs stay above their parent and normally open centered over its
-visible area. A dialog opens on its parent's workspace unless a rule sends it
-elsewhere. A modal dialog, one that says so through xdg-dialog-v1 or one another
-process attached through xdg-foreign, is attached to its parent: it stays
-centered over the parent as either moves or resizes, dragging it drags the
-parent, and while it is open the parent is shaded and gets neither focus nor
-pointer input. Focus and column actions such as `window-toggle-floating` act on
-the parent while the dialog is focused.
+visible area.
+
+A modal dialog is attached to its parent: one that says so through
+xdg-dialog-v1, or one another application parented through xdg-foreign, the way
+a portal file chooser is. It hangs on the parent's frame, centered over it and
+kept on screen, so it goes wherever the parent goes: another workspace or
+output, an unplugged output's refuge, the scratchpad, pinned, fullscreen, a
+scrolled or moved column, a drag, or an overview drop. In the overview it shows
+over its parent's card instead of on a card of its own.
+
+While it is attached, the dialog holds its parent's input: focusing or clicking
+the parent focuses the dialog, and the parent is shaded by
+`[animation.dialogs]` `dim` (see [Animation](animation.md#event-tables)).
+Actions aimed at the dialog that place a window, such as moving it to a
+workspace, floating, pinning, or the scratchpad, act on the parent; closing and
+killing still reach the dialog. A Mod-drag on the dialog drags the parent.
+Window rules that place a window (`default_workspace`, `default_output`,
+`default_scratchpad`, `default_pinned`, `default_position`, `default_floating`,
+and the size and maximize defaults) do not apply to an attached dialog.
+
+The dialog leaves when it stops being modal or closes, and becomes an ordinary
+floating window if its parent closes first. Set
+`[general] attach_modal_dialogs = false` to keep every dialog an ordinary
+window, or use `attach_to_parent = false` in a [window rule](window-rules.md) for
+single applications. Either takes effect on reload.
 
 ### Maximize and fullscreen
 
@@ -369,11 +448,40 @@ applications. Move windows to another workspace or use a
 [scratchpad](scratchpad.md) when they should stay running out of view.
 
 `window-toggle-fullscreen` fills the complete output, ignoring struts and panel
-exclusive zones.
+exclusive zones. A floating window keeps its normal size and position when moved
+through a tiled workspace while fullscreen and back to a floating workspace.
+Leaving fullscreen then restores that original floating box. Entering fullscreen
+during a resize still restores the requested size afterward.
+
+Visible floating windows above fullscreen require composition on that output.
+Once fullscreen covers them again, direct scanout can resume if the fullscreen
+buffer meets the other scanout requirements.
 
 `window-toggle-maximize` fills the layout area. Tiled columns keep struts and
 gaps; floating windows fill the output's usable area inside the same margin, and
 follow it when the gap, borders, struts, or usable area change.
 
+A maximized window stays maximized when you float it and then unfloat it.
+Pressing the maximize binding after that round trip restores the column's
+extent from before the initial maximize. Repeated float/unfloat cycles preserve
+that restore extent until you unmaximize manually.
+
+Unmaximizing while floating restores the remembered normal floating size and
+position. If the window has never floated, its restore size comes from its
+ordinary tile before maximization.
+
 `window-toggle-maximize-to-edges` removes layout struts, gaps, and borders while
 leaving panel exclusive zones visible.
+
+With `client_maximize = "edges"`, a tiled window's own maximize button (or
+titlebar double-click) behaves like `window-toggle-maximize-to-edges` instead of
+`window-toggle-maximize`; floating windows keep the default behavior. The key
+affects only requests from the application: the `window-toggle-maximize` action
+still fills the column, so bind `window-toggle-maximize-to-edges` to get the
+edges from a keybind. Windows without their own maximize control, such as most
+terminals, never send that request. Unmaximizing runs that toggle in
+reverse: the edges are left first, and a window whose column is also at full
+width leaves the column on the next unmaximize. A maximize restored at open
+under `honor_restored_maximize` lands in the edges too. On a `default_maximize`
+window the edges sit above the rule's full-width column, so unmaximizing it
+takes two steps; without a client request the rule opens the column only.

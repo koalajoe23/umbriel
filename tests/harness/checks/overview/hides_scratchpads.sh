@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # harness: outputs=2
 # Opening the overview hides every visible named scratchpad, including scratchpads on outputs that do not hold focus.
-# The windows stay stored after the overview closes, and one toggle per name shows them again. Transparent overview
-# backgrounds make the scene transition observable instead of merely covering an incorrectly visible scratchpad.
+# While the overview is open, no scratchpad action or focus request shows a scratchpad again. The windows stay stored
+# after the overview closes, and one toggle per name shows them again. Transparent overview backgrounds make the scene
+# transition observable instead of merely covering an incorrectly visible scratchpad.
 set -euo pipefail
 
 readonly CLIENT="${UMBRIEL_UNMAP_CLIENT:-./build-debug/tests/unmap-client}"
@@ -129,7 +130,6 @@ enabled = false
 enabled = false
 dim = 0.0
 blur = false
-scale = 0.0
 
 [colors]
 backdrop = "#000000FF"
@@ -209,6 +209,21 @@ assert_dark "$SECOND_OUTPUT after overview-open" "$second_open" "$second_x" "$se
 
 if [[ $("$UMBRIEL" windows --json | jq 'length') -ne 2 ]]; then
   echo "overview-open removed a stored scratchpad window: $("$UMBRIEL" windows --json)"
+  exit 1
+fi
+
+# Nothing re-enters a scratchpad while the overview covers the screen.
+move_pointer_to_output "$FIRST_OUTPUT"
+first_id=$("$UMBRIEL" windows --json | jq -r --arg t "$FIRST_TITLE" '.[] | select(.title == $t) | .id')
+"$UMBRIEL" msg "scratchpad-toggle:$FIRST_SCRATCHPAD" > /dev/null || true
+"$UMBRIEL" msg "scratchpad-window-show-next:$FIRST_SCRATCHPAD" > /dev/null || true
+"$UMBRIEL" msg "window-focus:$first_id" > /dev/null || true
+move_pointer_to_output "$SECOND_OUTPUT"
+"$UMBRIEL" msg "scratchpad-window-show-previous:$SECOND_SCRATCHPAD" > /dev/null || true
+"$UMBRIEL" settle > /dev/null
+shown=$("$UMBRIEL" windows --json | jq -c '[.[] | select(.scratchpad != "" and .active) | .title]')
+if [[ $shown != "[]" ]]; then
+  echo "a scratchpad was shown while the overview was open: $shown"
   exit 1
 fi
 

@@ -31,9 +31,32 @@ disabled. This avoids activating stale connector state reported by some DRM
 drivers. Add a matching output section with `enabled = true` to enable such a
 display explicitly.
 
-When an output disconnects or is disabled, Umbriel temporarily moves its
-workspaces and windows to another enabled output. They return with their layout
-and positions when the output becomes available again.
+When an output disconnects or is disabled, each populated workspace moves into
+its own temporary workspace on another enabled output. Umbriel appends these
+workspaces without replacing that output's configured workspaces, including
+when its workspace inventory is fixed. Temporary workspaces use numeric labels
+for originally anonymous workspaces; named workspaces keep their explicit
+names, so name-based keybinds continue to work. Both retain their original
+layout rules. When the same output connector becomes available again, their
+layout and positions are restored there. Windows opened in a temporary
+workspace return with it; explicitly moving a window into a local workspace
+cancels its automatic return.
+Tiling edits made in a temporary workspace also return with it when its tiled
+windows remain mapped.
+
+If a receiving output already has a workspace with the same name, its native
+workspace keeps priority for name lookup. Qualify the displaced name with its
+original output, such as `workspace-switch:WEB/DP-1`, to select it while `DP-1`
+is unavailable. See [workspace selectors](workspaces.md#workspace-selectors).
+
+Umbriel first uses the first remaining enabled output in its internal output
+order. If that output has reached the 64-workspace limit, it tries another
+enabled output. If every enabled output is full, displaced windows share a
+local workspace until their home returns. Growing a fixed inventory during
+the disconnection can also leave too little room for temporary workspaces;
+those windows retain their saved homes. Empty temporary workspaces are removed.
+If every output disappears, windows wait until an output returns, then recover
+their separate workspaces there while their home output is still absent.
 
 ## Settings
 
@@ -50,6 +73,7 @@ and positions when the output becomes available again.
 | `direct_scanout` | bool | `true` | Allow eligible fullscreen buffers to bypass composition. |
 | `hdr` | string | `"off"` | HDR activation policy. |
 | `sdr_white` | float | `203` | SDR reference white in cd/m² while HDR is active. |
+| `sdr_transfer` | string | `"gamma22"` | Transfer curve for untagged SDR on HDR outputs: `"gamma22"` or `"srgb"`. |
 | `bit_depth` | int | `8` | Render bit depth for SDR output: `8` or `10`. |
 | `workspaces` | int, string array, or `"dynamic"` | `"dynamic"` | Workspace inventory for this output. |
 | `min_workspaces` | int | `1` | Minimum count for a dynamic output. |
@@ -60,6 +84,10 @@ and positions when the output becomes available again.
 
 Umbriel tries an unadvertised resolution as a custom mode. If it cannot apply
 the configured mode, it uses the preferred advertised mode and logs a warning.
+Backend tests include the 8-bit SDR fallback, so a rejected swapchain can reach
+the preferred mode. On that mode, Umbriel retries the configured HDR and bit-depth
+preferences. A temporary rendering failure after an accepted backend test retries
+the current candidate instead of changing modes.
 
 ### Workspace count
 
@@ -156,6 +184,39 @@ power consumption.
 Set `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1` before starting Umbriel to disable
 direct scanout on every output.
 
+`umbriel outputs` shows whether it engages:
+
+```text
+  Direct scanout: active (steam_app_223850 "3DMark Steel Nomad")
+  Direct scanout: inactive (software cursor)
+```
+
+The log records each time scanout starts, stops, or moves to another window,
+once the new state has held for half a second:
+
+```text
+[INF] [output] output 'DP-1': direct scanout on (steam_app_223850 "3DMark Steel Nomad")
+[INF] [output] output 'DP-1': direct scanout off (composited)
+```
+
+When it is inactive, the reason is the first condition that ruled it out:
+
+| Reason | Meaning |
+| --- | --- |
+| `disabled` | `direct_scanout = false`, or `WLR_SCENE_DISABLE_DIRECT_SCANOUT` is set. |
+| `no_candidate` | Nothing is on the output, or what is visible is not a client buffer. |
+| `composited` | More than one surface is visible: overlays, popups, borders, a translucent window, or a window that does not cover the output. |
+| `effects` | A screen, window, or animation effect is drawing on the output. |
+| `color_conversion` | A gamma table, color transform, HDR white point, or the window's color description needs conversion. |
+| `capture` | An HDR output is being captured as SDR. |
+| `cropped` | The window is clipped, for instance mid-animation. |
+| `transform` | The buffer's transform differs from the output's. |
+| `modeset` | The output is changing mode or format this frame. |
+| `render_locked` | A capture or animation needs the output composited. |
+| `software_cursor` | The cursor is drawn in software over the window. |
+| `rejected` | The display driver refused the buffer, for instance its format or modifier. |
+| `debug_damage` | Damage highlighting is on. |
+
 ### Variable refresh rate
 
 `vrr` accepts:
@@ -206,6 +267,42 @@ hdr = "auto"
 sdr_white = 203
 ```
 
+While HDR is active, `sdr_white` sets both the brightness of composed SDR
+content and the reference white advertised to Wayland applications through
+output descriptions and surface color preferences. Reloading the setting
+updates those descriptions and notifies applications. In SDR mode, the
+advertised reference white remains the nominal 80 cd/m².
+
+On HDR outputs, untagged SDR windows and compositor colors use gamma 2.2 by
+default to preserve their legacy SDR appearance. Set `sdr_transfer = "srgb"` to
+decode them with the piecewise sRGB curve instead. This produces lighter dark
+shades and can match applications that convert SDR into PQ using that curve:
+
+```toml
+[output.DP-1]
+hdr = "on"
+sdr_transfer = "srgb"
+```
+
+The choice applies on reload and only while that output uses HDR (PQ). It also
+keeps effect color controls and SDR capture encoding consistent with the chosen
+curve. Explicit client color descriptions keep their declared transfer
+function, including piecewise sRGB, gamma 2.2, PQ, and linear content. The
+display's PQ encoding and normal SDR rendering stay unchanged. Run
+`umbriel color` to inspect each output's configured `sdr_transfer` choice.
+
+`sdr_white` can also be selected for one running output without editing the
+configuration:
+
+```sh
+umbriel msg output-sdr-white:203
+umbriel msg output-sdr-white:120/DP-1
+```
+
+The preferred output, or the named one, keeps the value until it disconnects or
+a configuration reload changes output state, which restores the configured
+`sdr_white`. `umbriel color` reports the selected value.
+
 Automatic HDR depends on metadata supplied by the application. Untagged
 XWayland content cannot be detected; use a native Wayland HDR path or
 `hdr = "on"` when necessary. Many monitors briefly go black while switching
@@ -225,16 +322,32 @@ by the EDID undefined instead of guessing a brightness that may be wrong for
 the panel. Nested and virtual outputs have no display EDID, so their luminance
 metadata remains undefined.
 
+These display limits describe the target color volume independently of
+`sdr_white`, which describes SDR reference white within the HDR encoding.
+
 Run `umbriel color` to inspect the metadata in the active output description.
 The JSON form reports `mastering_display_primaries`, `mastering_luminance`,
 `max_cll`, and `max_fall` for each output.
 
-Screenshots from normal screencopy clients receive an SDR view while HDR is
-active.
+Shared-memory screenshots from normal screencopy and image-copy clients receive
+an 8-bit SDR view while HDR is active. DMA-BUF capture may retain 10-bit
+storage while still containing SDR values. Export-DMA-BUF bypasses the SDR
+capture view and retains the output's native HDR representation.
 
-Gamma-control adjustments such as Night Light are suspended while HDR is
-active. Umbriel keeps the client's latest gamma table and restores it when the
-output returns to SDR.
+Window captures, including portal window previews, honor the client's committed
+color metadata and convert HDR client content to SDR.
+
+Existing gamma-control clients, including Night Light tools, can adjust white
+point and brightness while HDR remains enabled. Umbriel uses each gamma ramp's
+white endpoint to adjust the image in linear light before PQ encoding. This
+retains HDR highlight headroom instead of clipping highlights to SDR white,
+though warming the image deliberately changes its colors and channel brightness.
+
+Custom gamma-curve calibration applies only in SDR. Umbriel keeps the client's
+latest full gamma table and restores it when the output returns to SDR. An HDR
+white-point adjustment applies to the whole display, including the cursor, and
+requires composition while active. SDR screenshots and recordings exclude this
+adjustment.
 
 ### Bit depth
 
@@ -285,10 +398,28 @@ the client buffer format to exactly match what KMS accepts for the plane. Set
 
 #### Screencopy and capture
 
-Screencopy clients such as `grim` and Noctalia receive raw buffers in the
-output's active 10-bit render format (XR30 or XB30) when 10-bit SDR is active.
-Unlike HDR capture, the pixels are not converted to an 8-bit SDR format first.
-Tools that do not handle 10-bit formats may produce undesired output.
+Shared-memory captures through screencopy and image-copy use an 8-bit format
+even when the output render format is XR30 or XB30. This applies to both 10-bit
+SDR outputs and the SDR capture view produced while HDR is active, improving
+compatibility with clients whose shared-memory paths assume 8-bit pixels.
+DMA-BUF capture may retain the negotiated 10-bit storage format. During HDR,
+that buffer still contains Umbriel's SDR capture view. Export-DMA-BUF alone
+bypasses the conversion and exposes the displayed native representation.
+
+### Window capture resolution
+
+Window screenshots and window sharing render at the window's current output
+scale. A fullscreen window on a 3200×2000 output at scale 2.5 therefore captures
+at 3200×2000 pixels, while its logical size remains 1280×800. Fractional pixel
+dimensions round up. Moving the window to an output with a different scale or
+changing its output's scale updates ongoing capture sessions' buffer sizes.
+
+Larger capture buffers increase memory use, rendering and copying work, and may
+increase encoding work for window sharing. At scale 2.5 they contain 6.25 times
+as many pixels as a scale 1 capture of the same logical window. Applications
+that supply low-resolution buffers still have only that source detail. Idle
+capture sources do not render, and stopping the last session releases their
+output swapchain.
 
 ## Virtual outputs
 
@@ -420,5 +551,5 @@ files = [
 
 Each output keeps its screen pool assignment while disabled. Disconnecting
 releases it; reconnecting starts from configuration. Inspect assignments with
-`umbriel effects --json`; `outputs --json` remains output-management data.
+`umbriel effects --json`.
 The cursor has one session-wide selection shared by all outputs.

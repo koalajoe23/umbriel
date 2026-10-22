@@ -21,6 +21,18 @@ namespace umbriel {
     return {left, top, std::max(0, right - left), std::max(0, bottom - top)};
   }
 
+  wlr_box interpolateBox(const wlr_box& from, const wlr_box& to, double positionProgress, double sizeProgress) {
+    if (positionProgress == sizeProgress) {
+      return interpolateBox(from, to, positionProgress);
+    }
+    return {
+        lerpEdge(from.x, to.x, positionProgress),
+        lerpEdge(from.y, to.y, positionProgress),
+        std::max(0, lerpEdge(from.width, to.width, sizeProgress)),
+        std::max(0, lerpEdge(from.height, to.height, sizeProgress)),
+    };
+  }
+
   bool keepsSeparation(const MotionBox& a, const MotionBox& b) {
     // `lo` entirely on the low side of `hi` along one axis, touching allowed.
     const auto leftOf = [](const wlr_box& lo, const wlr_box& hi) { return lo.x + lo.width <= hi.x; };

@@ -35,7 +35,7 @@ namespace {
       std::ofstream out(configPath());
       out << document;
     }
-    (void)umbriel::loadConfig(configPath().c_str());
+    umbriel::loadConfig(configPath().c_str());
     Loaded loaded{.config = umbriel::config(), .messages = {}};
     for (const auto& diagnostic : umbriel::configDiagnostics()) {
       loaded.messages.push_back(diagnostic.message);
@@ -205,11 +205,23 @@ UMBRIEL_TEST(jsonIsSortedAndTyped) {
 
 // Every value a key lists is one its reader accepts without complaint.
 UMBRIEL_TEST(listedValuesAreAccepted) {
+  const auto shaderPath = configPath().string() + ".glsl";
+  {
+    std::ofstream shader(shaderPath);
+    shader << "vec4 animation(vec2 uv) { return umbriel_sample(uv); }";
+  }
   int tried = 0;
   for (const KeyDescription& key : umbriel::registry::describeConfig(umbriel::Config{})) {
     for (const std::string_view value : key.values) {
       std::string concrete;
-      const toml::table document = documentSetting(key.path, nlohmann::ordered_json(value), concrete);
+      toml::table document = documentSetting(key.path, nlohmann::ordered_json(value), concrete);
+      if (key.path == "animation.workspaces.style" && value == "reveal") {
+        document.at_path("animation.workspaces").as_table()->insert("effect", "wipe");
+        document.insert(
+            "effects",
+            toml::table{{"preset", toml::table{{"wipe", toml::table{{"kind", "animation"}, {"shader", shaderPath}}}}}}
+        );
+      }
       const Loaded loaded = load(document);
       ++tried;
       for (const std::string& message : loaded.messages) {
@@ -221,7 +233,22 @@ UMBRIEL_TEST(listedValuesAreAccepted) {
       }
     }
   }
+  std::filesystem::remove(shaderPath);
   CHECK(tried > 50);
+}
+
+UMBRIEL_TEST(outputSdrTransferSchemaListsCanonicalValuesAndDefault) {
+  const auto descriptions = umbriel::registry::describeConfig(umbriel::Config{});
+  bool found = false;
+  for (const auto& key : descriptions) {
+    if (key.path == "output.<name>.sdr_transfer") {
+      found = true;
+      CHECK_EQ(key.type, std::string_view{"enum"});
+      CHECK(key.values == std::vector<std::string_view>({"gamma22", "srgb"}));
+      CHECK(key.defaultValue == "gamma22");
+    }
+  }
+  CHECK(found);
 }
 
 UMBRIEL_TEST(effectPoolSchemaReportsMembersPoliciesAndRequiredKind) {

@@ -14,13 +14,19 @@
 // HOLD_SIZE keeps the default dimensions while acknowledging configures, exposing compositor-only resize scaling.
 
 #include "fractional-scale-v1-client-protocol.h"
+#include "server-decoration-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <poll.h>
 #include <print>
+#include <string>
+#include <string_view>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -42,6 +48,13 @@ namespace {
     xdg_surface* xdgSurface = nullptr;
     xdg_toplevel* toplevel = nullptr;
     wl_buffer* buffer = nullptr;
+    zxdg_decoration_manager_v1* decorationManager = nullptr;
+    zxdg_toplevel_decoration_v1* decoration = nullptr;
+    org_kde_kwin_server_decoration_manager* legacyManager = nullptr;
+    org_kde_kwin_server_decoration* legacyDecoration = nullptr;
+    wl_pointer* pointer = nullptr;
+    std::string commands;
+    bool running = true;
     uint32_t scale = 0; // 1/120ths, as wp_fractional_scale_v1 reports it.
     int defaultWidth = 800;
     int defaultHeight = 600;
@@ -173,12 +186,16 @@ namespace {
   // with the size its layout assigns.
   void toplevelConfigure(void* data, xdg_toplevel*, int32_t width, int32_t height, wl_array*) {
     auto& state = *static_cast<State*>(data);
+    if (std::getenv("LOG_CONFIGURES") != nullptr) {
+      std::println("configure {}x{}", width, height);
+      std::fflush(stdout);
+    }
     const bool holdSize = std::getenv("HOLD_SIZE") != nullptr;
     state.logicalWidth = !holdSize && width > 0 ? width : state.defaultWidth;
     state.logicalHeight = !holdSize && height > 0 ? height : state.defaultHeight;
   }
 
-  void toplevelClose(void*, xdg_toplevel*) {}
+  void toplevelClose(void* data, xdg_toplevel*) { static_cast<State*>(data)->running = false; }
 
   constexpr xdg_toplevel_listener kToplevelListener = {
       .configure = toplevelConfigure,
@@ -193,9 +210,108 @@ namespace {
       .ping = wmBasePing,
   };
 
+  const wl_pointer_listener kPointerListener = [] {
+    wl_pointer_listener listener{};
+    listener.enter = [](void*, wl_pointer*, uint32_t, wl_surface*, wl_fixed_t, wl_fixed_t) {};
+    listener.leave = [](void*, wl_pointer*, uint32_t, wl_surface*) {};
+    listener.motion = [](void*, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t) {};
+    listener.button = [](void*, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state) {
+      std::println("pointer-button {} {}", button, state);
+      std::fflush(stdout);
+    };
+    listener.axis = [](void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {};
+    return listener;
+  }();
+  void seatCapabilities(void* data, wl_seat* seat, uint32_t capabilities) {
+    auto& state = *static_cast<State*>(data);
+    if ((capabilities & WL_SEAT_CAPABILITY_POINTER) != 0 && state.pointer == nullptr) {
+      state.pointer = wl_seat_get_pointer(seat);
+      wl_pointer_add_listener(state.pointer, &kPointerListener, &state);
+    } else if ((capabilities & WL_SEAT_CAPABILITY_POINTER) == 0 && state.pointer != nullptr) {
+      wl_pointer_destroy(state.pointer);
+      state.pointer = nullptr;
+    }
+  }
+  constexpr wl_seat_listener kSeatListener{.capabilities = seatCapabilities, .name = nullptr};
+  void decorationConfigure(void*, zxdg_toplevel_decoration_v1*, uint32_t mode) {
+    std::println("decoration {}", mode);
+    std::fflush(stdout);
+  }
+  constexpr zxdg_toplevel_decoration_v1_listener kDecorationListener{.configure = decorationConfigure};
+
+  void legacyMode(void*, org_kde_kwin_server_decoration*, uint32_t mode) {
+    std::println("legacy-decoration {}", mode);
+    std::fflush(stdout);
+  }
+  constexpr org_kde_kwin_server_decoration_listener kLegacyListener{.mode = legacyMode};
+
+  void handleDecorationCommand(State& state, std::string_view command) {
+    if (command == "xdg destroy" && state.decoration != nullptr) {
+      zxdg_toplevel_decoration_v1_destroy(state.decoration);
+      state.decoration = nullptr;
+    } else if (command == "legacy destroy" && state.legacyDecoration != nullptr) {
+      org_kde_kwin_server_decoration_release(state.legacyDecoration);
+      state.legacyDecoration = nullptr;
+    } else if (command.starts_with("xdg ") && state.decoration != nullptr) {
+      if (command == "xdg unset")
+        zxdg_toplevel_decoration_v1_unset_mode(state.decoration);
+      else
+        zxdg_toplevel_decoration_v1_set_mode(state.decoration, command == "xdg server" ? 2 : 1);
+    } else if (command.starts_with("legacy ") && state.legacyDecoration != nullptr) {
+      const uint32_t mode = command == "legacy server" ? 2 : (command == "legacy none" ? 0 : 1);
+      org_kde_kwin_server_decoration_request_mode(state.legacyDecoration, mode);
+    } else if (command.starts_with("resize ")) {
+      int width = 0;
+      int height = 0;
+      if (std::sscanf(std::string(command.substr(7)).c_str(), "%d %d", &width, &height) != 2
+          || width <= 0
+          || height <= 0) {
+        state.running = false;
+        return;
+      }
+      state.logicalWidth = width;
+      state.logicalHeight = height;
+      present(state);
+    } else if (command.starts_with("title ")) {
+      xdg_toplevel_set_title(state.toplevel, std::string(command.substr(6)).c_str());
+    } else {
+      std::println(stderr, "fractional-client: unknown decoration command {}", command);
+      state.running = false;
+    }
+  }
+
+  void readDecorationCommands(State& state) {
+    char buffer[512];
+    const ssize_t count = read(STDIN_FILENO, buffer, sizeof(buffer));
+    if (count <= 0) {
+      state.running = false;
+      return;
+    }
+    state.commands.append(buffer, static_cast<size_t>(count));
+    size_t newline = 0;
+    while ((newline = state.commands.find('\n')) != std::string::npos) {
+      handleDecorationCommand(state, std::string_view(state.commands).substr(0, newline));
+      state.commands.erase(0, newline + 1);
+    }
+  }
+
   void registryGlobal(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t) {
     auto& state = *static_cast<State*>(data);
-    if (strcmp(interface, wl_compositor_interface.name) == 0) {
+    if (strcmp(interface, org_kde_kwin_server_decoration_manager_interface.name) == 0
+        && std::getenv("LEGACY_DECORATION") != nullptr) {
+      state.legacyManager = static_cast<org_kde_kwin_server_decoration_manager*>(
+          wl_registry_bind(registry, name, &org_kde_kwin_server_decoration_manager_interface, 1)
+      );
+    } else if (
+        strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0 && std::getenv("XDG_DECORATION") != nullptr
+    ) {
+      state.decorationManager = static_cast<zxdg_decoration_manager_v1*>(
+          wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1)
+      );
+    } else if (strcmp(interface, wl_seat_interface.name) == 0 && std::getenv("LOG_POINTER") != nullptr) {
+      auto* seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface, 1));
+      wl_seat_add_listener(seat, &kSeatListener, &state);
+    } else if (strcmp(interface, wl_compositor_interface.name) == 0) {
       state.compositor = static_cast<wl_compositor*>(wl_registry_bind(registry, name, &wl_compositor_interface, 4));
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
       state.shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
@@ -267,14 +383,56 @@ int main(int argc, char** argv) {
       wp_fractional_scale_manager_v1_get_fractional_scale(state.scaleManager, state.surface);
   wp_fractional_scale_v1_add_listener(fractionalScale, &kFractionalScaleListener, &state);
 
+  // Legacy clients can select decorations before assigning the xdg role.
+  if (const char* mode = std::getenv("LEGACY_DECORATION"); mode != nullptr) {
+    if (state.legacyManager == nullptr) {
+      std::println(stderr, "fractional-client: legacy decoration manager unavailable");
+      return 1;
+    }
+    state.legacyDecoration = org_kde_kwin_server_decoration_manager_create(state.legacyManager, state.surface);
+    org_kde_kwin_server_decoration_add_listener(state.legacyDecoration, &kLegacyListener, &state);
+    org_kde_kwin_server_decoration_request_mode(state.legacyDecoration, strcmp(mode, "server") == 0 ? 2 : 1);
+    if (wl_display_roundtrip(state.display) < 0)
+      return 1;
+  }
+
   state.xdgSurface = xdg_wm_base_get_xdg_surface(state.wmBase, state.surface);
   xdg_surface_add_listener(state.xdgSurface, &kXdgSurfaceListener, &state);
   state.toplevel = xdg_surface_get_toplevel(state.xdgSurface);
   xdg_toplevel_add_listener(state.toplevel, &kToplevelListener, &state);
   xdg_toplevel_set_title(state.toplevel, title);
+  if (const char* mode = std::getenv("XDG_DECORATION"); mode != nullptr) {
+    if (state.decorationManager == nullptr) {
+      std::println(stderr, "fractional-client: decoration manager unavailable");
+      return 1;
+    }
+    state.decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(state.decorationManager, state.toplevel);
+    zxdg_toplevel_decoration_v1_add_listener(state.decoration, &kDecorationListener, &state);
+    zxdg_toplevel_decoration_v1_set_mode(
+        state.decoration,
+        strcmp(mode, "server") == 0 ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
+                                    : ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE
+    );
+  }
   wl_surface_commit(state.surface);
 
-  while (wl_display_dispatch(state.display) >= 0) {
+  const bool controlled = std::getenv("DECORATION_CONTROL") != nullptr;
+  while (state.running) {
+    if (!controlled) {
+      if (wl_display_dispatch(state.display) < 0)
+        break;
+      continue;
+    }
+    if (wl_display_dispatch_pending(state.display) < 0 || wl_display_flush(state.display) < 0)
+      break;
+    pollfd fds[]{{wl_display_get_fd(state.display), POLLIN, 0}, {STDIN_FILENO, POLLIN, 0}};
+    if (poll(fds, 2, -1) < 0)
+      break;
+    if ((fds[0].revents & POLLIN) != 0 && wl_display_dispatch(state.display) < 0)
+      break;
+    if ((fds[1].revents & (POLLIN | POLLHUP)) != 0)
+      readDecorationCommands(state);
   }
+  wl_display_disconnect(state.display);
   return 0;
 }

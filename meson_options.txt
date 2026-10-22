@@ -13,6 +13,12 @@ option(
 )
 option('jemalloc', type: 'feature', value: 'auto', description: 'Use jemalloc on glibc builds')
 option(
+  'localed',
+  type: 'feature',
+  value: 'auto',
+  description: 'Read the systemd-localed keymap through libsystemd\'s sd-bus for keyboards with no XKB configuration',
+)
+option(
   'tracy',
   type: 'feature',
   value: 'disabled',

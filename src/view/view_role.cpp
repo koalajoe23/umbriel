@@ -65,30 +65,58 @@ namespace umbriel {
   }
 
   void View::setSuspendedState(bool suspended) {
-    // X11 has no such state: minimizing would tell the client it was iconified, which is not what a hidden tab is.
-    if (m_toplevel == nullptr || !m_toplevel->base->initialized || m_toplevel->scheduled.suspended == suspended) {
+    // X11 has no such state: minimizing would tell the client it was iconified, which is not what a hidden window is.
+    // An xdg client bound below version 6 never sees it either, so it keeps the background frame callbacks instead.
+    if (m_toplevel == nullptr
+        || !m_toplevel->base->initialized
+        || wl_resource_get_version(m_toplevel->resource) < XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION
+        || m_toplevel->scheduled.suspended == suspended) {
       return;
     }
     wlr_xdg_toplevel_set_suspended(m_toplevel, suspended);
   }
 
-  void View::setFullscreenState(bool fullscreen) {
-    if (m_toplevel != nullptr) {
-      wlr_xdg_toplevel_set_fullscreen(m_toplevel, fullscreen);
+  bool View::suspended() const { return m_toplevel != nullptr && m_toplevel->scheduled.suspended; }
+
+  bool View::presented() const {
+    if (m_sceneTree == nullptr) {
+      return false;
+    }
+    int x = 0;
+    int y = 0;
+    return wlr_scene_node_coords(&m_sceneTree->node, &x, &y);
+  }
+
+  void View::syncSuspendedState() {
+    // A tiled opener waits hidden only until the arrange that places it, so it is about to show, not hidden.
+    if (!m_mapped || m_tiledOpeningDeferred) {
       return;
     }
-    m_xState.fullscreen = fullscreen;
-    m_xFullscreenSize.reset();
-    wlr_xwayland_surface_set_fullscreen(m_xsurface, fullscreen);
+    setSuspendedState(!presented() && !m_server->viewRenderedOffscreen(*this));
+  }
+
+  void View::setFullscreenState(bool fullscreen) {
+    // The IPC window listing reports the scheduled state.
+    m_server->scheduleIpcWindowsEvent();
+    if (m_toplevel != nullptr) {
+      wlr_xdg_toplevel_set_fullscreen(m_toplevel, fullscreen);
+    } else {
+      m_xState.fullscreen = fullscreen;
+      m_xFullscreenSize.reset();
+      wlr_xwayland_surface_set_fullscreen(m_xsurface, fullscreen);
+    }
+    syncSsdFrame();
   }
 
   void View::setMaximizedState(bool maximized) {
+    m_server->scheduleIpcWindowsEvent();
     if (m_toplevel != nullptr) {
       wlr_xdg_toplevel_set_maximized(m_toplevel, maximized);
-      return;
+    } else {
+      m_xState.maximized = maximized;
+      wlr_xwayland_surface_set_maximized(m_xsurface, maximized, maximized);
     }
-    m_xState.maximized = maximized;
-    wlr_xwayland_surface_set_maximized(m_xsurface, maximized, maximized);
+    syncSsdFrame();
   }
 
   void View::requestClose() {
@@ -190,12 +218,16 @@ namespace umbriel {
     m_xConfigured.height = m_xsurface->height;
   }
 
-  bool View::configureSettled(uint32_t serial) const {
-    return m_toplevel == nullptr || serialSettled(m_toplevel->base->current.configure_serial, serial);
+  bool View::configureOutstanding() const {
+    if (m_toplevel == nullptr) {
+      return false;
+    }
+    const wlr_xdg_surface* surface = m_toplevel->base;
+    return surface->configure_idle != nullptr || surface->current.configure_serial != surface->scheduled_serial;
   }
 
-  bool View::pendingConfigureSettled(uint32_t serial) const {
-    return m_toplevel == nullptr || serialSettled(m_toplevel->base->pending.configure_serial, serial);
+  bool View::configureSettled(uint32_t serial) const {
+    return m_toplevel == nullptr || serialSettled(m_toplevel->base->current.configure_serial, serial);
   }
 
   bool View::retireFloatingSizeRequest() {
@@ -290,8 +322,8 @@ namespace umbriel {
     // The frame's position is its place in layout coordinates: a workspace slide moves the workspace tree around it
     // and does not change it. Its own animated motion is not published frame by frame either, because X clients, games
     // in particular, react to every move; the last tick of the animation publishes where the window came to rest.
-    int lx = region.toX(m_sceneTree->node.x);
-    int ly = region.toY(m_sceneTree->node.y);
+    int lx = region.toX(layoutX());
+    int ly = region.toY(layoutY());
     // X11 geometry is 16-bit: coordinates are signed, sizes unsigned and nonzero.
     constexpr int kMinCoordinate = std::numeric_limits<int16_t>::min();
     constexpr int kMaxCoordinate = std::numeric_limits<int16_t>::max();
@@ -333,9 +365,7 @@ namespace umbriel {
 
   XwaylandRegion View::xwaylandRegion() const {
     const Output* output = currentOutput();
-    return m_server->xwayland()->outputs().region(
-        output != nullptr ? output->wlr() : nullptr, m_sceneTree->node.x, m_sceneTree->node.y
-    );
+    return m_server->xwayland()->outputs().region(output != nullptr ? output->wlr() : nullptr, layoutX(), layoutY());
   }
 
   void View::applyXwaylandScale(double scale) {

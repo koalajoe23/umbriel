@@ -29,6 +29,21 @@ wait_for_workspace() {
   return 1
 }
 
+wait_for_temporary_workspace() {
+  local output=$1 native=$2 workspace=
+  for _ in $(seq 40); do
+    workspace=$("$UMBRIEL" windows --json | jq -r '.[0].workspace // ""')
+    if [[ $workspace == "$output":* && $workspace != "$native" ]] \
+      && "$UMBRIEL" workspaces --json | jq -e --arg id "$workspace" \
+        'any(.[]; .id == $id and .named == false)' > /dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "expected a separate anonymous temporary workspace on '$output', got '$workspace' (native '$native')"
+  return 1
+}
+
 wait_for_enabled() {
   local output=$1 expected=$2 state=
   for _ in $(seq 40); do
@@ -84,6 +99,7 @@ wait_for_log_since() {
 
 spawn_client
 wait_for_workspace 'HEADLESS-2:1'
+native_refuge=$("$UMBRIEL" workspaces --json | jq -r '.[] | select(.output == "HEADLESS-1" and .index == 1) | .id')
 read -r initial_x initial_y < <(
   "$UMBRIEL" outputs --json \
     | jq -r '.[] | select(.name == "HEADLESS-2") | "\(.position.x) \(.position.y)"'
@@ -100,14 +116,15 @@ timeout 5s grim -o HEADLESS-2 "$TEST_SHOT"
 mark=$(log_mark)
 "$OUTPUT_MANAGEMENT" apply disable HEADLESS-2 > /dev/null
 wait_for_enabled HEADLESS-2 false
-wait_for_workspace 'HEADLESS-1:1'
+wait_for_temporary_workspace HEADLESS-1 "$native_refuge"
+displaced_workspace=$("$UMBRIEL" windows --json | jq -r '.[0].workspace')
 wait_for_log_since "$mark" "output 'HEADLESS-2': disabled by output management, power off"
 expect_capture_failure HEADLESS-2 "$XDG_RUNTIME_DIR/output-management-disabled.png"
 
 # Protocol disable is not DPMS. Input on the remaining output must not wake it.
 "$POINTER" 1280 720 move 10 10
 wait_for_enabled HEADLESS-2 false
-wait_for_workspace 'HEADLESS-1:1'
+wait_for_workspace "$displaced_workspace"
 
 # Re-enable at its original automatic-layout position. Its displaced window
 # must return to the preserved workspace on that output.
@@ -121,6 +138,7 @@ wait_for_workspace 'HEADLESS-2:1'
 # fallback, then restores there instead of remaining unassigned.
 "$UMBRIEL" msg window-move-to-workspace:1/HEADLESS-1 > /dev/null
 wait_for_workspace 'HEADLESS-1:1'
+sleeping_refuge=$("$UMBRIEL" workspaces --json | jq -r '.[] | select(.output == "HEADLESS-2" and .index == 1) | .id')
 mark=$(log_mark)
 "$UMBRIEL" msg dpms-off:HEADLESS-2 > /dev/null
 wait_for_log_since "$mark" "output 'HEADLESS-2': powered off"
@@ -135,6 +153,6 @@ fi
 mark=$(log_mark)
 "$POINTER" 1280 720 move 20 20
 wait_for_log_since "$mark" "output 'HEADLESS-2': applied mode="
-wait_for_workspace 'HEADLESS-2:1'
+wait_for_temporary_workspace HEADLESS-2 "$sleeping_refuge"
 
 echo "output-management test was inert, apply restored output state, and DPMS fallback recovery succeeded"

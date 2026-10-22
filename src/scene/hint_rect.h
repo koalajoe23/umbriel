@@ -30,7 +30,7 @@ namespace umbriel {
     void show(Output* output, const wlr_box& box, int cornerRadius);
     void hideImmediate();
     [[nodiscard]] AnimationPhase animationPhase() const override { return AnimationPhase::Overlays; }
-    bool tickAnimations(uint64_t nowMsec) override;
+    bool tickAnimations(double nowMsec) override;
     [[nodiscard]] bool hasActiveAnimations() const override;
     [[nodiscard]] bool animatesOn(const Output* output) const override { return m_output == output; }
     [[nodiscard]] Output* output() const { return m_output; }

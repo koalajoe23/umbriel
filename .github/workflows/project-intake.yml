@@ -1,0 +1,120 @@
+name: Maintainer Triage Intake
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request_target:
+    types: [opened, reopened]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: maintainer-triage-intake-${{ github.event.issue.node_id || github.event.pull_request.node_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    steps:
+      # Short-lived token from the Noctalia Automation GitHub App (org variable
+      # AUTOMATION_APP_CLIENT_ID, org secret AUTOMATION_APP_PRIVATE_KEY), limited to
+      # this repository and to what intake needs.
+      - name: Create Noctalia Automation token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.AUTOMATION_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
+          permission-organization-projects: write
+          permission-issues: read
+          permission-pull-requests: read
+
+      - name: Add native issues and pull requests to maintainer triage
+        uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9.0.0
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const projectId = 'PVT_kwDODYBPq84BmIDl';
+            const { owner, repo } = context.repo;
+            if (owner !== 'noctalia-dev' || repo !== 'umbriel') throw new Error('Unexpected intake repository');
+            const data = await github.graphql(`query($id:ID!) {
+              node(id:$id) { ... on ProjectV2 {
+                fields(first:100) { nodes {
+                  ... on ProjectV2SingleSelectField { id name options { id name } }
+                } }
+              } }
+            }`, { id: projectId });
+            if (!data.node) throw new Error('Maintainer triage project is inaccessible');
+            const fields = new Map(data.node.fields.nodes.filter(f => f.name).map(f => [f.name, f]));
+            function fieldOption(name, label) {
+              const field = fields.get(name);
+              const option = field?.options.find(o => o.name === label);
+              if (!option) throw new Error(`Missing project field/option: ${name}/${label}`);
+              return { fieldId: field.id, value: { singleSelectOptionId: option.id } };
+            }
+            for (const [field, option] of [['Component', 'Umbriel'], ['Kind', 'Issue'], ['Kind', 'PR'], ['Status', 'Inbox']]) fieldOption(field, option);
+            const members = new Map();
+            let cursor = null;
+            do {
+              const page = await github.graphql(`query($id:ID!,$cursor:String) {
+                node(id:$id) { ... on ProjectV2 { items(first:100,after:$cursor) {
+                  nodes { id isArchived content { ... on Issue { id } ... on PullRequest { id } }
+                    fieldValues(first:100) { nodes { ... on ProjectV2ItemFieldSingleSelectValue {
+                      name field { ... on ProjectV2SingleSelectField { name } }
+                    } } }
+                  }
+                  pageInfo { hasNextPage endCursor }
+                } } }
+              }`, { id: projectId, cursor });
+              const items = page.node.items;
+              for (const item of items.nodes) {
+                if (!item.content?.id) continue;
+                if (members.has(item.content.id)) throw new Error(`Duplicate native card for ${item.content.id}`);
+                members.set(item.content.id, item);
+              }
+              cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
+            } while (cursor);
+            const subjects = [];
+            if (context.eventName === 'workflow_dispatch') {
+              for await (const response of github.paginate.iterator(github.rest.issues.listForRepo, { owner, repo, state: 'open', per_page: 100 })) {
+                for (const issue of response.data) subjects.push({ id: issue.node_id, kind: issue.pull_request ? 'PR' : 'Issue' });
+              }
+            } else {
+              const subject = context.payload.issue || context.payload.pull_request;
+              if (!subject) throw new Error('Intake event has no issue or pull request');
+              if (subject.state !== 'open') return;
+              subjects.push({ id: subject.node_id, kind: context.payload.pull_request ? 'PR' : 'Issue' });
+            }
+            for (const subject of subjects) {
+              let item = members.get(subject.id);
+              if (item?.isArchived) { core.info(`Preserving archived card ${item.id}`); continue; }
+              const current = new Map((item?.fieldValues.nodes || []).filter(v => v.field).map(v => [v.field.name, v.name]));
+              for (const [name, desired] of [['Component', 'Umbriel'], ['Kind', subject.kind]]) {
+                if (current.has(name) && current.get(name) !== desired) throw new Error(`Conflicting ${name} on ${item.id}`);
+              }
+              const added = !item;
+              if (added) {
+                const result = await github.graphql(`mutation($input:AddProjectV2ItemByIdInput!) {
+                  addProjectV2ItemById(input:$input) { item { id } }
+                }`, { input: { projectId, contentId: subject.id } });
+                item = result.addProjectV2ItemById.item;
+                members.set(subject.id, item);
+              }
+              for (const [name, desired] of [['Component', 'Umbriel'], ['Kind', subject.kind], ['Status', 'Inbox']]) {
+                if (current.has(name) && (name !== 'Status' || !added)) continue;
+                await github.graphql(`mutation($input:UpdateProjectV2ItemFieldValueInput!) {
+                  updateProjectV2ItemFieldValue(input:$input) { __typename }
+                }`, { input: { projectId, itemId: item.id, ...fieldOption(name, desired) } });
+              }
+              const verified = await github.graphql(`query($id:ID!) { node(id:$id) { ... on ProjectV2Item {
+                id content { ... on Issue { id } ... on PullRequest { id } }
+                fieldValues(first:100) { nodes { ... on ProjectV2ItemFieldSingleSelectValue {
+                  name field { ... on ProjectV2SingleSelectField { name } }
+                } } }
+              } } }`, { id: item.id });
+              const values = new Map(verified.node.fieldValues.nodes.filter(v => v.field).map(v => [v.field.name, v.name]));
+              if (verified.node.content.id !== subject.id || values.get('Component') !== 'Umbriel' || values.get('Kind') !== subject.kind) throw new Error(`Intake verification failed for ${item.id}`);
+              if ((added || !current.has('Status')) && values.get('Status') !== 'Inbox') throw new Error(`Inbox verification failed for ${item.id}`);
+              core.info(`${added ? 'Added' : 'Verified'} ${subject.kind}: ${item.id}`);
+            }

@@ -39,24 +39,49 @@ be rebuilt.
 
 An activation token created for `spawn:` records the preferred output and its
 active workspace. A trusted client-created token records the workspace of its
-input source. Pinned and visible scratchpad sources record the active workspace
-on the output where they are presented. Umbriel associates that origin with a
-new native toplevel through XDG activation, or through a private inherited token
-for applications that do not use the protocol.
+input source. Pinned sources record the active workspace on the output where
+they are presented. A launch from an active scratchpad, including an empty one,
+also records its name. A trusted token from a scratchpad window records that
+window's pad; a layer-shell launcher records the active pad on its output.
+The workspace remains the return destination for a scratchpad launch.
+Umbriel associates that origin with a new native toplevel through XDG
+activation, or through a private inherited token for applications that do not
+use the protocol.
 
 Launch placement is applied at most once, and only before the toplevel's first
 map. Explicit output, workspace, and scratchpad window rules are resolved
 instead when present. If the pointer-preferred workspace has changed, the
 captured workspace receives the new window without changing focus or switching
 the user back, including when the pointer moved to another output.
+Scratchpad admission uses the captured name even after the pad is hidden or
+replaced. The arriving window takes focus only when that pad is still the
+active launch destination on the preferred output. An enabled pinning rule
+also overrides scratchpad launch placement. Removing the named pad before map
+leaves normal workspace placement available.
 One exception applies to a pointer gesture that creates another toplevel in the
 same Wayland client. If the pointer gesture ends on another output and the
 client redeems its activation token there, the new toplevel opens on the active
 workspace of the drop output. This lets browser tab tear-offs follow their drop
-without changing ordinary application launch placement.
+without changing ordinary application launch placement. A captured scratchpad
+destination stays authoritative across such pointer movement.
 `focus_on_activate` controls the activation decision and does not select the
 recorded launch destination. Redeeming the token against an existing or
 remapping toplevel consumes it without relocation.
+
+Scratchpad visibility and launch context are independent of membership.
+An empty toggle shows the existing backdrop and clears window keyboard focus.
+Closing the last member preserves this state; restoring the last member or
+closing a solo member hides the pad. Explicit workspace focus relinquishes
+launch context on that output without hiding the pad. Admission suppresses the
+floating transition's normal focus step until membership and visibility have
+been established, so a hidden arrival cannot focus its temporary workspace.
+Window-relative actions also recognize an active empty pad and do not fall
+back to its underlying workspace's remembered focus.
+
+The scratchpad launch checks retain restored and pinned windows through
+compositor shutdown. Floating restacking can then scan the registry while its
+views are being destroyed; transient-tree scans skip entries already cleared
+by that destruction.
 
 ### Reconciling configured names
 
@@ -253,6 +278,69 @@ Bare digits produce a position, ordinary text produces a name, and double
 quotes force a name for numeric-looking values. Resolution never retries one
 type as the other.
 
+## Output evacuation
+
+Output removal, configuration disable, and output-management disable share
+`Server::reassignOutputViews()`. It records each native workspace's original
+output identity, selector, layout snapshot, floating positions, and active
+selection before moving any views. Source reservation anchors keep dynamic
+reconciliation from deleting workspace batches during that transfer.
+
+Each populated source workspace receives a temporary member on a live output.
+Explicit source names and their `named` flag are preserved; anonymous sources
+use their receiving positions as labels. `DisplacedWorkspace` owns the source
+identity strings, so its layout rules can still resolve against the original
+monitor and workspace after the physical `Output` is destroyed. Indices
+describe the receiving output; the saved home remains independent of those positions.
+Duplicate named workspaces on different outputs therefore remain separate.
+The destination layout receives the captured topology and viewport before its
+members are moved. Pinned windows and scratchpads retain their separate
+output-level evacuation paths.
+
+Temporary members also appear on fixed inventories. Fixed reconciliation
+matches configured native members first, then appends surviving temporary
+members. Dynamic name reconciliation cannot claim a temporary member as a
+configured name. Both inventory types prune empty unreserved temporary members
+and repair active and previous workspace pointers. A pending launch can keep
+an empty temporary member alive. A new window entering that member inherits
+its original home and schedules restoration, including when the home returned
+before the delayed window mapped. Explicit movement into a native workspace
+clears that window's return record.
+
+`Server::resolveNamedWorkspace()` serves actions and window rules. It excludes
+disabled outputs, prefers a native name over displaced names within one group,
+and treats multiple displaced matches as ambiguity. A qualifier naming an
+unavailable output searches the original identities of displaced members on
+enabled outputs. Numeric selectors remain positions on a live output.
+Dynamic declaration reconciliation skips displaced members, including when a
+native declaration with the same name is added or removed during reload.
+
+Scratchpad returns from temporary workspaces retain a weak workspace anchor
+and the displaced origin. A surviving anchor selects the exact temporary
+member despite a name collision. An expired anchor allows the empty member to
+be pruned and recreated on return; if the original output has returned, the
+window rejoins its native home instead. This does not reserve an empty temporary
+workspace for the duration of a scratchpad stay.
+
+Allocation remains bounded at 64 workspaces per output. Evacuation tries the
+chosen live output, then the other enabled outputs. If none has room, it uses a
+native workspace without overwriting a foreign temporary layout. Fixed
+inventory growth can likewise displace excess temporary members into native
+workspaces while preserving the windows' original return records.
+
+`restoreDisplacedViews()` restores available homes first. If every output was
+lost, saved homes whose outputs are still missing acquire separate temporary
+members on the first available output through the same allocation policy.
+Before further evacuation or restoration, live temporary workspaces refresh
+their mapped tiled members' snapshots, including column edits, widths, tabs,
+and runtime layout overrides. The original selector stays unchanged. If a
+surviving peer is unmapped and still needs a saved snapshot slot, the origin
+retains that complete snapshot until the delayed member can be restored.
+Returning native anonymous positions cannot resolve to foreign temporary
+members. A temporary active selection is never recorded as a native selection
+for its refuge output. Empty source layouts are flushed after evacuation,
+because a disabled output has no frame on which to finish their pending work.
+
 ## Verification
 
 Configuration resolution and change classification are covered by
@@ -262,6 +350,27 @@ workspace selection is exercised by
 [`tests/harness/checks/workspace/selectors.sh`](../../tests/harness/checks/workspace/selectors.sh),
 including a bare position on the pointer-preferred output versus an exact
 numeric name selected with quotes.
+Preserved names, original-output qualification, dynamic name collisions,
+disabled-output rule routing, and scratchpad returns are covered by
+[`tests/harness/checks/output/evacuated_names.sh`](../../tests/harness/checks/output/evacuated_names.sh)
+and
+[`tests/harness/checks/output/evacuated_name_collisions.sh`](../../tests/harness/checks/output/evacuated_name_collisions.sh).
+Output removal, disable, reload, complete output loss, separate temporary
+membership, layout preservation, and cleanup are covered by
+[`tests/harness/checks/output/workspace_evacuation.sh`](../../tests/harness/checks/output/workspace_evacuation.sh).
+New windows following a temporary workspace home, explicit moves adopting
+their destination, and pending launches retaining an emptied temporary member
+until a late client maps are covered by
+[`tests/harness/checks/output/evacuated_arrivals.sh`](../../tests/harness/checks/output/evacuated_arrivals.sh).
+Tiling edits and runtime layout switches made while the home output is absent
+are covered by
+[`tests/harness/checks/output/evacuated_layout_edits.sh`](../../tests/harness/checks/output/evacuated_layout_edits.sh).
+Native fallback at the limit of 64 workspaces, including an already occupied
+temporary workspace being active when another output disappears, is covered by
+[`tests/harness/checks/output/evacuation_capacity.sh`](../../tests/harness/checks/output/evacuation_capacity.sh).
+Exact scrolling, dwindle, and master restoration with an unmapped member is
+covered by
+[`tests/harness/checks/output/layout_restore.sh`](../../tests/harness/checks/output/layout_restore.sh).
 Leading and trailing dynamic sentinels, including renumbering after workspace
 movement, are covered by
 [`tests/harness/checks/workspace/empty_above.sh`](../../tests/harness/checks/workspace/empty_above.sh).

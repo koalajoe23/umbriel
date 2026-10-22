@@ -149,14 +149,11 @@ namespace umbriel {
   void validateEffectReferences(Config& loaded, std::vector<EffectReference>& references);
   void warnScrollButtonBinds(const Config& loaded);
 
-  // Whether the config asks for a DRM policy. A load that fails then refuses to fall back to defaults.
-  [[nodiscard]] bool hasRequestedDrmPolicy(const toml::table& root);
-
   enum class ConfigParseOutcome : uint8_t {
     Loaded,
     Missing,
-    DefaultsAllowed,
-    Fatal,
+    // Errors were reported. Startup falls back to defaults; a reload keeps the previous configuration.
+    Failed,
   };
 
   // Merge `rootPath` with its includes and read every table into `out`, which is left alone unless the result is

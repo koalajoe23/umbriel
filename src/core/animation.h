@@ -15,6 +15,13 @@ namespace umbriel {
   // for the process lifetime. Shared by every transition source, including drag physics.
   [[nodiscard]] uint64_t nextAnimationTransitionId();
 
+  struct AnimationTransition {
+    uint64_t id;
+    std::array<float, 4> seed;
+  };
+  // Identity and random seed for native transitions, including directly controlled gestures.
+  [[nodiscard]] AnimationTransition beginAnimationTransition();
+
   enum class Easing : uint8_t {
     Linear,
     EaseInSine,
@@ -148,7 +155,7 @@ namespace umbriel {
 
     [[nodiscard]] virtual AnimationPhase animationPhase() const = 0;
     // Advance to `nowMsec`; true while anything is still running.
-    virtual bool tickAnimations(uint64_t nowMsec) = 0;
+    virtual bool tickAnimations(double nowMsec) = 0;
     [[nodiscard]] virtual bool hasActiveAnimations() const = 0;
     // Whether `output` has to keep scheduling frames for this owner. An owner spanning every output (the overview)
     // answers true for all of them; one with no output yet answers false for all.
@@ -192,7 +199,7 @@ namespace umbriel {
     // Advances the value. Returns true when the value was animating at entry (i.e. the owner must apply current()). The
     // call that reaches the target returns true and leaves animating() false, so owners detect completion as (tick(now)
     // && !animating()).
-    bool tick(uint64_t nowMsec);
+    bool tick(double nowMsec);
 
     [[nodiscard]] double current() const { return m_current; }
     [[nodiscard]] double target() const { return m_target; }
@@ -211,8 +218,8 @@ namespace umbriel {
     double m_current = 0.0;
     double m_velocity = 0.0;
     double m_initialVelocity = 0.0;
-    double m_progress = 1.0;  // linear fraction as of the last tick(); 1.0 when never animating
-    uint64_t m_startMsec = 0; // 0 = clock starts on the first tick
+    double m_progress = 1.0; // linear fraction as of the last tick(); 1.0 when never animating
+    double m_startMsec = 0;  // 0 = clock starts on the first tick
     uint64_t m_durationMsec = 1;
     uint64_t m_transitionId = 0;
     std::array<float, 4> m_shaderSeed{};
@@ -245,7 +252,7 @@ namespace umbriel {
     void retargetSpring(const std::array<float, 4>& to, double damping = 0.75, double stiffness = 100.0);
 
     // Advances the color animation
-    bool tick(uint64_t nowMsec);
+    bool tick(double nowMsec);
 
     [[nodiscard]] const std::array<float, 4>& current() const { return m_current; }
     void current(float out[4]) const;
@@ -271,7 +278,7 @@ namespace umbriel {
     OkLab m_fromOkLab;
     OkLab m_targetOkLab;
     double m_progress = 1.0; // linear fraction as of the last tick(); 1.0 when never animating
-    uint64_t m_startMsec = 0;
+    double m_startMsec = 0;
     uint64_t m_durationMsec = 1;
     uint64_t m_transitionId = 0;
     std::array<float, 4> m_shaderSeed{};

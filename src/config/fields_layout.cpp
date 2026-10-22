@@ -25,6 +25,7 @@ namespace umbriel {
           {.name = "scrolling", .value = LayoutMode::Scrolling},
           {.name = "dwindle", .value = LayoutMode::Dwindle},
           {.name = "master", .value = LayoutMode::Master},
+          {.name = "floating", .value = LayoutMode::Floating},
       };
       return choices;
     }
@@ -43,6 +44,14 @@ namespace umbriel {
           {.name = "never", .value = CenterFocusedColumn::Never},
           {.name = "always", .value = CenterFocusedColumn::Always},
           {.name = "on_overflow", .value = CenterFocusedColumn::OnOverflow},
+      };
+      return choices;
+    }
+
+    const registry::Choices<ClientMaximize>& clientMaximizeModes() {
+      static const registry::Choices<ClientMaximize> choices{
+          {.name = "column", .value = ClientMaximize::Column},
+          {.name = "edges", .value = ClientMaximize::Edges},
       };
       return choices;
     }
@@ -135,6 +144,7 @@ namespace umbriel {
         }
         parsed.push_back(used);
       }
+      std::ranges::sort(parsed);
       return parsed;
     }
 
@@ -210,6 +220,7 @@ namespace umbriel {
                 }
               }
           ),
+          choice("client_maximize", &L::clientMaximize, clientMaximizeModes()),
           table("scrolling", &L::scrolling, scrolling),
           table("dwindle", &L::dwindle, dwindle),
           table("master", &L::master, master),

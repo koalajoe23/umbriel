@@ -30,6 +30,8 @@ selectors are what turn it on. If your configuration already has an
 to your existing `[effects]` and `[animation.windows_in]` tables rather than
 repeating the tables.
 
+On NixOS, see [Using bundled effects](installation.md#using-bundled-effects) for the path to use instead of `/usr/share`.
+
 Bundled presets:
 
 | Preset | Kind | Selector |
@@ -37,6 +39,7 @@ Bundled presets:
 | `reveal` | animation | `[animation.windows_in] effect = "reveal"` (also `windows_out`) |
 | `squash` | animation | `[animation.windows_move] effect = "squash"` |
 | `pulse` | border | `[effects] border = "pulse"` |
+| `audio` | border | `[effects] border = "audio"`; brightness follows the lowest external spectrum band. |
 | `scanlines` | window | `[effects] window = "scanlines"` |
 | `vignette` | screen | `[effects] screen = "vignette"` |
 | `glow` | cursor | `[effects] cursor = "glow"` |
@@ -260,8 +263,8 @@ inactive pool history does not.
 `umbriel windows --json` and `subscribe windows` include `border_effect` and
 `window_effect` with `name`, `pool`, `source` (`default`, `rule`, or `runtime`),
 and `suppressed`; borders also expose `overlay`. Inspection never picks,
-compiles, or binds. Screen assignments are in `effects`, while `outputs --json`
-keeps its existing output-management contract. See [IPC](ipc.md).
+compiles, or binds. Screen assignments are in `effects`, not `outputs`. See
+[IPC](ipc.md).
 
 ## Write a shader
 
@@ -290,10 +293,14 @@ Every kind sees:
 | `umbriel_time` | Seconds on the animation clock, times the border's `speed`. Held as a single-precision float that is never wrapped, so fine time-based motion loses precision after long uptimes. `sin` and `cos` reduce their argument to one revolution, so they stay correct at large angles. |
 | `umbriel_palette_count` | `4` for palette presets, `0` otherwise. |
 | `umbriel_palette_at(float t)` | The palette color at `t`, blended between neighboring colors from the wrapping sequence `accent_primary`, `accent_secondary`, `warning`, `error`. Transparent black when there is no palette. |
+| `umbriel_audio_spectrum(position)` | Interpolated spectrum intensity from 0 to 1, or 0 without a feed. See [Audio input](#audio-input). |
+| `umbriel_audio_available()` | `1` while the feed has fresh snapshots, otherwise `0`. See [Audio input](#audio-input). |
 
 Animations add `umbriel_progress`, `umbriel_clamped_progress`,
 `umbriel_linear_progress`, `umbriel_direction`, and `umbriel_random_seed`
-([Animation](animation.md#custom-effects)). Borders add `umbriel_border_hole`
+([Animation](animation.md#custom-effects)); workspace reveal shaders also read
+the incoming scene with `umbriel_sample_incoming(vec2 uv)`
+([Workspace reveal](animation.md#workspace-reveal)). Borders add `umbriel_border_hole`
 (the client rectangle in `uv`), `umbriel_border_radius` (its corner radii in
 logical pixels), and `umbriel_border_distance(vec2 uv)`, the signed distance
 in logical pixels to the client rectangle, negative inside it; the client hole
@@ -322,6 +329,31 @@ desktop theme. Its colours can be edited in `cursor/trail/shader.glsl`. Both
 `trail` and `trail-path` draw a Catmull-Rom curve through the samples, so fast
 circles stay round; `trail-path` reads `umbriel_pointer_path` and is the
 starting point for longer tails.
+
+### Audio input
+
+Every effect kind can read `umbriel_audio_spectrum(position)` and
+`umbriel_audio_available()`. An [external analyser](ipc.md#audio-input) supplies
+64 bands from 0 to 1. Position is clamped to `[0,1]` and linearly interpolates
+between entries at `position * 63`, from the lowest to the highest band.
+Band values are quantized to 8-bit intensity before interpolation.
+It is a normalized low-to-high coordinate, with no promised Hz centers or edges.
+Availability tracks receipt of fresh snapshots, including all-zero input from
+silence or idle capture. All bands and availability are zero without a feed.
+Bands represent visual intensity, not calibrated loudness. The analyser chooses
+the audio source and smoothing.
+
+Shaders can sample a band or aggregate the spectrum according to the effect's
+needs. For example, `umbriel_audio_spectrum(0.0)` reacts to the lowest band.
+
+Audio works without `umbriel_time`; `animated` and `speed` only affect time.
+Changed input redraws visible consumers at `max_fps`. Identical input
+does not request frames. Each output holds its snapshot between eligible frames,
+and all passes of a composition, including closing copies, use that value.
+Existing `in_capture` behavior applies.
+
+Include `border/audio/effect.toml` from the installed effect directory and select
+`border = "audio"` for a simple example. It remains dim without a feed.
 
 ### What a window effect sees
 

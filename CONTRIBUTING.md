@@ -30,7 +30,7 @@ Direct project dependencies. Transitive dependencies are owned by their providin
 | Compositor framework | `wlroots-0.20` |
 | Scene graph and effects | `umbrielfx` (blur, shadows, rounded corners; maintained in-tree) |
 | Wayland core | `wayland-server`, `wayland-client`, `wayland-protocols`, `wayland-scanner` |
-| Input | `libinput`, `xkbcommon` |
+| Input | `libinput`, `xkbcommon`, `libsystemd` (sd-bus, optional: the systemd-localed keymap) |
 | Graphics | `pixman`, `libdrm`, OpenGL via wlroots |
 | Text | `cairo`, `pangocairo` |
 | Memory allocation | `jemalloc` (optional, glibc) |
@@ -53,10 +53,28 @@ The README covers routine builds and running Umbriel. Contributor checks and spe
 | `just check-stress <name> [n]` | Run `n` copies (default 32) of one harness check at once, to expose races that load reveals |
 | `just check-names` | List every harness check name. Builds nothing |
 | `just lint [file ...]` | Build the compositor, unit tests, and harness clients, then run clang-tidy on everything or only the given files |
-| `just format` | Format source and test files |
+| `just format` | Format the C++ and umbrielfx C sources, tests, and GLSL shaders (including `examples/effects`) |
 | `just install` | Build a release binary and install it with `meson install` |
 | `just clean <mode>` | Remove a build directory |
 | `just rebuild <mode>` | Clean and rebuild a build directory |
+
+The Nix development shell includes the clients and command-line tools used by the test suite:
+
+```sh
+nix develop
+just test                 # unit and umbrielfx suites, through Meson
+just check                # every harness check
+```
+
+Select harness checks by name or name fragment:
+
+```sh
+just check protocol/color_management                  # one check
+just check protocol/color_management protocol/tearing # several
+just check overview/                                  # every check in a group
+just check protocol/color_management -v               # keep passing-check output
+just mode=asan check protocol/color_management        # use build-asan
+```
 
 Tests live in three places, and which one a change belongs in follows from what it can observe:
 
@@ -99,8 +117,8 @@ follow:
   down itself, as `session/quit` does.
 - Never re-apply `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, or `-u DBUS_SESSION_BUS_ADDRESS` per command. The harness
   already put the body in that environment. This is containment, not convenience: only IPC subcommands honour
-  `UMBRIEL_SOCKET`, while `umbriel outputs` and every helper client are Wayland clients resolving `XDG_RUNTIME_DIR`
-  and `WAYLAND_DISPLAY`, so a missing prefix used to query the developer's live session instead of the instance.
+  `UMBRIEL_SOCKET`, while every helper client is a Wayland client resolving `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`,
+  so a missing prefix used to query the developer's live session instead of the instance.
 - Never retain `$!` from a backgrounded shell *function*. Bash forks a subshell, so the captured pid is the wrapper and
   a signal to it leaves the client running. Background the client binary directly when a pid must be kept.
 - Never time a check with the wall clock. Wait for an end state with `umbriel settle`: it replies once no animation
@@ -161,6 +179,9 @@ keys. A check about how keyboards themselves arrive opts out with `# harness: ke
 
 A check that stops making progress is killed after 120 seconds, so the suite reports instead of hanging. Set
 `CHECK_TIMEOUT` to change the cap, and `CHECK_VERBOSE=1` (or `-v`) to keep the full output of passing checks.
+Passing checks emit completion messages, summarized to a single dimmed line unless verbose output is enabled.
+Failing checks print their whole output and keep their runtime directory (compositor log, config, and per-client
+logs), with its path in the report.
 
 ### Writing regression checks
 
@@ -231,7 +252,8 @@ narrate history, migrations, rejected alternatives, or "why we don't do X"; git 
 
 This project uses [clang-format](https://clang.llvm.org/docs/ClangFormat.html) for formatting, with the same
 `.clang-format` as noctalia-shell (LLVM base, 2-space indent, 120 columns, left pointer alignment, regrouped includes).
-Run `just format` before committing.
+The same file covers the umbrielfx C sources and the GLSL shaders (`.frag`, `.vert`, `.glsl`). Wrap hand-aligned
+tables such as matrices in `// clang-format off` and `// clang-format on`. Run `just format` before committing.
 
 Static analysis uses [clang-tidy](https://clang.llvm.org/extra/clang-tidy/) with the same `.clang-tidy` check set as
 noctalia-shell. Run `just lint` (warnings are errors). Prefer the modern idioms the checks enforce: `auto`, ranges,
@@ -396,7 +418,9 @@ taking control of a seat.
   The file is deliberately unfiltered (`src/core/log.cpp:270`); only the console
   honours the build's minimum level, which is debug for debug and ASan builds and
   info for release (`src/core/log.cpp:21-25`). So a release session still records
-  debug diagnostics to the file while keeping stderr quiet. The first startup
+  debug diagnostics to the file while keeping stderr quiet. wlroots messages
+  (`[wlr]`) are recorded from info up; set `UMBRIEL_WLR_DEBUG=1` before starting
+  the compositor to include wlroots debug output as well. The first startup
   record includes the release version and commit revision, which helps identify
   the exact binary behind a report.
 
@@ -434,8 +458,9 @@ an ASan build therefore describes an allocator nothing uses; configure with `-Dj
 
 ### Profiling
 
-`tracy` mode is a release build with `-Dtracy=enabled`. It compiles the Tracy zones in umbrielfx's render pass and
-in the compositor's per-frame path; every other build mode compiles them to nothing.
+`tracy` mode is a release build with `-Dtracy=enabled`, debug info, and frame pointers, so Tracy's sampling can walk
+call stacks. It compiles the Tracy zones in umbrielfx's render pass and in the compositor's per-frame path; every
+other build mode compiles them to nothing.
 
 ```sh
 just tracy                                     # build build-tracy/umbriel
@@ -483,7 +508,8 @@ umbriel msg --help              # list actions available to `msg` and keybinds
 umbriel msg <action> [args...]   # send an action to the running compositor
 ```
 
-`windows`, `effects`, `workspaces`, `layers`, `keyboard-layouts`, and `msg` accept `--json` / `-j` for machine-readable output.
+`windows`, `effects`, `workspaces`, `layers`, `outputs`, `keyboard-layouts`, and `msg` accept `--json` / `-j` for
+machine-readable output.
 `subscribe` is always JSON; see [docs/user/ipc.md](docs/user/ipc.md) for the families and payloads.
 
 ## Commits
@@ -494,3 +520,11 @@ types such as `feat`, `fix`, `refactor`, `chore`, `test`, or `docs` and a focuse
 Default to the summary line alone. Add a body only when it carries information a reader would otherwise miss: a
 non-obvious root cause, a constraint that forced the approach, a behavior change users will notice, or a `Fixes #N`
 reference. Do not restate the diff or list touched files.
+
+## Maintainer triage intake
+
+`.github/workflows/project-intake.yml` attaches newly opened or reopened Umbriel issues and pull requests to the organization Maintainer triage project as native cards. New cards receive Status Inbox, Component Umbriel, and Kind Issue or PR. It does not create drafts, post comments, change issue state, or set Priority. Existing card statuses, priorities, and other triage values are preserved. Archived cards are left archived; conflicting Component or Kind values fail the run rather than overwrite triage.
+
+Run Maintainer Triage Intake manually from GitHub Actions to reconcile all open issues and pull requests. Closed items are excluded. The Umbriel views require matching Component and Kind values.
+
+Intake authenticates as the organization's Noctalia Automation GitHub App: each run mints a short-lived token limited to this repository, organization project write and issue/pull request read, from the organization variable `AUTOMATION_APP_CLIENT_ID` and the organization secret `AUTOMATION_APP_PRIVATE_KEY`. The App must stay installed on this repository with Organization projects read and write. Rotate the key from the App's settings page and update the secret; never commit it. Intake on `pull_request_target` runs only the trusted workflow code and does not check out pull request code.

@@ -28,7 +28,7 @@ namespace umbriel {
     [[nodiscard]] bool bordersVisible() const;
     [[nodiscard]] wlr_scene_tree* borderTree() const { return m_borderTree; }
     void setBordersEnabled(bool enabled);
-    void updateBorderGeometry(int contentWidth, int contentHeight);
+    void updateBorderGeometry(int contentWidth, int contentHeight, int topExtension);
     // `alpha` premultiplies the border color so a fading view's ring fades with it.
     void setBorderColor(bool focused, float alpha);
     void setBorderRawColor(const std::array<float, 4>& baseColor, float alpha);
@@ -44,7 +44,7 @@ namespace umbriel {
     [[nodiscard]] int borderPadding() const { return m_borderPadding; }
     // True when the drawn ring no longer matches the given content size, i.e. a
     // client commit changed geometry behind the layout's back.
-    [[nodiscard]] bool borderGeometryStale(int contentWidth, int contentHeight) const;
+    [[nodiscard]] bool borderGeometryStale(int contentWidth, int contentHeight, int topExtension) const;
     // Copy the border into a close-animation snapshot tree. `innerColor` is the straight colour the ring currently
     // shows and `opacity` the effective opacity it is drawn at.
     void snapshotBorders(
@@ -63,6 +63,7 @@ namespace umbriel {
         const wlr_box* clip, float surfaceOpacity, float blurAlpha
     );
     void hideBlur();
+    void setBlurLive(bool live) { m_blur.setLive(live); }
 
     // Shadow
     void createShadow(wlr_scene_tree* frame);
@@ -73,7 +74,7 @@ namespace umbriel {
     // Only a pooled container needs these; under the frame it inherits both.
     void setShadowPosition(int x, int y);
     void setShadowEnabled(bool enabled);
-    void updateShadow(int contentWidth, int contentHeight, int borderInset, int cornerRadius);
+    void updateShadow(int contentWidth, int contentHeight, int borderInset, int cornerRadius, int topExtension);
     void hideShadow();
     void setShadowAnimationSource(wlr_scene_node* source) { m_shadow.setAnimationSource(source); }
     // `inPool` places the copy under every window of `parent`, otherwise directly below `source`.

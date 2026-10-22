@@ -56,8 +56,8 @@ EOF
 # Animation time only moves by clock-advance.
 "$UMBRIEL" clock-freeze
 
-# Runs every animation to its end. A resize crossfade starts only once its client commits, which happens in real time,
-# so advance until a settle probe succeeds.
+# Runs every animation to its end. Settling waits for clients to commit their resized buffers, which happens in real
+# time, so advance until a settle probe succeeds.
 finish() {
   for _ in $(seq 20); do
     "$UMBRIEL" clock-advance 2000 > /dev/null

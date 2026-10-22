@@ -1,3 +1,7 @@
+#include "umbrielfx/types/surface_pacing.h"
+
+#include "types/wlr_scene.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <wayland-server-core.h>
@@ -6,141 +10,135 @@
 #include <wlr/util/addon.h>
 #include <wlr/util/log.h>
 
-#include "types/wlr_scene.h"
-#include "umbrielfx/types/surface_pacing.h"
-
-static const char *output_name(const struct wlr_output *output) {
-	return output != NULL && output->name != NULL ? output->name : "-";
+static const char* output_name(const struct wlr_output* output) {
+  return output != NULL && output->name != NULL ? output->name : "-";
 }
 
 // Writes the surface's entered outputs, suspended ones marked, as
 // "DP-1 eDP-1(suspended)".
-static void describe_entered_outputs(struct wlr_surface *surface, char *buf, size_t size) {
-	size_t used = 0;
-	buf[0] = '\0';
-	struct wlr_surface_output *surface_output;
-	wl_list_for_each(surface_output, &surface->current_outputs, link) {
-		int written = snprintf(buf + used, size - used, "%s%s%s", used > 0 ? " " : "",
-			output_name(surface_output->output), surface_output->suspended ? "(suspended)" : "");
-		if (written < 0 || (size_t)written >= size - used) {
-			return;
-		}
-		used += (size_t)written;
-	}
+static void describe_entered_outputs(struct wlr_surface* surface, char* buf, size_t size) {
+  size_t used = 0;
+  buf[0] = '\0';
+  struct wlr_surface_output* surface_output;
+  wl_list_for_each(surface_output, &surface->current_outputs, link) {
+    int written = snprintf(
+        buf + used, size - used, "%s%s%s", used > 0 ? " " : "", output_name(surface_output->output),
+        surface_output->suspended ? "(suspended)" : ""
+    );
+    if (written < 0 || (size_t)written >= size - used) {
+      return;
+    }
+    used += (size_t)written;
+  }
 }
 
-static void surface_pacing_addon_destroy(struct wlr_addon *addon) {
-	struct umbrielfx_surface_pacing *pacing = wl_container_of(addon, pacing, addon);
+static void surface_pacing_addon_destroy(struct wlr_addon* addon) {
+  struct umbrielfx_surface_pacing* pacing = wl_container_of(addon, pacing, addon);
 
-	wl_signal_emit_mutable(&pacing->events.destroy, pacing);
+  wl_signal_emit_mutable(&pacing->events.destroy, pacing);
 
-	wl_list_remove(&pacing->output_destroy.link);
-	wlr_addon_finish(&pacing->addon);
-	free(pacing);
+  wl_list_remove(&pacing->output_destroy.link);
+  wlr_addon_finish(&pacing->addon);
+  free(pacing);
 }
 
 static const struct wlr_addon_interface surface_pacing_addon_impl = {
-	.name = "umbrielfx_surface_pacing",
-	.destroy = surface_pacing_addon_destroy,
+    .name = "umbrielfx_surface_pacing",
+    .destroy = surface_pacing_addon_destroy,
 };
 
 // A wlr_scene_output going away doesn't necessarily re-run the surface's own
 // outputs_update bookkeeping (that depends on the surface's real scene
 // membership having changed too), so the addon watches its current output's
 // destroy event directly to avoid outliving it.
-static void handle_output_destroy(struct wl_listener *listener, void *data) {
-	struct umbrielfx_surface_pacing *pacing =
-		wl_container_of(listener, pacing, output_destroy);
-	struct wlr_output *destroyed = pacing->output;
-	wlr_log(WLR_DEBUG, "pacing output %s of surface %p destroyed", output_name(destroyed),
-		(void *)pacing->surface);
+static void handle_output_destroy(struct wl_listener* listener, void* data) {
+  struct umbrielfx_surface_pacing* pacing = wl_container_of(listener, pacing, output_destroy);
+  struct wlr_output* destroyed = pacing->output;
+  wlr_log(WLR_DEBUG, "pacing output %s of surface %p destroyed", output_name(destroyed), (void*)pacing->surface);
 
-	struct wlr_surface_output *surface_output;
-	wl_list_for_each(surface_output, &pacing->surface->current_outputs, link) {
-		if (surface_output->output == destroyed) {
-			// The output can no longer pace frames for this surface, whether
-			// or not the surface ever gets an explicit leave for it.
-			// Writing to this wlroots-owned entry is intentional and harmless
-			// in either listener order: wlroots destroys it from its own
-			// listener on the same output destroy signal. If that listener
-			// ran first, the entry is already gone and this loop finds
-			// nothing; if ours runs first, the flag only keeps
-			// umbrielfx_surface_frame_pacing_output below from picking the
-			// dying output, and the entry is freed right after.
-			surface_output->suspended = true;
-			break;
-		}
-	}
+  struct wlr_surface_output* surface_output;
+  wl_list_for_each(surface_output, &pacing->surface->current_outputs, link) {
+    if (surface_output->output == destroyed) {
+      // The output can no longer pace frames for this surface, whether
+      // or not the surface ever gets an explicit leave for it.
+      // Writing to this wlroots-owned entry is intentional and harmless
+      // in either listener order: wlroots destroys it from its own
+      // listener on the same output destroy signal. If that listener
+      // ran first, the entry is already gone and this loop finds
+      // nothing; if ours runs first, the flag only keeps
+      // umbrielfx_surface_frame_pacing_output below from picking the
+      // dying output, and the entry is freed right after.
+      surface_output->suspended = true;
+      break;
+    }
+  }
 
-	umbrielfx_surface_pacing_set_output(pacing,
-		umbrielfx_surface_frame_pacing_output(pacing->surface));
+  umbrielfx_surface_pacing_set_output(pacing, umbrielfx_surface_frame_pacing_output(pacing->surface));
 }
 
 // Keeps output_destroy aimed at pacing->output. Safe to call whether or not a
 // listener is currently registered.
-static void surface_pacing_watch_output(struct umbrielfx_surface_pacing *pacing) {
-	wl_list_remove(&pacing->output_destroy.link);
+static void surface_pacing_watch_output(struct umbrielfx_surface_pacing* pacing) {
+  wl_list_remove(&pacing->output_destroy.link);
 
-	if (pacing->output != NULL) {
-		pacing->output_destroy.notify = handle_output_destroy;
-		wl_signal_add(&pacing->output->events.destroy, &pacing->output_destroy);
-	} else {
-		wl_list_init(&pacing->output_destroy.link);
-	}
+  if (pacing->output != NULL) {
+    pacing->output_destroy.notify = handle_output_destroy;
+    wl_signal_add(&pacing->output->events.destroy, &pacing->output_destroy);
+  } else {
+    wl_list_init(&pacing->output_destroy.link);
+  }
 }
 
-struct umbrielfx_surface_pacing *umbrielfx_surface_pacing_find(struct wlr_surface *surface) {
-	struct wlr_addon *addon = wlr_addon_find(&surface->addons,
-		&surface_pacing_addon_impl, &surface_pacing_addon_impl);
-	if (addon == NULL) {
-		return NULL;
-	}
+struct umbrielfx_surface_pacing* umbrielfx_surface_pacing_find(struct wlr_surface* surface) {
+  struct wlr_addon* addon = wlr_addon_find(&surface->addons, &surface_pacing_addon_impl, &surface_pacing_addon_impl);
+  if (addon == NULL) {
+    return NULL;
+  }
 
-	struct umbrielfx_surface_pacing *pacing = wl_container_of(addon, pacing, addon);
-	return pacing;
+  struct umbrielfx_surface_pacing* pacing = wl_container_of(addon, pacing, addon);
+  return pacing;
 }
 
-void umbrielfx_surface_pacing_set_output(struct umbrielfx_surface_pacing *pacing,
-		struct wlr_output *output) {
-	if (pacing->output == output) {
-		return;
-	}
+void umbrielfx_surface_pacing_set_output(struct umbrielfx_surface_pacing* pacing, struct wlr_output* output) {
+  if (pacing->output == output) {
+    return;
+  }
 
-	if (wlr_log_get_verbosity() >= WLR_DEBUG) {
-		char entered[256];
-		describe_entered_outputs(pacing->surface, entered, sizeof(entered));
-		wlr_log(WLR_DEBUG, "pacing output of surface %p: %s -> %s (entered: %s)",
-			(void *)pacing->surface, output_name(pacing->output), output_name(output),
-			entered[0] != '\0' ? entered : "none");
-	}
-	pacing->output = output;
-	surface_pacing_watch_output(pacing);
-	wl_signal_emit_mutable(&pacing->events.output_change, NULL);
+  if (wlr_log_get_verbosity() >= WLR_DEBUG) {
+    char entered[256];
+    describe_entered_outputs(pacing->surface, entered, sizeof(entered));
+    wlr_log(
+        WLR_DEBUG, "pacing output of surface %p: %s -> %s (entered: %s)", (void*)pacing->surface,
+        output_name(pacing->output), output_name(output), entered[0] != '\0' ? entered : "none"
+    );
+  }
+  pacing->output = output;
+  surface_pacing_watch_output(pacing);
+  wl_signal_emit_mutable(&pacing->events.output_change, NULL);
 }
 
-struct umbrielfx_surface_pacing *umbrielfx_surface_pacing_get(struct wlr_surface *surface) {
-	struct umbrielfx_surface_pacing *pacing = umbrielfx_surface_pacing_find(surface);
-	if (pacing != NULL) {
-		return pacing;
-	}
+struct umbrielfx_surface_pacing* umbrielfx_surface_pacing_get(struct wlr_surface* surface) {
+  struct umbrielfx_surface_pacing* pacing = umbrielfx_surface_pacing_find(surface);
+  if (pacing != NULL) {
+    return pacing;
+  }
 
-	pacing = calloc(1, sizeof(*pacing));
-	if (pacing == NULL) {
-		return NULL;
-	}
+  pacing = calloc(1, sizeof(*pacing));
+  if (pacing == NULL) {
+    return NULL;
+  }
 
-	pacing->surface = surface;
-	pacing->output = umbrielfx_surface_frame_pacing_output(surface);
-	wl_list_init(&pacing->output_destroy.link);
+  pacing->surface = surface;
+  pacing->output = umbrielfx_surface_frame_pacing_output(surface);
+  wl_list_init(&pacing->output_destroy.link);
 
-	wl_signal_init(&pacing->events.output_change);
-	wl_signal_init(&pacing->events.frame_done);
-	wl_signal_init(&pacing->events.destroy);
+  wl_signal_init(&pacing->events.output_change);
+  wl_signal_init(&pacing->events.frame_done);
+  wl_signal_init(&pacing->events.destroy);
 
-	wlr_addon_init(&pacing->addon, &surface->addons,
-		&surface_pacing_addon_impl, &surface_pacing_addon_impl);
+  wlr_addon_init(&pacing->addon, &surface->addons, &surface_pacing_addon_impl, &surface_pacing_addon_impl);
 
-	surface_pacing_watch_output(pacing);
+  surface_pacing_watch_output(pacing);
 
-	return pacing;
+  return pacing;
 }

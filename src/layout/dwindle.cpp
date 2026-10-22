@@ -485,6 +485,19 @@ namespace umbriel {
 
   bool DwindleLayout::moveViewVertical(View* view, int direction) { return moveView(view, false, direction); }
 
+  bool DwindleLayout::toggleSplit(View* view) {
+    Node* node = findNode(view);
+    if (node == nullptr || node->parent == nullptr) {
+      return false;
+    }
+    Node* parent = node->parent;
+    const bool horizontal =
+        parent->type == Node::AutoSplit ? parent->areaW >= parent->areaH : parent->type == Node::HSplit;
+    parent->type = horizontal ? Node::VSplit : Node::HSplit;
+    parent->locked = true;
+    return true;
+  }
+
   bool DwindleLayout::moveView(View* view, bool horizontal, int direction) {
     Node* node = findNode(view);
     if ((direction != -1 && direction != 1) || node == nullptr || node->parent == nullptr) {
@@ -689,16 +702,12 @@ namespace umbriel {
   }
 
   bool DwindleLayout::cycleWidth(int columnIndex, int direction) {
-    Node* node = nodeAtFlatIndex(columnIndex);
-    const std::vector<Split> axisSplits = splits(node, Node::HSplit);
-    if (axisSplits.empty()) {
-      return false;
-    }
-    double current = 1.0;
-    for (const Split& split : axisSplits) {
-      current *= splitShare(split);
-    }
-    return applyFraction(axisSplits, nextFractionPreset(m_config->extentPresets, current, direction));
+    // Each step reads the splits afresh: applying a fraction can move outer splits, which the cached products miss.
+    return cycleFractionPreset(
+        m_config->extentPresets, widthFraction(columnIndex), direction,
+        [&](double fraction) { return setWidthFraction(columnIndex, fraction); },
+        [&] { return widthFraction(columnIndex); }
+    );
   }
 
   bool DwindleLayout::toggleFullWidth(int columnIndex) {

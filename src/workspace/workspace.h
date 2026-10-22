@@ -3,6 +3,7 @@
 #include "core/animation.h"
 #include "layout/layout.h"
 #include "layout/layout_motion.h"
+#include "workspace/displaced_workspace.h"
 #include "workspace/tab_presenter.h"
 
 #include <array>
@@ -19,6 +20,8 @@ struct wlr_ext_workspace_group_handle_v1;
 struct wlr_ext_workspace_handle_v1;
 struct wlr_ext_workspace_manager_v1;
 struct wlr_scene_tree;
+struct wlr_scene_node;
+struct fx_effect_shader;
 
 namespace umbriel {
 
@@ -71,6 +74,9 @@ namespace umbriel {
     [[nodiscard]] bool named() const { return m_named; }
     [[nodiscard]] size_t index() const { return m_index; }
     [[nodiscard]] bool active() const { return m_active; }
+    [[nodiscard]] const std::shared_ptr<const DisplacedWorkspace>& displacedWorkspace() const {
+      return m_displacedWorkspace;
+    }
     [[nodiscard]] std::shared_ptr<WorkspaceLaunchAnchor> reserveForLaunch() const { return m_launchAnchor; }
     [[nodiscard]] bool launchReserved() const { return m_launchAnchor.use_count() > 1; }
     void invalidateLaunchReservations();
@@ -100,6 +106,7 @@ namespace umbriel {
     [[nodiscard]] DwindleLayout* dwindleLayout();
     [[nodiscard]] MasterStackLayout* masterLayout();
     [[nodiscard]] const ResolvedLayoutConfig& layoutConfig() const { return m_layoutConfig; }
+    [[nodiscard]] bool inTabGroup(const View* view) const;
     [[nodiscard]] LayoutMode layoutMode() const { return m_layoutMode; }
     // Runtime layout override set by workspace-set-layout. Empty = the configured mode applies. A config reload clears
     // it and reasserts the configured mode; window open/close keeps it (reconcileDynamic re-applies).
@@ -110,14 +117,17 @@ namespace umbriel {
     [[nodiscard]] wlr_scene_tree* viewLayer(bool tiled) const { return tiled ? m_tiledLayer : m_floatingLayer; }
     [[nodiscard]] wlr_scene_tree* tileShadowLayer() const { return m_tileShadowLayer; }
     [[nodiscard]] wlr_scene_tree* fullscreenTree() const { return m_fullscreenTree; }
+    [[nodiscard]] bool floatingLayerRaised() const;
     [[nodiscard]] bool switchTransitionActive() const { return m_inSwitchTransition; }
     [[nodiscard]] bool isSwitchTransitionView(const View* view) const;
 
     void setActive(bool active);
     void updateUrgent();
-    void setFocusedView(View* view);
+    // Hover and maintenance focus preserve the floating layer when focus enters the tiled layout.
+    void setFocusedView(View* view, bool raise = true);
     void syncFloatingStack(View* view);
     void restackFloatingViews();
+    void raiseFloatingLayer();
     void addView(View* view, bool attachToLayout = true, LayoutAttachOrigin origin = LayoutAttachOrigin::ExistingView);
     View* removeView(View* view, bool reconcile = true);
     void layoutAttach(
@@ -161,8 +171,10 @@ namespace umbriel {
     [[nodiscard]] std::unique_ptr<Layout> previewArrangedLayout() const;
     void refreshAloneRuleStates();
     void syncViewPresentation(View* view);
-    [[nodiscard]] View* focusAdjacent(int direction) const;
-    [[nodiscard]] View* focusVertical(int direction) const;
+    // Directional queries and moves read the layout's arranged targets, so they
+    // apply a pending arrange first.
+    [[nodiscard]] View* focusAdjacent(int direction);
+    [[nodiscard]] View* focusVertical(int direction);
     [[nodiscard]] View* focusFirstColumn() const;
     [[nodiscard]] View* focusLastColumn() const;
     [[nodiscard]] View* focusReplacementForRemoval(const View* view) const;
@@ -183,6 +195,7 @@ namespace umbriel {
     bool swapFocusedInDirection(bool horizontal, int direction);
     bool increaseMasterCount();
     bool decreaseMasterCount();
+    bool toggleDwindleSplit();
     bool cycleFocusedWidth(int direction);
     bool cycleFocusedHeight(int direction);
     bool setFocusedWidth(double fraction);
@@ -233,6 +246,8 @@ namespace umbriel {
     void rename(std::string name, size_t index, bool named);
 
     [[nodiscard]] const std::vector<View*>& allViews() const noexcept { return m_views; }
+    // Floating frames from back to front, matching their workspace stacking order.
+    [[nodiscard]] const std::vector<View*>& floatingStack() const noexcept { return m_floatingStack; }
     [[nodiscard]] bool hasViews() const { return !m_views.empty(); }
     // Pull the scroll offset back into [0, maxScroll]. For removals and restored offsets only: a touchpad swipe
     // overscrolls on purpose.
@@ -245,10 +260,13 @@ namespace umbriel {
     // The running motion's progress, for the windows_move shader; null when no motion runs.
     [[nodiscard]] const AnimatedValue* layoutMotionValue() const;
     // Advances the motion; true while it is still running.
-    bool tickLayoutMotion(uint64_t nowMsec);
+    bool tickLayoutMotion(double nowMsec);
     [[nodiscard]] bool layoutMotionActive() const { return m_motion.progress.animating() || !m_motion.views.empty(); }
 
   private:
+    void syncFloatingLayer();
+    friend class WorkspaceGroup;
+
     // `resized` lists the members whose assigned size this arrange changed.
     void applyPositions(bool animate, std::span<View* const> resized);
     [[nodiscard]] wlr_box tiledTargetBox(const View* view, const wlr_box& usable) const;
@@ -263,10 +281,9 @@ namespace umbriel {
     [[nodiscard]] std::optional<std::array<int, 2>> focusedFloatingAxis(bool width) const;
     // The focused floating window's size as a fraction of the usable axis; nullopt when unavailable.
     [[nodiscard]] std::optional<double> focusedFloatingFraction(bool width) const;
-    // The focused window's place in the layout: a modal dialog holds the focus for the window it is attached to.
-    [[nodiscard]] View* layoutFocus() const;
-    [[nodiscard]] View* focusAlongStrip(int direction) const;
-    [[nodiscard]] View* focusWithinLane(int direction) const;
+    [[nodiscard]] View* focusAlongStrip(int direction);
+    [[nodiscard]] View* floatingFocusTarget(bool horizontal, int direction) const;
+    [[nodiscard]] View* focusWithinLane(int direction);
     // Directional focus lands on the most recently focused window of the group
     // the move entered (target column, or crossed dwindle subtree). Moves that
     // stay inside one group keep `target`.
@@ -287,6 +304,7 @@ namespace umbriel {
     size_t m_index = 0;
     bool m_named = false;
     bool m_active = false;
+    std::shared_ptr<const DisplacedWorkspace> m_displacedWorkspace;
     std::shared_ptr<WorkspaceLaunchAnchor> m_launchAnchor = std::make_shared<WorkspaceLaunchAnchor>();
     std::vector<View*> m_views;
     std::vector<View*> m_floatingStack;
@@ -295,6 +313,7 @@ namespace umbriel {
     LayoutMode m_layoutMode = LayoutMode::Scrolling;
     std::optional<LayoutMode> m_layoutModeOverride;
     View* m_focusedView = nullptr;
+    bool m_floatingLayerActive = false;
     bool m_inSwitchTransition = false;
     bool m_arrangePending = false;
     bool m_arrangeAnimate = true;
@@ -321,8 +340,15 @@ namespace umbriel {
         wlr_box to{};
         float direction = 1.0F;
       };
+      // windows_move drives position and windows_resize size; the motion runs until both have settled. A timeline
+      // restarted mid-flight with a spring carries the members' speed and runs the physics solver, whose value is the
+      // progress itself rather than a curve over time.
       AnimatedValue progress;
       MonotonicEasing geometryCurve;
+      bool progressPhysics = false;
+      AnimatedValue size;
+      MonotonicEasing sizeCurve;
+      bool sizePhysics = false;
       std::vector<ViewEntry> views;
     };
     LayoutMotion m_motion;
@@ -350,7 +376,8 @@ namespace umbriel {
     [[nodiscard]] bool dynamic() const { return m_dynamic; }
     [[nodiscard]] Workspace* workspaceAt(size_t index) const;
     [[nodiscard]] Workspace* workspaceAtClamped(size_t index) const;
-    // Match an explicit name only. Anonymous numeric labels are positions.
+    // Match an explicit name only, preferring native workspaces over temporary refugees. Multiple refugees with the
+    // same name are ambiguous and return null. Anonymous numeric labels are positions.
     [[nodiscard]] Workspace* workspaceNamed(std::string_view name) const;
     [[nodiscard]] Workspace* workspaceFromHandle(wlr_ext_workspace_handle_v1* handle) const;
     [[nodiscard]] size_t workspaceCount() const { return m_workspaces.size(); }
@@ -367,6 +394,9 @@ namespace umbriel {
     // Acquire a destination for moving every window from another workspace. Static groups reuse their highest empty
     // configured workspace without changing its identity; dynamic groups use the ordinary create behavior.
     Workspace* transferDestination();
+    // Acquire a temporary workspace for one absent home, including on a fixed output. Explicit names survive, while
+    // anonymous workspaces use their new numeric position. Original identities keep matching names separate.
+    Workspace* displacedDestination(std::shared_ptr<const DisplacedWorkspace> origin);
     // Insert an empty numbered workspace into a dynamic group and renumber the following workspaces. Static configured
     // groups cannot be extended this way and return null.
     Workspace* insertDynamicWorkspace(size_t index);
@@ -391,9 +421,15 @@ namespace umbriel {
     // per second, and starts the settle from that speed instead of from rest; callers that are not a gesture pass 0.
     void slideSettle(int delta, double velocity = 0);
     void slideFinish();
+    // Refresh the native pair bindings and shader inputs before output composition.
+    void refreshReveal();
+    [[nodiscard]] wlr_scene_node* revealRoot(bool incoming) const;
+    [[nodiscard]] bool revealActive() const { return m_slide.reveal != nullptr; }
+    void abandonReveal();
+    void cancelReveal();
     // Advances the workspace slide; returns true while it is still running.
     [[nodiscard]] AnimationPhase animationPhase() const override { return AnimationPhase::Workspaces; }
-    bool tickAnimations(uint64_t nowMsec) override;
+    bool tickAnimations(double nowMsec) override;
     [[nodiscard]] bool hasActiveAnimations() const override;
     [[nodiscard]] bool animatesOn(const Output* output) const override { return m_output == output; }
 
@@ -403,7 +439,12 @@ namespace umbriel {
     Workspace* appendDynamicWorkspace();
     Workspace* prependDynamicWorkspace();
     void reconcileDynamicNames(const std::vector<ResolvedWorkspace>& resolved);
-    void refreshDynamicWorkspaceMetadata();
+    void refreshWorkspaceMetadata();
+    bool pruneDisplacedWorkspaces();
+
+    void beginReveal();
+    // The workspace a reveal at `progress` shows coming in; the previous one when progress is held at the base.
+    [[nodiscard]] Workspace* revealIncoming(double progress) const;
 
     struct Slide {
       Workspace* base = nullptr;
@@ -411,6 +452,9 @@ namespace umbriel {
       Workspace* next = nullptr;
       double extent = 0;
       double progress = 0;
+      fx_effect_shader* reveal = nullptr;
+      std::optional<EffectPreset> revealPreset;
+      AnimationTransition transition{};
     };
 
     Server* m_server = nullptr;

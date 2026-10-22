@@ -112,10 +112,13 @@ namespace umbriel {
         return false;
       };
 
-      // SDR8. The last resort, so it is committed without a test, retrying once without VRR.
+      // Test SDR8 too, so a rejected swapchain reaches capability fallbacks
+      // instead of becoming a retryable scene-build failure.
       const auto trySdr8Formats = [&]() -> bool {
         for (const bool vrr : vrrPasses(params.tryVrrOn)) {
-          ops.stageSdr(DRM_FORMAT_XRGB8888, vrr);
+          if (!ops.stageSdr(DRM_FORMAT_XRGB8888, vrr) || !ops.test()) {
+            continue;
+          }
           if (commitStaged(FormatTier::Sdr8, DRM_FORMAT_XRGB8888, vrr)) {
             return true;
           }
@@ -147,6 +150,18 @@ namespace umbriel {
 
     result.committed = runSequenceForCurrentMode(params, ops, result, hdrFail, sdr10Fail);
 
+    const auto rerunOnMode = [&](wlr_output_mode* mode) {
+      ops.stageMode(mode);
+      hdrFail = params.earlyHdrFail;
+      sdr10Fail = {};
+      result.committed = runSequenceForCurrentMode(params, ops, result, hdrFail, sdr10Fail);
+    };
+
+    if (!result.committed && !result.retry && params.keptLiveMode != nullptr) {
+      result.usedLiveModeRetry = true;
+      rerunOnMode(params.keptLiveMode);
+    }
+
     if (!result.committed && !result.retry && params.configuredModeSpec != nullptr && params.preferredMode != nullptr) {
       result.usedModeFallback = true;
       if (!params.modeFallbackAlreadyWarned) {
@@ -160,11 +175,7 @@ namespace umbriel {
         ops.warnModeFallback(requested, *params.preferredMode);
       }
 
-      ops.stageMode(params.preferredMode);
-
-      hdrFail = params.earlyHdrFail;
-      sdr10Fail = {};
-      result.committed = runSequenceForCurrentMode(params, ops, result, hdrFail, sdr10Fail);
+      rerunOnMode(params.preferredMode);
     }
 
     result.hdrFail = hdrFail;

@@ -69,7 +69,13 @@ wait_for_box 1264x704
 wait_for_box 320x216
 "$UMBRIEL" msg window-toggle-floating > /dev/null
 wait_for_box 1264x704
-# The re-tile animates too; sample only once it has settled.
+# The re-tile animates too: halfway through it still shows a box between the floating and tiled widths.
+"$UMBRIEL" clock-advance 1000
+retile_width=$(capture_width retile)
+if ((retile_width <= 320 || retile_width >= 1264)); then
+  echo "the re-tile did not animate from the floating size: width $retile_width halfway through"
+  exit 1
+fi
 "$UMBRIEL" clock-advance 3000
 tiled_width=$(capture_width tiled)
 if ((tiled_width < 1264)); then

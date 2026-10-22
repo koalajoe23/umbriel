@@ -58,6 +58,9 @@ namespace umbriel {
     // passes through get their area back when it moves on. Toward a lone sibling across the parent's own split, the
     // two trade sides. False when no tile lies in that direction.
     bool moveView(View* view, bool horizontal, int direction);
+    // Flips the split holding the view's tile between side by side and stacked, keeping its ratio. False for a lone
+    // tile. The split is locked, so arrange keeps the flipped direction whatever preserve_split is set to.
+    bool toggleSplit(View* view);
     bool swapViews(View* a, View* b) override;
     void removeView(View* view) override;
     void moveColumn(int from, int to) override;

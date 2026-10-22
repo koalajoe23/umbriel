@@ -566,6 +566,22 @@ UMBRIEL_TEST(directionalDropKeepsItsAxisWhenPreserveSplitIsOff) {
   CHECK(fixture.layout.targetBox(stub(0)).x != fixture.layout.targetBox(stub(1)).x);
 }
 
+UMBRIEL_TEST(toggledSplitSurvivesArrangeWhenPreserveSplitIsOff) {
+  Fixture fixture;
+  fixture.addLeaves(2);
+  fixture.layout.arrange(kUsable);
+  CHECK_EQ(fixture.layout.targetBox(stub(0)).y, fixture.layout.targetBox(stub(1)).y);
+
+  CHECK(fixture.layout.toggleSplit(stub(1)));
+  fixture.layout.arrange(kUsable);
+  fixture.layout.arrange(kUsable);
+
+  const wlr_box first = fixture.layout.targetBox(stub(0));
+  const wlr_box second = fixture.layout.targetBox(stub(1));
+  CHECK_EQ(first.x, second.x);
+  CHECK(first.y != second.y);
+}
+
 UMBRIEL_TEST(insertAtAGapSplitsThePrecedingLeaf) {
   Fixture fixture;
   fixture.addLeaves(3);
@@ -815,6 +831,19 @@ UMBRIEL_TEST(cycleWidthBackWalksThePresetsInReverse) {
   CHECK(fixture.layout.cycleWidth(0, -1));
   fixture.layout.arrange(kUsable);
   CHECK(std::abs(fixture.layout.targetBox(stub(0)).width - static_cast<int>(span * (2.0 / 3.0))) <= 2);
+}
+
+UMBRIEL_TEST(cycleWidthWrapsWhenTheNextPresetIsOutOfReach) {
+  // A split share tops out at 0.9, short of the 1.0 preset.
+  Fixture fixture;
+  fixture.config.extentPresets = {0.5, 1.0};
+  fixture.addLeaves(2);
+  fixture.layout.arrange(kUsable);
+  CHECK(fixture.layout.setWidthFraction(0, 0.5));
+  CHECK(fixture.layout.cycleWidth(0, 1));
+  CHECK(std::abs(fixture.layout.widthFraction(0) - 0.9) < 1e-9);
+  CHECK(fixture.layout.cycleWidth(0, 1));
+  CHECK(std::abs(fixture.layout.widthFraction(0) - 0.5) < 1e-9);
 }
 
 UMBRIEL_TEST(resizeEdgesComeFromTileThirds) {

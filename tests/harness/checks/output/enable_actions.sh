@@ -26,6 +26,21 @@ wait_for_workspace() {
   return 1
 }
 
+wait_for_temporary_workspace() {
+  local native=$1 workspace=
+  for _ in $(seq 40); do
+    workspace=$("$UMBRIEL" windows --json | jq -r '.[0].workspace // ""')
+    if [[ $workspace == HEADLESS-1:* && $workspace != "$native" ]] \
+      && "$UMBRIEL" workspaces --json | jq -e --arg id "$workspace" \
+        'any(.[]; .id == $id and .named == false)' > /dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "expected a separate anonymous temporary workspace on HEADLESS-1, got '$workspace' (native '$native')"
+  return 1
+}
+
 wait_for_output_count() {
   local expected=$1 count=
   for _ in $(seq 40); do
@@ -64,10 +79,11 @@ expect_capture_failure() {
 
 spawn_client
 wait_for_workspace 'HEADLESS-2:1'
+native_refuge=$("$UMBRIEL" workspaces --json | jq -r '.[] | select(.output == "HEADLESS-1" and .index == 1) | .id')
 
 "$UMBRIEL" msg output-disable:HEADLESS-2 > /dev/null
 wait_for_enabled HEADLESS-2 false
-wait_for_workspace 'HEADLESS-1:1'
+wait_for_temporary_workspace "$native_refuge"
 expect_capture_failure HEADLESS-2
 timeout 5s grim "$XDG_RUNTIME_DIR/output-action-desktop.png"
 
@@ -77,7 +93,7 @@ wait_for_workspace 'HEADLESS-2:1'
 
 "$UMBRIEL" msg output-toggle:HEADLESS-2 > /dev/null
 wait_for_enabled HEADLESS-2 false
-wait_for_workspace 'HEADLESS-1:1'
+wait_for_temporary_workspace "$native_refuge"
 "$UMBRIEL" msg output-toggle:HEADLESS-2 > /dev/null
 wait_for_enabled HEADLESS-2 true
 wait_for_workspace 'HEADLESS-2:1'
@@ -87,13 +103,14 @@ wait_for_workspace 'HEADLESS-2:1'
 # restore its displaced window onto an unavailable desktop target.
 "$UMBRIEL" msg output-disable:HEADLESS-2 > /dev/null
 wait_for_enabled HEADLESS-2 false
-wait_for_workspace 'HEADLESS-1:1'
+wait_for_temporary_workspace "$native_refuge"
+displaced_workspace=$("$UMBRIEL" windows --json | jq -r '.[0].workspace')
 "$UMBRIEL" output-destroy HEADLESS-2 > /dev/null
 wait_for_output_count 1
 "$UMBRIEL" output-create HEADLESS-2 > /dev/null
 wait_for_output_count 2
 wait_for_enabled HEADLESS-2 false
-wait_for_workspace 'HEADLESS-1:1'
+wait_for_workspace "$displaced_workspace"
 expect_capture_failure HEADLESS-2
 
 # Enabling a known disabled head must also work when it is the only output

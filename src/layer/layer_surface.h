@@ -40,6 +40,9 @@ namespace umbriel {
     [[nodiscard]] SurfaceBlurOptions popupBlurOptions() const;
 
     void focus();
+    // A grabbing xdg_popup of this layer mapped. wlroots routes the grab's keys to the seat's focused surface and
+    // never moves focus itself, so an on-demand layer that does not hold the keyboard yet takes it here.
+    void focusForPopupGrab();
     void unconstrainPopup(wlr_xdg_popup* popup);
     // Push the owning output's scale to every surface of this layer surface
     // (fractional-scale + preferred buffer scale, popups included).
@@ -47,7 +50,7 @@ namespace umbriel {
     [[nodiscard]] Output* output() const;
 
     [[nodiscard]] AnimationPhase animationPhase() const override { return AnimationPhase::Overlays; }
-    bool tickAnimations(uint64_t nowMsec) override;
+    bool tickAnimations(double nowMsec) override;
     [[nodiscard]] bool hasActiveAnimations() const override { return m_fade.animating(); }
     [[nodiscard]] bool animatesOn(const Output* output) const override;
 

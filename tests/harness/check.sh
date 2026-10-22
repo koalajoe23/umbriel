@@ -7,6 +7,7 @@
 # Containment matters. A stock Umbriel start runs its built-in autostarts, and
 # `dbus-update-activation-environment --systemd` would repoint the *caller's* session-wide WAYLAND_DISPLAY and
 # UMBRIEL_SOCKET at this throwaway instance. Unsetting DBUS_SESSION_BUS_ADDRESS makes both autostarts fail harmlessly.
+# DBUS_SYSTEM_BUS_ADDRESS points at no bus, so the host's systemd-localed keymap never reaches an instance.
 # Usage: check.sh <path-to-umbriel-binary> [name-fragment ...] [-j N|--jobs N] [-v|--verbose] [-l|--list]
 # A check's name is its path under checks/ without `.sh`, such as `overview/wheel`. Each name fragment selects every
 # check whose name contains it, so `overview/` selects a topic and several fragments run several checks. Without a
@@ -176,8 +177,11 @@ export UMBRIEL_FRACTIONAL_CLIENT="$CLIENT_DIR/fractional-client"
 export UMBRIEL_SYNCOBJ_CLIENT="$CLIENT_DIR/syncobj-client"
 export UMBRIEL_SECURITY_CONTEXT_CLIENT="$CLIENT_DIR/security-context-client"
 export UMBRIEL_SEAT_LOG_CLIENT="$CLIENT_DIR/seat-log-client"
+export UMBRIEL_COLOR_FEEDBACK_CLIENT="$CLIENT_DIR/color-feedback-client"
 export UMBRIEL_XWAYLAND_FOCUS_CLIENT="$CLIENT_DIR/xwayland-focus-client"
+export UMBRIEL_XWAYLAND_SELECTION_CLIENT="$CLIENT_DIR/xwayland-selection-client"
 export UMBRIEL_XWAYLAND_CURSOR_CLIENT="$CLIENT_DIR/xwayland-cursor-client"
+export UMBRIEL_XSETTINGS_CLIENT="$CLIENT_DIR/xsettings-client"
 export UMBRIEL_WAYLAND_CURSOR_CLIENT="$CLIENT_DIR/wayland-cursor-client"
 export UMBRIEL_OUTPUT_MANAGEMENT_CLIENT="$CLIENT_DIR/output-management-client"
 export UMBRIEL_PIXEL_PROBE="$CLIENT_DIR/pixel-probe"
@@ -334,12 +338,14 @@ row() {
 
 # No autostart, no Xwayland, no cheatsheet: a check wants a bare compositor, and
 # each of those would spawn processes outside the container. A check that needs
-# X11 opts in with `# harness: xwayland=true` in its header.
+# X11 opts in with `# harness: xwayland=true` in its header, or with
+# `# harness: xwayland=native` for xwayland_native_resolution, which needs a restart.
 write_default_config() {
   local xwayland=$2 cursor_theme=$3
   cat > "$1" << EOF
 [general]
-xwayland = $xwayland
+xwayland = $([[ $xwayland == false ]] && echo false || echo true)
+xwayland_native_resolution = $([[ $xwayland == native ]] && echo true || echo false)
 show_cheatsheet = false
 autostart = []
 EOF
@@ -369,11 +375,9 @@ check_keyboard() {
 }
 
 check_xwayland() {
-  if sed -n '2,12p' "$CHECKS_DIR/$1.sh" | grep -q '^# harness: xwayland=true'; then
-    echo true
-  else
-    echo false
-  fi
+  local declared
+  declared=$(sed -n '2,12p' "$CHECKS_DIR/$1.sh" | sed -n 's/^# harness: xwayland=\(true\|native\)$/\1/p' | head -1)
+  echo "${declared:-false}"
 }
 
 check_xcursor_theme() {
@@ -508,6 +512,7 @@ start_instance() {
   # compositor in place, so SERVER_PID stays the compositor.
   local pgid_file=$RUNTIME_DIR/instance.pgid
   setsid env -u WAYLAND_DISPLAY -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS \
+    DBUS_SYSTEM_BUS_ADDRESS="unix:path=$RUNTIME_DIR/no-system-bus" \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WLR_BACKENDS=headless \
     WLR_LIBINPUT_NO_DEVICES=1 \
@@ -540,7 +545,7 @@ start_instance() {
   export UMBRIEL_LOG=$log
   export UMBRIEL_CONFIG=$config
   UMBRIEL_HARNESS_DISPLAY=
-  if [[ $xwayland == true ]]; then
+  if [[ $xwayland != false ]]; then
     local display_waited_ms=0
     while [[ -z $UMBRIEL_HARNESS_DISPLAY ]]; do
       UMBRIEL_HARNESS_DISPLAY=$(sed -n 's/.*Xwayland listening on DISPLAY=\([^ ]*\).*/\1/p' "$log" | tail -1)
@@ -635,9 +640,9 @@ stop_instance() {
 # background job.
 # The body runs pointed at its own instance, not at the session that started the
 # suite. This is not a convenience: only IPC subcommands honour UMBRIEL_SOCKET,
-# while `umbriel outputs` and every helper client are Wayland clients that
-# resolve XDG_RUNTIME_DIR and WAYLAND_DISPLAY, so an inherited session
-# environment silently points them at the developer's live compositor.
+# while every helper client is a Wayland client that resolves XDG_RUNTIME_DIR
+# and WAYLAND_DISPLAY, so an inherited session environment silently points it
+# at the developer's live compositor.
 run_check_body() {
   local name=$1 output_file=$2
   local pgid_file=$RUNTIME_DIR/check.pgid
@@ -646,6 +651,7 @@ run_check_body() {
     display_environment+=("DISPLAY=$UMBRIEL_HARNESS_DISPLAY")
   fi
   setsid env -u DISPLAY -u DBUS_SESSION_BUS_ADDRESS "${display_environment[@]}" \
+    DBUS_SYSTEM_BUS_ADDRESS="unix:path=$RUNTIME_DIR/no-system-bus" \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" \
     WAYLAND_DISPLAY=wayland-0 \
     bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pgid_file" \

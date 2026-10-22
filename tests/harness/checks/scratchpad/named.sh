@@ -99,9 +99,6 @@ readonly COMMON_CONFIG='
 [animation]
 enabled = false
 
-[animation.scratchpad]
-scale = 0
-
 [output.HEADLESS-1]
 mode = "1280x720"
 position = [0, 0]

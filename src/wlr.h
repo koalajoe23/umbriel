@@ -4,6 +4,7 @@
 extern "C" {
 #include <umbrielfx/render/fx_renderer/fx_renderer.h>
 #include <umbrielfx/types/linux_drm_syncobj.h>
+#include <umbrielfx/types/scene_capture.h>
 #include <umbrielfx/types/surface_pacing.h>
 #include <umbrielfx/types/wlr_scene.h>
 #include <wlr/backend.h>

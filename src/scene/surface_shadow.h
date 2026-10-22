@@ -21,7 +21,10 @@ namespace umbriel {
   public:
     // contentWidth/Height: toplevel geometry size. borderTotal: decoration ring width drawn outside the content (0 when
     // borders are disabled/hidden). cornerRadius: radius of the decoration's outer edge (0 = square).
-    void update(wlr_scene_tree* parent, int contentWidth, int contentHeight, int borderTotal, int cornerRadius);
+    void update(
+        wlr_scene_tree* parent, int contentWidth, int contentHeight, int borderTotal, int cornerRadius,
+        int topExtension = 0
+    );
     // Owner override of appearance.shadow.enabled. std::nullopt follows the global
     // switch, so a window rule can both drop a shadow the global config draws and
     // draw one it does not. Owners that never call this follow the global switch.

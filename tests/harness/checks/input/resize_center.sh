@@ -59,11 +59,12 @@ center_resize_click() {
 check_maximized_size_unchanged() {
   local kind=$1 before after before_size after_size
   before=$("$UMBRIEL" windows --json)
+  [[ $(jq -r '.[0].maximized_to_edges' <<< "$before") == true ]] || { echo "$kind was not maximized before the center click"; return 1; }
   before_size=$(jq -r '.[0] | "\(.w)x\(.h)"' <<< "$before")
   center_resize_click
   after=$("$UMBRIEL" windows --json)
   after_size=$(jq -r '.[0] | "\(.w)x\(.h)"' <<< "$after")
-  if [[ $after_size != "$before_size" ]]; then
+  if [[ $(jq -r '.[0].maximized_to_edges' <<< "$after") != true || $after_size != "$before_size" ]]; then
     echo "$kind center resize click changed maximized geometry: $before_size to $after_size"
     return 1
   fi
@@ -79,7 +80,7 @@ check_maximized_size_unchanged tiled || failed=1
 
 "$UMBRIEL" msg window-toggle-floating > /dev/null
 wait_for_floating true
-"$UMBRIEL" msg window-toggle-maximize-to-edges > /dev/null
+# The float toggle preserves maximize state. A second maximize toggle would restore normal size.
 wait_for_maximized_size
 check_maximized_size_unchanged floating || failed=1
 

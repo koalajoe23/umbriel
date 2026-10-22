@@ -103,7 +103,7 @@ opaque_fullscreen = true
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `prefer_no_csd` | `true` | Prefer Umbriel's border-only server decoration. |
+| `prefer_no_csd` | `true` | Advertise a preference for server decorations. The optional title bar is configured separately. |
 | `border_width` | `2` | Inner border width in logical pixels. |
 | `outer_border_width` | `0` | Outer ring width in logical pixels. |
 | `corner_radius` | `10` | Radius of the complete decorated window. |
@@ -124,6 +124,68 @@ Borders render outside window content and are included in layout spacing.
 [window rule](window-rules.md#decoration) can override `border_width`,
 `outer_border_width`, and `corner_radius` for the windows it matches.
 
+### Title bar
+
+Enable a simple server-side title bar on decorated windows in every layout:
+
+```toml
+[appearance.title_bar]
+mode = "off"
+height = 28
+font = "sans 10"
+button_position = "right"
+
+[colors.title_bar]
+background = "#292933FF"
+background_unfocused = "#1A1A1FFF"
+text = "#E8E8EAFF"
+text_unfocused = "#8A8A92FF"
+close = "#FF6B6BFF"
+maximize = "#7AA3FFFF"
+```
+
+Set `mode = "on"` to follow client decoration preferences, or `mode = "forced"`
+to show a bar regardless of client preference. `mode = "off"` is the default. `height` is 16
+to 128 logical pixels, and `font` is a Pango font description. `button_position` accepts `"left"` or
+`"right"`; close stays at the outside edge. The two buttons are colored circles
+without icons. The maximize button is disabled for fixed-size windows.
+`background` and `text` apply to the focused window; their `_unfocused`
+variants apply to other windows. Colors and title bar settings reload live.
+
+In `"on"` mode, Wayland windows that request server decorations, or have no
+known decoration preference, receive a bar.
+Explicit client-side decoration requests suppress it. Both xdg-decoration and
+the older server-decoration protocol are tracked; xdg-decoration takes priority
+when a window uses both. Managed Xwayland windows follow their decoration hints.
+Popups and unmanaged Xwayland windows do not receive a title bar.
+
+A [window rule](window-rules.md#decoration) can set `title_bar` to `"on"`,
+`"forced"`, or `"off"`. `"forced"` adds a bar even when the application requests its
+own decorations; `"off"` hides it; `"on"` restores automatic selection after
+an earlier matching override. An omitted rule inherits the global mode.
+An explicit rule overrides it, so `"forced"` can enable a bar with global `"off"`,
+and `"on"` can honor client preferences with global `"forced"`.
+Existing windows update when their preference or matching rule changes, or when
+the setting reloads.
+
+Application-drawn headerbars, tab strips, and custom controls remain part of the
+application content. To avoid duplicate title bars, select the application's
+native or system title bar option where available. `prefer_no_csd = true` still
+advertises Umbriel's preference to applications that support decoration
+negotiation.
+
+Drag empty title bar space with the left button to move a window without a
+modifier, or double-click it to toggle maximize. Click a colored button to
+maximize/restore or close the window. Buttons activate on release inside the
+same button. Floating windows also have modifier-free resize grips around their
+borders and corners. Application content keeps its normal pointer behavior.
+
+Tab group members show the tab bar instead. Fullscreen and maximize-to-edges
+hide the title bar, while normal maximize keeps it. The bar occupies space
+inside a tile's allocation; configure sizes, IPC window coordinates, and window
+captures continue to describe application content. Borders and shadows wrap the
+title bar and content together.
+
 ### Tab bar
 
 A [tab group](layout.md#tab-groups) draws a bar along one edge, with a slot for
@@ -137,6 +199,7 @@ height = 24
 font = "sans 10"
 padding = 8
 tab_gap = 2
+gap = -1
 corner_radius = -1
 title_format = "{title}"
 title_align = "center"
@@ -150,10 +213,11 @@ overflow = "scroll"
 | --- | --- | --- |
 | `style` | `"titles"` | `"titles"` shows each tab's title in its slot. `"indicator"` draws the slots alone; pair it with a small `height` for a thin strip. |
 | `position` | `"top"` | The group edge the bar sits on: `"top"`, `"bottom"`, `"left"`, or `"right"`. On the top or bottom the slots sit side by side; on the left or right they stack, a vertical tab list whose titles still read across. |
-| `height` | `24` | Thickness in logical pixels, from 2 to 400: the bar's height on the top or bottom, its width on the left or right. The group reserves the bar and one `gap` beside it. Give a side bar with titles room for them, such as `160`. |
+| `height` | `24` | Thickness in logical pixels, from 2 to 400: the bar's height on the top or bottom, its width on the left or right. The group reserves the bar and its `gap` beside it. Give a side bar with titles room for them, such as `160`. |
 | `font` | `"sans 10"` | Title font as a Pango description, such as `"Inter Bold 9"`. |
 | `padding` | `8` | Space a title keeps from either end of its slot. |
 | `tab_gap` | `2` | Space between neighbouring slots. |
+| `gap` | `-1` | Space between the bar and its window, from 0 to 500; `-1` follows the [layout `gap`](layout.md#shared-settings). |
 | `corner_radius` | `-1` | Slot corner radius; `-1` follows `corner_radius`. |
 | `title_format` | `"{title}"` | Slot label. `{title}`, `{app_id}`, and `{index}` (from 1) are replaced; a window without a title shows its app id. |
 | `title_align` | `"center"` | `"left"`, `"center"`, or `"right"` within the slot. |
@@ -203,6 +267,7 @@ Optimized blur samples the background beneath the window stack. Set it to
 `false` when translucent surfaces should blur the surfaces directly behind
 them, at a higher rendering cost. The shared background cache follows
 background layer-shell updates, including animated map and unmap transitions.
+Unchanged commits that only request frame callbacks reuse the cached blur.
 
 ### Shadow
 

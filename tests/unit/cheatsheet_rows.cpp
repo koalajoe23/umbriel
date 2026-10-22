@@ -401,4 +401,19 @@ UMBRIEL_TEST(effectActionLabelsPreserveSelectorsAndTargets) {
   }
 }
 
+UMBRIEL_TEST(floatingLayoutModeIsNamedInTheActionLabel) {
+  const std::vector<Keybind> binds = {layoutBind(XKB_KEY_f, umbriel::LayoutMode::Floating)};
+  const auto rows = buildCheatsheetRows(binds);
+  CHECK_EQ(rows.size(), size_t{1});
+  CHECK(rows[0].action.contains("floating"));
+}
+
+UMBRIEL_TEST(snapActionLabelsNameTheRegion) {
+  Keybind binding = bind(KeybindAction::WindowSnap, XKB_KEY_h);
+  binding.payload = umbriel::SnapRegionArg{.region = umbriel::SnapRegion::BottomLeft};
+  const auto rows = buildCheatsheetRows(std::vector<Keybind>{binding});
+  CHECK_EQ(rows.size(), size_t{1});
+  CHECK(rows[0].action.contains("bottom_left"));
+}
+
 int main() { return RUN_TESTS(); }

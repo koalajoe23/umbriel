@@ -18,6 +18,7 @@ extern "C" {
 #include "view/view_internal.h"
 // clang-format off
 #include <algorithm>
+#include <cassert>
 #include "wlr.h"
 // clang-format on
 #include "workspace/scratchpad.h"
@@ -28,8 +29,6 @@ namespace umbriel {
   namespace {
     constexpr Logger kLog("view");
   } // namespace
-
-  using view_detail::scratchpadOwnsOpeningGeometry;
 
   void View::onRequestMove(wl_listener* listener, void* data) {
     View* self = wl_container_of(listener, self, m_requestMove);
@@ -198,6 +197,11 @@ namespace umbriel {
     if (!roleInitialized()) {
       return;
     }
+    // An attached dialog's size is its own, but its placement is its parent's.
+    if (attached()) {
+      reassertRoleState();
+      return;
+    }
     if (!m_mapped) {
       if (config().general.honorRestoredMaximize && requestedMaximized()) {
         // Some clients restore maximization only after acknowledging the first
@@ -237,15 +241,7 @@ namespace umbriel {
       return;
     }
     m_consumeRestoredMaximizeRequest = false;
-    if (m_tiled && m_workspace != nullptr) {
-      if (maximizeRequestTargetsEdges(m_maximizedToEdges)) {
-        setMaximizedToEdges(requestedMaximized());
-        return;
-      }
-      setMaximized(requestedMaximized());
-      return;
-    }
-    setMaximized(requestedMaximized());
+    setMaximizedLikeClientRequest(requestedMaximized());
   }
 
   void View::setMaximizedToEdges(bool maximized, bool animate) {
@@ -291,6 +287,23 @@ namespace umbriel {
   void View::toggleMaximizedToEdges() { setMaximizedToEdges(!m_maximizedToEdges); }
 
   void View::toggleMaximized() { setMaximized(m_tiled ? !scheduledMaximized() : !m_floatingMaximized); }
+
+  void View::setMaximizedLikeClientRequest(bool maximized) {
+    // The one implementation of the client-request target policy, shared by
+    // handleRequestMaximize and the pointer gesture: a tiled window honors the
+    // workspace's client_maximize, a floating window keeps the default behavior
+    // whatever it says. The gesture passes the direction explicitly because it
+    // computes the opposite of the current state at its second press.
+    if (m_tiled && m_workspace != nullptr) {
+      if (maximizeRequestTargetsEdges(
+              maximized, m_maximizedToEdges, m_workspace->layoutConfig().clientMaximize == ClientMaximize::Edges
+          )) {
+        setMaximizedToEdges(maximized);
+        return;
+      }
+    }
+    setMaximized(maximized);
+  }
 
   void View::restoreMaximizedForMove() {
     // Fullscreen temporarily covers an underlying floating-maximized state.
@@ -338,6 +351,10 @@ namespace umbriel {
     );
 
     const bool requested = requestedFullscreen();
+    if (attached()) {
+      reassertRoleState();
+      return;
+    }
     if (!requested && scheduledFullscreen() && m_xCompositorFullscreen) {
       kLog.debug("request_fullscreen denied for compositor-owned X11 '{}'", appId() != nullptr ? appId() : "?");
       reassertRoleState();
@@ -368,17 +385,21 @@ namespace umbriel {
 
   void View::handleSetParent() {
     if (m_mapped) {
-      if (inheritScratchpadFromParent(m_tiled) && !scratchpadOwnsOpeningGeometry()) {
+      reconcileAttachment();
+      // `match.is_dialog` follows the parent.
+      refreshStateRuleEffects();
+    }
+    if (m_mapped && !attached()) {
+      if (inheritScratchpadFromParent(m_tiled)) {
         placeInUsableArea(m_initialRules.defaultPosition);
         if (ScratchpadManager* scratchpad = m_server->scratchpadManager()) {
           scratchpad->syncViewPresentation(this);
         }
       }
       raiseToTop();
-      syncModalDialogEntry();
-      // A dialog whose parent closed is handed to the grandparent, and what the old parent's dialog blocked is free.
-      retargetModalShades();
     }
+    // The IPC window listing reports the parent.
+    m_server->scheduleIpcWindowsEvent();
   }
 
   void View::recordOpeningParentRequest(bool parentRequested) {
@@ -408,7 +429,67 @@ namespace umbriel {
     }
   }
 
-  void View::toggleFloating() { setFloating(m_tiled); }
+  void View::toggleFloating(bool focus) {
+    if (!m_mapped || !roleInitialized()) {
+      return;
+    }
+    const bool wasTiled = m_tiled;
+    const bool keepMaximized = scheduledMaximized() && !scheduledFullscreen() && !currentFullscreen();
+    const bool keepMaximizedToEdges = keepMaximized && m_maximizedToEdges;
+    const std::optional<wlr_box> floatingRestore =
+        keepMaximized && !wasTiled && m_hasMaximizeRestoreBox ? std::optional{m_maximizeRestoreBox} : std::nullopt;
+    if (floatingRestore
+        && !m_savedScrollingExtent
+        && !m_savedScrollingExtentPx
+        && m_workspace != nullptr
+        && m_workspace->scrollingLayout() != nullptr
+        && !m_workspace->layoutConfig().scrolling.defaultExtentFraction) {
+      // A window first opened floating has no earlier column extent. Seed its new column from the normal floating
+      // size rather than the maximized client buffer; explicit layout defaults still choose their own extent.
+      m_savedScrollingExtentPx = m_workspace->scrollingVertical() ? floatingRestore->height : floatingRestore->width;
+    }
+    if (keepMaximized && wasTiled) {
+      // Recover the ordinary column geometry before detaching. A first-time float restores that size; a window
+      // that has floated before keeps its remembered floating size and position.
+      if (keepMaximizedToEdges) {
+        setMaximizedToEdges(false, false);
+      }
+      setMaximized(false, false);
+      if (!m_floating.size() && m_workspace != nullptr) {
+        m_workspace->flushArrange();
+        const wlr_box normal = m_workspace->layout().targetBox(this);
+        if (normal.width > 0 && normal.height > 0) {
+          const SizeHints hints = sizeHints();
+          m_floating.rememberSize(clampWidth(normal.width, hints), clampHeight(normal.height, hints));
+        }
+      }
+    }
+    setFloating(wasTiled, focus);
+    if (wasTiled == m_tiled) {
+      return;
+    }
+    if (keepMaximized) {
+      if (m_tiled) {
+        // Retiling restores the ordinary column extent. Maximize that column again so only the maximize binding
+        // consumes its restore extent. Keep the maximized float's geometry out of its normal floating memory.
+        if (floatingRestore) {
+          m_floating.rememberSize(floatingRestore->width, floatingRestore->height);
+          m_floating.rememberPositionFraction({.x = floatingRestore->x, .y = floatingRestore->y}, floatingUsableArea());
+        }
+        m_hasMaximizeRestoreBox = false;
+      } else {
+        // The client can still be committing its maximized tile. Record the floating target explicitly so maximize
+        // captures the restore size before the client acknowledges the ordinary-size configure.
+        const auto restore = scheduledSize();
+        requestFloatingSize(restore.width, restore.height);
+      }
+      if (keepMaximizedToEdges) {
+        setMaximizedToEdges(true);
+      } else {
+        setMaximized(true);
+      }
+    }
+  }
 
   void View::restorePinnedSceneParent() {
     if (!m_pinned) {
@@ -424,6 +505,7 @@ namespace umbriel {
 
   void View::applyPinnedState() {
     m_pinned = true;
+    m_server->scheduleIpcWindowsEvent();
     restorePinnedSceneParent();
     if (m_workspace != nullptr) {
       m_workspace->syncViewPresentation(this);
@@ -439,6 +521,7 @@ namespace umbriel {
   void View::togglePinned() { setPinned(!m_pinned, true); }
 
   void View::setPinned(bool pinned, bool focus) {
+    assert(!attached());
     if (!m_mapped
         || !roleInitialized()
         || (pinned && (scheduledFullscreen() || currentFullscreen()))
@@ -465,6 +548,7 @@ namespace umbriel {
     const bool restoreTiled = m_restoreTiledAfterUnpin;
     m_restoreTiledAfterUnpin = false;
     m_pinned = false;
+    m_server->scheduleIpcWindowsEvent();
     if (restoreTiled) {
       setFloating(false, focus);
       if (Overview* overview = m_server->overview(); overview != nullptr && overview->active()) {
@@ -488,7 +572,41 @@ namespace umbriel {
     }
   }
 
+  void View::floatForLayout() {
+    if (m_tiled) {
+      const bool fullscreen = scheduledFullscreen() || currentFullscreen();
+      const auto restore = m_hasFullscreenRestoreBox ? std::optional{m_fullscreenRestoreBox} : std::nullopt;
+      toggleFloating(false);
+      if (fullscreen) {
+        setFullscreen(true);
+        // The internal tiled fullscreen exit discards this box. The layout transition must preserve the floating
+        // episode that started before fullscreen, rather than capture the fullscreen client buffer on re-entry.
+        if (restore) {
+          m_fullscreenRestoreBox = *restore;
+          m_hasFullscreenRestoreBox = true;
+        }
+      }
+    }
+    m_layoutFloated = true;
+  }
+
+  void View::adoptLayoutFloat() {
+    m_tiled = false;
+    m_layoutFloated = true;
+    const bool fullscreen = scheduledFullscreen() || currentFullscreen();
+    setSceneParent(fullscreen ? m_workspace->fullscreenTree() : m_workspace->viewLayer(false));
+    m_workspace->syncFloatingStack(this);
+  }
+
   void View::setFloating(bool floating, bool focus, TilePlacement placement) {
+    if (!floating
+        && placement == TilePlacement::Layout
+        && m_workspace != nullptr
+        && m_workspace->layoutMode() == LayoutMode::Floating) {
+      m_layoutFloated = true;
+      return;
+    }
+    assert(!attached());
     if (!m_mapped || !roleInitialized()) {
       return;
     }
@@ -504,6 +622,10 @@ namespace umbriel {
     const bool wantTiled = !floating;
     if (m_tiled == wantTiled) {
       return;
+    }
+    m_layoutFloated = false;
+    if (!floating) {
+      clearSnapState();
     }
     if (m_maximizedToEdges) {
       setMaximizedToEdges(false, false);
@@ -704,6 +826,7 @@ namespace umbriel {
   }
 
   void View::setFullscreen(bool fullscreen, FullscreenExitLayout exitLayout) {
+    assert(!attached());
     m_deferredUnfullscreen.clear();
     const bool refreshHoverFocus = !fullscreen
         && m_mapped
@@ -718,15 +841,16 @@ namespace umbriel {
       setMaximizedToEdges(false, false);
       m_restoreMaximizedToEdges = true;
     }
-    if (fullscreen && !m_tiled && !currentFullscreen()) {
-      const wlr_box& geometry = geometryBox();
+    if (fullscreen && !m_tiled && !scheduledFullscreen() && !currentFullscreen()) {
+      // A requested resize or move may still be awaiting its client buffer or animation. Restore its target geometry.
+      const auto [width, height] = floatingSize();
       m_fullscreenRestoreBox = {
-          .x = m_sceneTree->node.x,
-          .y = m_sceneTree->node.y,
-          .width = geometry.width,
-          .height = geometry.height,
+          .x = layoutTargetX(),
+          .y = layoutTargetY(),
+          .width = width,
+          .height = height,
       };
-      m_hasFullscreenRestoreBox = geometry.width > 0 && geometry.height > 0;
+      m_hasFullscreenRestoreBox = width > 0 && height > 0;
     }
     const bool restoreFloating = !fullscreen && !m_tiled && m_hasFullscreenRestoreBox;
     // Any leave-fullscreen invalidates a pending float-toggle restore: the
@@ -756,6 +880,9 @@ namespace umbriel {
       m_presentation.setSize(presentedWidth, presentedHeight);
     }
     setFullscreenState(fullscreen);
+    if (m_workspace != nullptr) {
+      m_workspace->syncFloatingStack(this);
+    }
     setFadeAlpha(m_fadeAlpha);
     updateFullscreenPresentation(0, 0);
     if (fullscreen) {

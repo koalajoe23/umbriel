@@ -3,8 +3,7 @@
 # Lifecycle actors are deliberately outside this contract, so opens and closes settle before sampling. Every window is
 # translucent red over black with a green border ring. Two content layers raise red above 0.56, while a border crossing
 # content mixes red with green. The windows_move shader writes the source alpha into blue, which proves the sampled
-# transition really ran. The maximized window is drawn at a lower alpha than its peers, because its resize crossfade
-# carries the windows_move shader too: only blue at the peers' alpha proves the peers themselves moved.
+# transition really ran.
 set -euo pipefail
 
 readonly CLIENT="${UMBRIEL_UNMAP_CLIENT:-./build-debug/tests/unmap-client}"
@@ -78,8 +77,8 @@ window_id() {
   "$UMBRIEL" windows --json | jq -r --arg title "$1" '.[] | select(.title == $title) | .id'
 }
 
-# Runs every animation to its end. A crossfade starts only once its client commits the resized buffer, which happens in
-# real time, so advance until a settle probe succeeds.
+# Runs every animation to its end. Settling waits for clients to commit their resized buffers, which happens in real
+# time, so advance until a settle probe succeeds.
 finish() {
   for _ in $(seq 20); do
     "$UMBRIEL" clock-advance 2000 > /dev/null

@@ -134,6 +134,7 @@ namespace umbriel {
         view->setChromeAttachment(std::move(created));
       }
       bar->setModel(model);
+      view->syncSsdFrame();
     }
   }
 
@@ -142,6 +143,7 @@ namespace umbriel {
     if (barOf(view) != nullptr) {
       view->setChromeAttachment(nullptr);
     }
+    view->syncSsdFrame();
   }
 
   bool TabPresenter::barShown(const TabGroup& group) const {
@@ -150,7 +152,7 @@ namespace umbriel {
 
   TabBarModel TabPresenter::modelFor(const Column& column, const TabGroup& group) const {
     TabBarModel model{
-        .tabs = {}, .active = group.active - group.first, .strip = {}, .gap = m_workspace.layoutConfig().gap
+        .tabs = {}, .active = group.active - group.first, .strip = {}, .gap = m_workspace.layoutConfig().tabs.barGap
     };
     model.tabs.reserve(group.count);
     for (size_t row = group.first; row < group.end() && row < column.views.size(); ++row) {

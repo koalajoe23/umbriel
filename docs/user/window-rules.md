@@ -23,6 +23,7 @@ default_workspace = 2
 | `match.is_scratchpad` | Match current scratchpad state. |
 | `match.is_alone` | Match whether this is the only tiled window. |
 | `match.is_only_window` | Match whether this is the only window on its workspace, floating ones included. |
+| `match.is_dialog` | Match whether the application named a parent window for it. |
 | `match.at_startup` | Match during or after the first 60 seconds. |
 
 Selectors are optional. A rule with none matches every window. Regular
@@ -56,7 +57,7 @@ floating or pinned state that it creates.
 | `default_floating` | Force floating or tiling. |
 | `default_maximize` | Open maximized within normal layout bounds. |
 | `default_maximize_to_edges` | Open maximized without gaps, struts, or borders. |
-| `default_focused` | Choose whether the new window takes focus. |
+| `default_focused` | Override whether the new window takes focus. Use `true` to focus and reveal a floating window above fullscreen. |
 | `default_pinned` | Open pinned above normal windows. |
 | `default_scrolling_column` | Join matching windows into one named scrolling column. |
 | `default_scrolling_column_order` | Set order inside a named scrolling column. |
@@ -71,8 +72,36 @@ identity signal cannot replay it over a later compositor action.
 Later identity changes refresh only the settings that update while a window is
 open.
 
+Named `default_workspace` targets remain valid when their output is unavailable
+and their workspace has been evacuated. Combining a name with `default_output`
+can select that original output's evacuated workspace, including when another
+workspace on the receiving output has the same name. Missing or ambiguous
+targets keep the normal placement fallback.
+
+A `default_maximize` rule opens the window at the full column width.
+[`client_maximize`](layout.md#maximize-and-fullscreen) governs the client's own or restored
+maximize request instead, deciding whether that request lands in the edges. A rule that never
+sees a client request stays on the column unless `default_maximize_to_edges` is set.
+
 Dialogs float by default. Use `default_floating = false` in a matching rule to
 force one into the layout.
+
+A modal dialog [attaches to its parent](layout.md#dialogs) and ignores the
+settings above, since it goes wherever its parent goes. `attach_to_parent =
+false` keeps it an ordinary window that these settings place. It is checked
+again whenever the rules change, so a reload detaches or attaches open dialogs.
+
+A rule that matches the parent window also covers its dialogs. This is how to
+opt out an application whose file pickers come from the desktop portal: those
+dialogs carry the portal's app id, such as `xdg-desktop-portal-gtk`, not the
+application's. A rule that matches the dialog itself takes precedence over its
+parent's.
+
+```toml
+[[window_rule]]
+match.app_id = "^org\\.mozilla\\.firefox$"
+attach_to_parent = false
+```
 
 ## Size and Position Rules
 
@@ -124,6 +153,19 @@ With no named definitions, use `"default"`. A hidden scratchpad keeps the new
 window hidden unless `default_focused = true` is also set. Output, workspace,
 and floating rules determine where and how it returns when restored.
 
+The window opens with the size and position that `default_floating_size`,
+`default_floating_size_px`, and `default_position` give it, centered when no
+position is set, or opens fullscreen or maximized to the edges with
+`default_fullscreen` or `default_maximize_to_edges`. A window moved into a
+scratchpad later keeps its current size and position.
+
+```toml
+[[window_rule]]
+match.app_id = "^scratchpad-terminal$"
+default_scratchpad = "terminal"
+default_floating_size = { width = 0.7, height = 0.7 }
+```
+
 ## Workspace placement
 
 `default_workspace` uses TOML type to distinguish positions and names:
@@ -171,6 +213,7 @@ the windows stacked beside it in the column it joins or creates.
 | `blur_ignore_alpha` | Skip blur below an alpha threshold. |
 | `blur_optimized` | Override the global optimized-blur choice. |
 | `confine_pointer` | Keep the pointer inside this window while it has keyboard focus (default `false`). |
+| `background_render` | Keep this window drawing while hidden (default `false`). See [Background rendering](#background-rendering). |
 | `focus_on_activate` | Override activation focus for this window. |
 | `vrr` | Override the focused output's VRR policy. |
 | `tearing` | Request or veto asynchronous presentation. |
@@ -180,6 +223,7 @@ the windows stacked beside it in the column it joins or creates.
 | `border_color_outer` | Override `colors.border.outer`. |
 | `border_width` | Override `appearance.border_width`, 0 to 100. |
 | `outer_border_width` | Override `appearance.outer_border_width`, 0 to 100. |
+| `title_bar` | `"on"` follows client decoration preferences, `"forced"` forces a title bar, and `"off"` hides it. Overrides `appearance.title_bar.mode`; omission inherits the global mode. |
 | `corner_radius` | Override `appearance.corner_radius`, 0 to 100. |
 | `shadow` | Override `appearance.shadow.enabled`. |
 | `border_effect` | Replace `effects.border` with a border preset or pool, or `"off"` to disable it. |
@@ -203,6 +247,30 @@ border_color_unfocused = "#5C4A2AFF"
 ```
 
 ### Decoration
+
+An omitted `title_bar` inherits `[appearance.title_bar] mode`. An explicit
+`title_bar = "on"` follows the client's decoration preference, or shows
+Umbriel's bar if no preference is known. Use `"forced"` to force a bar or `"off"`
+to hide it. Rules override every global mode: `"forced"` can enable a bar with
+global `"off"`, and `"on"` can honor CSD requests with global `"forced"`.
+A later matching `"on"` rule resets an earlier override to automatic selection. Changes apply to existing windows,
+including state-based rules and config reloads. Fullscreen, maximize-to-edges,
+and tiled tab groups still suppress the bar.
+
+```toml
+[[window_rule]]
+match.app_id = "^my-editor$"
+title_bar = "forced"
+
+[[window_rule]]
+match.app_id = "^my-editor$"
+match.title = "^Preferences$"
+title_bar = "on"
+```
+
+Forcing a title bar does not remove client-drawn headerbars or controls.
+Changing title bar presence adjusts tiled content space and maximized floating
+content sizes. Border-only overrides below keep layout spacing unchanged.
 
 `border_width`, `outer_border_width`, `corner_radius`, and `shadow` change what
 Umbriel draws around the windows a rule matches. Layout spacing keeps using the
@@ -340,3 +408,22 @@ small movements over the window you just left do not refocus it; leaving and
 re-entering it, clicking it, or explicitly focusing it allows confinement again.
 Compositor cursor warps remain available. Confinement is suspended during
 session lock, overview, compositor move/resize and client drag operations.
+
+### Background rendering
+
+A window that no output shows, because it sits on another workspace, in a
+hidden tab or in a hidden scratchpad, is told it is suspended and receives no
+frame callbacks, so it can stop drawing. Applications that tie other work to
+their drawing loop can stall or degrade in that state. Use `background_render`
+for them:
+
+```toml
+[[window_rule]]
+match.app_id = "^obs$"
+background_render = true
+```
+
+A matching window is not suspended while hidden and receives frame callbacks
+at its output's refresh rate, so it keeps running as if it were shown. Umbriel
+still does not draw it. This costs the CPU and GPU time the application spends
+drawing in the background. Reloading the configuration updates open windows.

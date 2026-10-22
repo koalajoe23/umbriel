@@ -1,6 +1,7 @@
 #pragma once
 
 #include "xwayland/outputs.h"
+#include "xwayland/xsettings.h"
 
 #include <cstdint>
 #include <memory>
@@ -14,6 +15,7 @@ struct wlr_xcursor_manager;
 struct wlr_xwayland;
 struct wlr_xwayland_surface;
 struct wlr_xwayland_surface_configure_event;
+struct xcb_connection_t;
 
 namespace umbriel {
 
@@ -38,7 +40,7 @@ namespace umbriel {
     // The value children get as DISPLAY.
     [[nodiscard]] const char* displayName() const;
     // The cursor X clients see over their windows until they set their own. The buffer belongs to `manager`, so this
-    // must run again before a replaced manager is destroyed.
+    // must run again before a replaced manager is destroyed. Also republishes the cursor theme in XSETTINGS.
     void applyCursor(wlr_xcursor_manager* manager);
     // Called by a window whose X11 surface was destroyed; deletes it.
     void forget(XwaylandWindow* window);
@@ -54,28 +56,45 @@ namespace umbriel {
     // Republishes the X screen and moves every X11 window to match it.
     void handleOutputLayoutChange();
     // An Xwayland surface just yielded the keyboard to a native Wayland client. Clear both X focus channels after the
-    // Wayland enter has reached the client, matching the cross-process handoff used by xwayland-satellite.
+    // Wayland enter has reached the client, so the native client holds keyboard focus before X11 loses it.
     void scheduleFocusClear();
 
   private:
     static void onServerStart(wl_listener* listener, void* data);
     static void onReady(wl_listener* listener, void* data);
     static void onNewSurface(wl_listener* listener, void* data);
+    static void onKeyboardFocusChange(wl_listener* listener, void* data);
+    static int onSelectionRefreshTimer(void* data);
     static int onFocusClearTimer(void* data);
     void handleReady();
     void handleNewSurface(wlr_xwayland_surface* xsurface);
+    void handleKeyboardFocusChange(void* data);
     void clearFocus();
+    // Owns the XSETTINGS selection of the running Xwayland and publishes the current settings in it.
+    void startXsettings(uint32_t selectionAtom, uint32_t managerAtom);
+    // Rewrites the settings property when the values announced to X11 clients changed.
+    void publishXsettings();
 
     Server& m_server;
     wlr_xwayland* m_wlr = nullptr;
     bool m_nativeResolution = false;
+    bool m_xsettingsEnabled = true;
     std::unique_ptr<XwaylandOutputs> m_outputs;
     std::vector<std::unique_ptr<XwaylandWindow>> m_windows;
     uint32_t m_netActiveWindow = 0;
+    // The XSETTINGS manager lives on the window manager's connection, so it neither keeps the lazy Xwayland running
+    // nor outlives it. `m_xsettingsConnection` tells whether the window belongs to the current Xwayland.
+    xcb_connection_t* m_xsettingsConnection = nullptr;
+    uint32_t m_xsettingsWindow = 0;
+    uint32_t m_xsettingsSettingsAtom = 0;
+    uint32_t m_xsettingsSerial = 0;
+    XsettingsValues m_xsettings;
     wl_event_source* m_focusClearTimer = nullptr;
+    wl_event_source* m_selectionRefreshTimer = nullptr;
     wl_listener m_serverStart{};
     wl_listener m_ready{};
     wl_listener m_newSurface{};
+    wl_listener m_keyboardFocusChange{};
   };
 
 } // namespace umbriel

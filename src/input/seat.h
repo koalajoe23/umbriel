@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <wayland-server-core.h>
 
 struct wlr_cursor_shape_manager_v1;
@@ -9,6 +10,7 @@ struct wlr_seat_client;
 namespace umbriel {
 
   class Server;
+  class ToplevelDragManager;
 
   class Seat {
   public:
@@ -19,6 +21,8 @@ namespace umbriel {
     Seat& operator=(const Seat&) = delete;
 
     [[nodiscard]] wlr_seat* wlr() const { return m_seat; }
+
+    [[nodiscard]] ToplevelDragManager& toplevelDrags() const { return *m_toplevelDrags; }
 
     void applyConfig();
     void updateCapabilities(bool hasKeyboard, bool hasTouch);
@@ -44,6 +48,7 @@ namespace umbriel {
     void handleDragDestroy();
     void sendPointerModifiers(wlr_seat_client* client, bool clear);
 
+    std::unique_ptr<ToplevelDragManager> m_toplevelDrags;
     Server* m_server = nullptr;
     wlr_seat* m_seat = nullptr;
     wlr_cursor_shape_manager_v1* m_cursorShapeManager = nullptr;

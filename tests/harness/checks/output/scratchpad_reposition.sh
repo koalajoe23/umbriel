@@ -18,7 +18,7 @@ write_config() {
   {
     printf '%s\n' "$BASELINE"
     printf '\n[animation]\nenabled = false\n'
-    printf '\n[animation.scratchpad]\nenabled = false\ndim = 0.5\nblur = false\nscale = 0.0\n'
+    printf '\n[animation.scratchpad]\nenabled = false\ndim = 0.5\nblur = false\n'
     printf '\n[colors]\nbackdrop = "#FFFFFFFF"\n'
     printf '\n[appearance]\nborder_width = 0\nouter_border_width = 0\ncorner_radius = 0\n'
     printf '\n[output.HEADLESS-1]\nenabled = true\nmode = "1280x720"\nposition = [%s, 0]\nworkspaces = ["LEFT"]\n' "$1"

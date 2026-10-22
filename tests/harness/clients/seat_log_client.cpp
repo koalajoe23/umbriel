@@ -7,6 +7,8 @@
 // unanswered until a byte arrives on stdin, so the window keeps its size while
 // the resize stays pending. POINTER_CONSTRAINT_CONTROL accepts l/c/u to lock/confine/unconstrain
 // and p to report pointer position; it also logs relative motion during client locks.
+// SHORTCUTS_INHIBIT_CONTROL accepts i/u to create/destroy a shortcut inhibitor.
+// REDRAW_CONTROL accepts a byte on stdin to commit another frame at the current size.
 
 #include "keyboard-shortcuts-inhibit-unstable-v1-client-protocol.h"
 #include "pointer-constraints-unstable-v1-client-protocol.h"
@@ -49,6 +51,8 @@ namespace {
     zxdg_exporter_v2* exporter = nullptr;
     zwp_keyboard_shortcuts_inhibit_manager_v1* shortcutsInhibitManager = nullptr;
     zwp_keyboard_shortcuts_inhibitor_v1* shortcutsInhibitor = nullptr;
+    bool shortcutsControl = false;
+    bool redrawControl = false;
     zwp_text_input_manager_v3* textInputManager = nullptr;
     zwp_text_input_v3* textInput = nullptr;
     bool constraintControl = false;
@@ -171,6 +175,23 @@ namespace {
       .active = shortcutsInhibitorActive,
       .inactive = shortcutsInhibitorInactive,
   };
+
+  void shortcutsCommand(State& state, char command) {
+    if (command != 'i' && command != 'u') {
+      return;
+    }
+    if (command == 'i' && state.shortcutsInhibitor == nullptr) {
+      state.shortcutsInhibitor = zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(
+          state.shortcutsInhibitManager, state.surface, state.seat
+      );
+      zwp_keyboard_shortcuts_inhibitor_v1_add_listener(state.shortcutsInhibitor, &kShortcutsInhibitorListener, &state);
+    } else if (command == 'u' && state.shortcutsInhibitor != nullptr) {
+      zwp_keyboard_shortcuts_inhibitor_v1_destroy(state.shortcutsInhibitor);
+      state.shortcutsInhibitor = nullptr;
+    }
+    wl_display_roundtrip(state.display);
+    std::println("shortcuts-command {}", command);
+  }
 
   constexpr zwp_locked_pointer_v1_listener kLockedListener = {
       .locked = [](void*, zwp_locked_pointer_v1*) { std::println("pointer-locked"); },
@@ -465,6 +486,8 @@ int main(int argc, char** argv) {
 
   State state;
   state.constraintControl = std::getenv("POINTER_CONSTRAINT_CONTROL") != nullptr;
+  state.shortcutsControl = std::getenv("SHORTCUTS_INHIBIT_CONTROL") != nullptr;
+  state.redrawControl = std::getenv("REDRAW_CONTROL") != nullptr;
   state.holdResize = std::getenv("HOLD_RESIZE") != nullptr;
   state.useTextInput = std::getenv("ENABLE_TEXT_INPUT") != nullptr;
   state.logModifiers = std::getenv("LOG_MODIFIERS") != nullptr;
@@ -500,11 +523,13 @@ int main(int argc, char** argv) {
   state.toplevel = xdg_surface_get_toplevel(state.xdgSurface);
   xdg_toplevel_add_listener(state.toplevel, &kToplevelListener, &state);
   xdg_toplevel_set_title(state.toplevel, title);
-  if (std::getenv("INHIBIT_SHORTCUTS") != nullptr) {
+  if (state.shortcutsControl || std::getenv("INHIBIT_SHORTCUTS") != nullptr) {
     if (state.shortcutsInhibitManager == nullptr) {
       std::println(stderr, "seat-log-client: compositor is missing zwp_keyboard_shortcuts_inhibit_manager_v1");
       return EXIT_FAILURE;
     }
+  }
+  if (std::getenv("INHIBIT_SHORTCUTS") != nullptr) {
     state.shortcutsInhibitor = zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(
         state.shortcutsInhibitManager, state.surface, state.seat
     );
@@ -526,7 +551,11 @@ int main(int argc, char** argv) {
     wl_display_flush(state.display);
     pollfd sources[2] = {
         {.fd = displayFd, .events = POLLIN, .revents = 0},
-        {.fd = (state.holdResize || state.constraintControl) ? STDIN_FILENO : -1, .events = POLLIN, .revents = 0},
+        {.fd = (state.holdResize || state.constraintControl || state.shortcutsControl || state.redrawControl)
+             ? STDIN_FILENO
+             : -1,
+         .events = POLLIN,
+         .revents = 0},
     };
     if (poll(sources, 2, -1) < 0) {
       if (errno == EINTR) {
@@ -543,12 +572,26 @@ int main(int argc, char** argv) {
     if ((sources[1].revents & (POLLIN | POLLHUP)) != 0) {
       char command = 0;
       [[maybe_unused]] const ssize_t bytes = read(STDIN_FILENO, &command, 1);
+      if (state.redrawControl && bytes > 0) {
+        wl_surface_attach(state.surface, state.buffer, 0, 0);
+        wl_surface_damage_buffer(state.surface, 0, 0, state.width, state.height);
+        wl_surface_commit(state.surface);
+        wl_display_roundtrip(state.display);
+        std::println("redrawn");
+        continue;
+      }
       if (state.constraintControl && bytes > 0) {
         constraintCommand(state, command);
         continue;
       }
+      if (state.shortcutsControl && bytes > 0) {
+        shortcutsCommand(state, command);
+        continue;
+      }
       if (bytes <= 0) {
+        state.redrawControl = false;
         state.constraintControl = false;
+        state.shortcutsControl = false;
       }
       state.holdResize = false;
       if (state.heldSerial) {

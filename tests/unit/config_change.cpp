@@ -84,6 +84,22 @@ UMBRIEL_TEST(eachSectionIsReportedOnItsOwn) {
   }
   {
     Config after;
+    after.input.touchpad.enabled = false;
+    CHECK(ConfigChange::between(before, after).input);
+    CHECK(ConfigEffects::between(before, after).input);
+  }
+  {
+    Config withRule;
+    Config::Input::Device rule;
+    rule.name = "Acme Precision Touchpad";
+    withRule.input.devices.push_back(rule);
+    Config after = withRule;
+    after.input.devices.front().enabled = false;
+    CHECK(ConfigChange::between(withRule, after).input);
+    CHECK(ConfigEffects::between(withRule, after).input);
+  }
+  {
+    Config after;
     after.input.touchpad.accelProfile.emplace();
     after.input.touchpad.accelProfile->kind = AccelProfile::Kind::Flat;
     const ConfigChange change = ConfigChange::between(before, after);
@@ -358,6 +374,34 @@ UMBRIEL_TEST(firstLoadInvalidatesEveryRuntimeConsumer) {
   CHECK(effects.input);
   CHECK(effects.overviewPresentation);
   CHECK(effects.internalUi);
+  CHECK(effects.dialogAttachment);
+}
+
+UMBRIEL_TEST(dialogAttachmentFollowsTheSwitchAndWindowRules) {
+  const Config before;
+  Config disabled;
+  disabled.general.attachModalDialogs = false;
+  const ConfigEffects switched = ConfigEffects::between(before, disabled);
+  CHECK(switched.dialogAttachment);
+  CHECK(!switched.viewChrome);
+
+  Config ruled;
+  WindowRule optOut;
+  optOut.matchDialog = true;
+  optOut.attachToParent = false;
+  ruled.windowRules.push_back(std::move(optOut));
+  CHECK(ConfigEffects::between(before, ruled).dialogAttachment);
+
+  // A rule that cannot decide attachment leaves dialogs alone.
+  Config translucent;
+  WindowRule faded;
+  faded.opacity = 0.5;
+  translucent.windowRules.push_back(std::move(faded));
+  CHECK(!ConfigEffects::between(before, translucent).dialogAttachment);
+
+  Config slower;
+  slower.animation.overview.durationMs = 400;
+  CHECK(!ConfigEffects::between(before, slower).dialogAttachment);
 }
 
 UMBRIEL_TEST(anyColorChangeRefreshesEveryColorConsumer) {
@@ -570,6 +614,25 @@ UMBRIEL_TEST(outputStateAndWorkspaceInventoryAreIndependent) {
   const ConfigEffects reenableEffects = ConfigEffects::between(disabled, before);
   CHECK(reenableEffects.outputState);
   CHECK(!reenableEffects.workspaceInventory);
+}
+
+UMBRIEL_TEST(outputSdrTransferReloadOnlyRefreshesOutputState) {
+  Config before;
+  OutputRule original;
+  original.name = "HEADLESS-1";
+  before.outputs.push_back(original);
+
+  Config after = before;
+  after.outputs[0].sdrTransfer = umbriel::SdrTransfer::Srgb;
+  CHECK(ConfigChange::between(before, after).outputs);
+  const ConfigEffects changed = ConfigEffects::between(before, after);
+  CHECK(changed.outputState);
+  CHECK_EQ(changed.summary(), std::string{"output state"});
+
+  const ConfigEffects reset = ConfigEffects::between(after, before);
+  CHECK(reset.outputState);
+  CHECK_EQ(reset.summary(), std::string{"output state"});
+  CHECK(!ConfigEffects::between(after, after).any());
 }
 
 UMBRIEL_TEST(outputScrollingDefaultOnlyRefreshesWorkspaceLayout) {
@@ -1008,6 +1071,21 @@ UMBRIEL_TEST(effectActionRootsAreUniqueAcrossKeybindsAndCorners) {
   config.hotCorners.corners[0].enabled = true;
   config.hotCorners.corners[0].action = config.keybinds.front();
   CHECK(umbriel::configuredEffectActionRoots(config) == std::vector<std::string>({"alpha", "zebra"}));
+}
+
+UMBRIEL_TEST(titleBarGeometryReloadRearrangesWorkspaces) {
+  Config before;
+  Config after = before;
+  after.appearance.titleBar.height = 40;
+  CHECK(ConfigEffects::between(before, after).workspaceLayout);
+  CHECK(ConfigEffects::between(before, after).viewChrome);
+  after = before;
+  after.appearance.titleBar.mode = umbriel::TitleBarMode::Forced;
+  CHECK(ConfigEffects::between(before, after).workspaceLayout);
+  after = before;
+  after.colors.titleBar.close[0] = 0.25F;
+  CHECK(!ConfigEffects::between(before, after).workspaceLayout);
+  CHECK(ConfigEffects::between(before, after).viewChrome);
 }
 
 int main() { return RUN_TESTS(); }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stepping from a focused dialog steps from the scratchpad window it belongs to, and a scratchpad hidden while a dialog
-# had focus shows that dialog's parent again, even if the dialog closed in the meantime. With the parent shown on its
-# own, its focused dialog is the scratchpad's current window for focus-next and restore.
+# had focus shows that dialog's parent again, even if the dialog closed in the meantime. The dialog, attached from
+# another process, is modal: it takes the focus its parent is given, and placement actions aimed at it act on the parent.
 set -euo pipefail
 
 readonly PARENT_CLIENT="${UMBRIEL_SEAT_LOG_CLIENT:-./build-debug/tests/seat-log-client}"
@@ -115,16 +115,16 @@ fi
 "$UMBRIEL" msg scratchpad-window-show-next > /dev/null
 expect_active focus-parent "showing a scratchpad whose focused dialog closed while it was hidden"
 
-# Restoring with a dialog of the window on show focused takes out the dialog and keeps its parent stored.
+# Restoring with the attached dialog focused takes out its parent, and the dialog comes along.
 TRANSIENT_FOREIGN_HANDLE="$handle" "$CLIENT" focus-dialog 200 150 > "$UMBRIEL_RUNTIME_DIR/focus-dialog-2.log" 2>&1 &
 wait_for_window focus-dialog
 focus_dialog
 "$UMBRIEL" msg window-restore-from-scratchpad > /dev/null
-restored_dialog=$(window_of focus-dialog | jq -r .scratchpad)
-stored_parent=$(window_of focus-parent | jq -r .scratchpad)
-if [[ -n $restored_dialog || $stored_parent != default ]]; then
-  echo "restore took out [parent: '$stored_parent', dialog: '$restored_dialog'] instead of the focused dialog: $(windows)"
+restored_dialog=$(window_of focus-dialog | jq -r '"\(.scratchpad)|\(.workspace)"')
+restored_parent=$(window_of focus-parent | jq -r '"\(.scratchpad)|\(.workspace)"')
+if [[ $restored_parent != "|HEADLESS-1:1" || $restored_dialog != "$restored_parent" ]]; then
+  echo "restore took out [parent: '$restored_parent', dialog: '$restored_dialog'] instead of the parent: $(windows)"
   exit 1
 fi
 
-echo "stepping from a focused dialog stepped from the window it belongs to"
+echo "stepping from a focused dialog stepped from the window it belongs to, and restoring it restored its parent"

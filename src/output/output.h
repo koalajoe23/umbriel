@@ -2,11 +2,14 @@
 
 #include "core/dirty.h"
 #include "output/cursor_plane_pace.h"
+#include "output/direct_scanout.h"
 #include "output/frame_schedule.h"
 #include "output/hdr_metadata.h"
 #include "output/hdr_transition.h"
+#include "scene/effect_audio.h"
 #include "scene/effect_selection.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -32,6 +35,7 @@ namespace umbriel {
 
   enum class FormatTier : uint8_t;
   enum class HdrMode;
+  enum class SdrTransfer;
   class Server;
   class View;
   class WorkspaceGroup;
@@ -76,6 +80,7 @@ namespace umbriel {
     void markDirty(Dirty what);
     // Asks for a frame on behalf of persistent effects.
     void scheduleEffectFrame();
+    void scheduleAudioFrame();
     // Pushes the effect capture policy and the screen and cursor presets to this output's scene. Detached while
     // effects are suspended; the instances are visible only while the output is enabled.
     void applyOutputEffects();
@@ -110,6 +115,9 @@ namespace umbriel {
     [[nodiscard]] bool bitDepthActive() const;
     [[nodiscard]] const std::string& hdrFallbackReason() const { return m_hdrFallbackReason; }
     [[nodiscard]] float configuredSdrWhite() const;
+    [[nodiscard]] float sdrWhite() const;
+    [[nodiscard]] SdrTransfer configuredSdrTransfer() const;
+    void setRuntimeSdrWhite(float nits);
     [[nodiscard]] int configuredBitDepth() const;
     [[nodiscard]] const std::string& bitDepthFallbackReason() const { return m_bitDepthFallbackReason; }
     [[nodiscard]] bool configuredDirectScanoutEnabled() const;
@@ -122,6 +130,8 @@ namespace umbriel {
     [[nodiscard]] const std::optional<bool>& lastPresentationPresented() const { return m_lastPresentationPresented; }
     [[nodiscard]] std::optional<bool> lastPresentationVsync() const;
     [[nodiscard]] const std::string& tearingFallbackReason() const { return m_tearingFallbackReason; }
+    // Settled, so it can lag the latest frame by DirectScanoutTracker::kSettleMs.
+    [[nodiscard]] const DirectScanoutState& directScanout() const { return m_directScanout.settled(); }
     [[nodiscard]] bool clientTearingHintAsync(const View* view) const;
     [[nodiscard]] bool tearingEligible(View* view) const;
     [[nodiscard]] View* tearingCandidate() const;
@@ -160,6 +170,7 @@ namespace umbriel {
     static void notifySurfaceScaleIter(wlr_surface* surface, int sx, int sy, void* data);
 
   private:
+    [[nodiscard]] bool audioPending() const;
     // Flushed at the top of handleFrame, in Dirty declaration order: layer arrange defines the usable area, which the
     // layout depends on, which the chrome over it depends on.
     void flushDirty();
@@ -169,9 +180,11 @@ namespace umbriel {
     static void onFrame(wl_listener* listener, void* data);
     static void onRequestState(wl_listener* listener, void* data);
     static void onPresent(wl_listener* listener, void* data);
+    static void onBackgroundUpdate(wl_listener* listener, void* data);
     static void onDestroy(wl_listener* listener, void* data);
     static int onFrameRetryTimer(void* data);
     static int onEffectFrameTimer(void* data);
+    static int onDirectScanoutTimer(void* data);
 
     void handleFrame();
     void handleRequestState(void* data);
@@ -186,7 +199,10 @@ namespace umbriel {
     void setHdrFallbackReason(std::string_view reason);
     void setBitDepthFallbackReason(std::string_view reason);
     void updateSceneSdrWhite();
+    void updateSceneHdrWhitePoint(wlr_gamma_control_v1* control);
     void armFrameRetry();
+    // Reads the scanout outcome of the frame just built.
+    void observeDirectScanout();
     void armEffectFrame(uint64_t nowMsec);
     // Render locks other than this output's animation lock.
     [[nodiscard]] int externalRenderLocks() const;
@@ -203,6 +219,7 @@ namespace umbriel {
     wlr_output* m_output = nullptr;
     float m_defaultScale = 1.0F;
     std::optional<HdrStaticMetadata> m_hdrStaticMetadata;
+    std::optional<float> m_runtimeSdrWhite;
     wlr_scene_output* m_sceneOutput = nullptr;
     wlr_scene_tree* m_layerTrees[kLayerCount]{};
     wlr_scene_tree* m_popupTree = nullptr;
@@ -212,6 +229,7 @@ namespace umbriel {
     wlr_scene_optimized_blur* m_optimizedBlur = nullptr;
     std::unique_ptr<WorkspaceGroup> m_workspaceGroup;
     wlr_box m_localUsableArea{};
+    wlr_box m_loggedUsableArea{};
     int m_arrangedLayoutX = 0;
     int m_arrangedLayoutY = 0;
 
@@ -233,13 +251,20 @@ namespace umbriel {
     HdrTransition m_hdrTransition;
     bool m_lastCommitTearing = false;
     bool m_trackingPresentation = false;
+    // Cadence of the last presented frame, which places this output's animation samples on its vblanks. 0 while
+    // unknown, including under adaptive sync, whose refresh varies.
+    uint64_t m_lastPresentNs = 0;
+    uint64_t m_refreshNs = 0;
     bool m_appliedConfiguredScale = false;
     wl_event_source* m_frameRetryTimer = nullptr;
     wl_event_source* m_effectFrameTimer = nullptr;
+    wl_event_source* m_directScanoutTimer = nullptr;
+    DirectScanoutTracker m_directScanout;
     uint64_t m_lastEffectFrameMsec = 0;
     bool m_effectFrameDue = false;
     bool m_effectFrameArmed = false;
     EffectSlot m_screenEffectSlot;
+    EffectAudio m_effectAudio{}; // bands and availability latched at the last effect frame
     uint64_t m_effectFrames = 0;
     float m_effectSeconds = 0.0F;
     bool m_outputEffectsTimed = false; // a visible screen or cursor instance here reads umbriel_time
@@ -252,6 +277,12 @@ namespace umbriel {
     std::optional<bool> m_lastPresentationPresented;
     std::optional<uint32_t> m_lastPresentationFlags;
     uint32_t m_trackedPresentationCommitSeq = 0;
+#ifdef TRACY_ENABLE
+    const char* m_tracyIntervalPlot = nullptr;
+    const char* m_tracyVblankPlot = nullptr;
+    int64_t m_tracyLastPresentNs = 0;
+    unsigned m_tracyLastPresentSeq = 0;
+#endif
     TearingCommitRecovery m_tearingRecovery;
     int m_deferredWidth = 0;
     int m_deferredHeight = 0;
@@ -260,6 +291,7 @@ namespace umbriel {
     wl_listener m_frame{};
     wl_listener m_requestState{};
     wl_listener m_present{};
+    wl_listener m_backgroundUpdate{};
     wl_listener m_destroy{};
   };
 

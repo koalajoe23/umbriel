@@ -13,7 +13,7 @@ Read the project [ethos](https://noctalia.dev/ethos) for the values behind these
 ## In scope
 
 - Bugs, crashes, regressions, and protocol misbehavior in anything Umbriel already does.
-- Refinement of the surfaces that already exist: the scrolling, dwindle, and master layouts, per-output workspaces,
+- Refinement of the surfaces that already exist: the scrolling, dwindle, master, and floating layouts, per-output workspaces,
   scratchpads, window and layer rules, the overview, input handling, and the existing effects.
 - Configuration keys that expose behavior Umbriel already implements, plus IPC actions and inspection output for state
   it already tracks.
@@ -24,8 +24,8 @@ Read the project [ethos](https://noctalia.dev/ethos) for the values behind these
 
 ## Out of scope
 
-- **New tiling layouts and new layout paradigms.** Scrolling, dwindle, and master are the set. Improving how those
-  three behave is in scope; adding a fourth model, or reshaping one of them into a different one, is not.
+- **New tiling layouts and new layout paradigms.** Scrolling, dwindle, master, and floating are the set. Improving how those
+  four behave is in scope; adding a fifth model, or reshaping one of them into a different one, is not.
 - **Desktop shell components.** Bars, panels, launchers, notification daemons, wallpaper handling, widgets, menus, and
   on-screen displays belong to a shell speaking Wayland protocols, for example
   [Noctalia](https://github.com/noctalia-dev/noctalia). Umbriel's job is to expose what a shell needs, not to become

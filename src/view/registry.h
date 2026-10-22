@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <ranges>
 #include <span>
 #include <vector>
 
@@ -25,18 +26,18 @@ namespace umbriel {
     void clear();
 
     [[nodiscard]] std::span<const std::unique_ptr<View>> all() const { return m_views; }
+    // The views that own a placement, in the same order: an attached dialog lives inside its parent, so a scan picking
+    // a window to focus or act on skips it.
+    [[nodiscard]] auto placementRoots() const { return std::views::filter(m_views, &ViewRegistry::isPlacementRoot); }
     [[nodiscard]] bool empty() const { return m_views.empty(); }
 
     // Move `view` to the front. No-op when it is absent or already there.
     void promote(View* view);
 
-    // The mapped modal dialogs, so finding what blocks a window does not scan every view.
-    void setModalDialog(View* view, bool modal);
-    [[nodiscard]] std::span<View* const> modalDialogs() const { return m_modalDialogs; }
-
   private:
+    static bool isPlacementRoot(const std::unique_ptr<View>& view);
+
     std::vector<std::unique_ptr<View>> m_views;
-    std::vector<View*> m_modalDialogs;
   };
 
 } // namespace umbriel

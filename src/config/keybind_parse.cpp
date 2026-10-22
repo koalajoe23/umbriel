@@ -136,6 +136,9 @@ namespace umbriel {
       if (name == "dwindle") {
         return LayoutMode::Dwindle;
       }
+      if (name == "floating") {
+        return LayoutMode::Floating;
+      }
       if (name == "master") {
         return LayoutMode::Master;
       }
@@ -184,6 +187,66 @@ namespace umbriel {
       return true;
     }
 
+    // A signed pixel count; std::from_chars rejects a leading '+', so it is stripped first.
+    bool parseSignedPixels(std::string_view text, int& output) {
+      if (!text.empty() && text.front() == '+') {
+        text.remove_prefix(1);
+      }
+      const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), output);
+      return error == std::errc{} && end == text.data() + text.size();
+    }
+
+    // Splits `<first>/<second>/.../[/<window-id>]` into `required` leading parts and an optional non-empty window id.
+    std::optional<std::vector<std::string_view>>
+    splitWithOptionalWindowId(std::string_view arg, std::size_t required, std::string& windowId) {
+      std::vector<std::string_view> tokens;
+      for (const auto token : arg | std::views::split('/')) {
+        tokens.emplace_back(token.begin(), token.end());
+      }
+      if (tokens.size() < required || tokens.size() > required + 1) {
+        return std::nullopt;
+      }
+      if (tokens.size() > required) {
+        // A trailing slash names no window; it must not fall back to the focused one.
+        if (tokens.back().empty()) {
+          return std::nullopt;
+        }
+        windowId = std::string(tokens.back());
+      }
+      return tokens;
+    }
+
+    bool parseWindowMoveToArg(std::string_view arg, WindowMoveToArg& output) {
+      std::string windowId;
+      const auto tokens = splitWithOptionalWindowId(arg, 3, windowId);
+      if (!tokens) {
+        return false;
+      }
+      const std::optional<WindowPositionAnchor> anchor = windowPositionAnchorFromName((*tokens)[0]);
+      WindowPosition position;
+      if (!anchor || !parseSignedPixels((*tokens)[1], position.x) || !parseSignedPixels((*tokens)[2], position.y)) {
+        return false;
+      }
+      position.anchor = *anchor;
+      output.id = std::move(windowId);
+      output.position = position;
+      return true;
+    }
+
+    bool parseWindowMoveByArg(std::string_view arg, WindowMoveByArg& output) {
+      std::string windowId;
+      const auto tokens = splitWithOptionalWindowId(arg, 2, windowId);
+      int deltaX = 0;
+      int deltaY = 0;
+      if (!tokens || !parseSignedPixels((*tokens)[0], deltaX) || !parseSignedPixels((*tokens)[1], deltaY)) {
+        return false;
+      }
+      output.id = std::move(windowId);
+      output.deltaX = deltaX;
+      output.deltaY = deltaY;
+      return true;
+    }
+
     constexpr ActionSpec kActionSpecs[] = {
         {"cheatsheet-close", "", "Hide the keybind cheatsheet", KeybindAction::CheatsheetClose},
         {"cheatsheet-open", "", "Show the keybind cheatsheet", KeybindAction::CheatsheetOpen},
@@ -227,6 +290,8 @@ namespace umbriel {
         {"column-toggle-tabbed", "", "Tab the rows around the focused window, or stack its tabs",
          KeybindAction::ColumnToggleTabbed},
         {"config-reload", "", "Reload the configuration file", KeybindAction::ConfigReload},
+        {"cursor-hide", "", "Hide the cursor until pointer activity", KeybindAction::CursorHide},
+        {"cursor-show", "", "Show the cursor and restart its inactivity timeout", KeybindAction::CursorShow},
         {"dpms-off", "[<output>]", "Power off one output, or every output when bare", KeybindAction::DpmsOff,
          ActionArgKind::OptionalOutput},
         {"dpms-on", "[<output>]", "Power on one output, or every output when bare", KeybindAction::DpmsOn,
@@ -274,6 +339,8 @@ namespace umbriel {
         {"layout-scroll-left", "", "Scroll the strip toward its start", KeybindAction::LayoutScrollLeft},
         {"layout-scroll-right", "", "Scroll the strip toward its end", KeybindAction::LayoutScrollRight},
         {"layout-scroll-up", "", "Scroll the strip toward its start", KeybindAction::LayoutScrollUp},
+        {"layout-toggle-split", "", "Toggle the focused tile's dwindle split direction",
+         KeybindAction::LayoutToggleSplit},
         {"output-disable", "<output>", "Remove an output from the desktop", KeybindAction::OutputDisable,
          ActionArgKind::Output},
         {"output-enable", "<output>", "Add an output to the desktop", KeybindAction::OutputEnable,
@@ -284,6 +351,8 @@ namespace umbriel {
         {"output-focus-previous", "", "Focus the previous output, wrapping around", KeybindAction::OutputFocusPrevious},
         {"output-focus-right", "", "Focus the output to the right", KeybindAction::OutputFocusRight},
         {"output-focus-up", "", "Focus the output above", KeybindAction::OutputFocusUp},
+        {"output-sdr-white", "<nits>[/<output>]", "Set an output's live SDR reference white in cd/m2",
+         KeybindAction::OutputSdrWhite, ActionArgKind::SdrWhite},
         {"output-toggle", "<output>", "Add or remove an output from the desktop", KeybindAction::OutputToggle,
          ActionArgKind::Output},
         {"overview-close", "", "Close the workspace overview", KeybindAction::OverviewClose},
@@ -361,6 +430,8 @@ namespace umbriel {
         {"window-focus-up", "", "Focus the next window up in the column", KeybindAction::WindowFocusUp},
         {"window-focus-warp", "<window-id>", "Focus or reveal a window and warp the cursor to it",
          KeybindAction::WindowFocusWarpId, ActionArgKind::WindowId},
+        {"window-kill", "[<window-id>]", "Kill the process owning the focused or given window",
+         KeybindAction::WindowKill, ActionArgKind::OptionalWindowId},
         {"window-modify-height-down", "<delta>", "Resize the focused window from its bottom edge",
          KeybindAction::WindowModifyHeightDown, ActionArgKind::FractionDelta},
         {"window-modify-height-up", "<delta>", "Resize the focused window from its top edge",
@@ -373,8 +444,12 @@ namespace umbriel {
          KeybindAction::WindowModifyWidthLeft, ActionArgKind::FractionDelta},
         {"window-modify-width-right", "<delta>", "Resize the focused column from its right edge",
          KeybindAction::WindowModifyWidthRight, ActionArgKind::FractionDelta},
-        {"window-move-down", "", "Move the focused window down in its column", KeybindAction::WindowMoveDown},
-        {"window-move-left", "", "Move the focused window left", KeybindAction::WindowMoveLeft},
+        {"window-move-by", "<delta-x>/<delta-y>[/<window-id>]", "Move the floating window by logical pixels",
+         KeybindAction::WindowMoveBy, ActionArgKind::WindowMoveBy},
+        {"window-move-down", "", "Move down in its column, or a float to the bottom edge",
+         KeybindAction::WindowMoveDown},
+        {"window-move-left", "", "Move the focused window left, or a float to the left edge",
+         KeybindAction::WindowMoveLeft},
         {"window-move-or-output-down", "", "Move down, or the column to the output below",
          KeybindAction::WindowMoveOrOutputDown},
         {"window-move-or-output-left", "", "Move the column left, or to the output left",
@@ -387,7 +462,10 @@ namespace umbriel {
          KeybindAction::WindowMoveOrWorkspaceDown},
         {"window-move-or-workspace-up", "", "Move up, or to the previous workspace at the edge",
          KeybindAction::WindowMoveOrWorkspaceUp},
-        {"window-move-right", "", "Move the focused window right", KeybindAction::WindowMoveRight},
+        {"window-move-right", "", "Move the focused window right, or a float to the right edge",
+         KeybindAction::WindowMoveRight},
+        {"window-move-to", "<anchor>/<x>/<y>[/<window-id>]", "Move the floating window to an anchored position",
+         KeybindAction::WindowMoveTo, ActionArgKind::WindowMoveTo},
         {"window-move-to-output-down", "", "Move the focused window to the output below",
          KeybindAction::WindowMoveToOutputDown},
         {"window-move-to-output-left", "", "Move the focused window to the output left",
@@ -415,13 +493,16 @@ namespace umbriel {
          KeybindAction::WindowMoveToWorkspaceSilentNext},
         {"window-move-to-workspace-silent-previous", "", "Move the focused window to the previous workspace silently",
          KeybindAction::WindowMoveToWorkspaceSilentPrevious},
-        {"window-move-up", "", "Move the focused window up in its column", KeybindAction::WindowMoveUp},
+        {"window-move-up", "", "Move up in its column, or a float to the top edge", KeybindAction::WindowMoveUp},
         {"window-restore-from-scratchpad", "[<scratchpad>]", "Return a scratchpad window to its saved workspace",
          KeybindAction::WindowRestoreFromScratchpad, ActionArgKind::OptionalScratchpad},
         {"window-set-primary-extent", "<fraction>", "Set the focused area's primary extent fraction",
          KeybindAction::WindowSetPrimaryExtent, ActionArgKind::Fraction},
         {"window-set-secondary-extent", "<fraction>", "Set the focused area's secondary extent fraction",
          KeybindAction::WindowSetSecondaryExtent, ActionArgKind::Fraction},
+        {"window-snap", "<left|right|top|bottom|top_left|top_right|bottom_left|bottom_right>",
+         "Snap the floating window, or restore it when already there", KeybindAction::WindowSnap,
+         ActionArgKind::SnapRegion},
         {"window-swap-down", "", "Swap with the window below", KeybindAction::WindowSwapDown},
         {"window-swap-left", "", "Swap with the window to the left", KeybindAction::WindowSwapLeft},
         {"window-swap-next", "", "Swap with the next window in layout order", KeybindAction::WindowSwapNext},
@@ -439,6 +520,7 @@ namespace umbriel {
         {"window-toggle-pinned", "", "Pin the focused window above other windows", KeybindAction::TogglePinned},
         {"window-toggle-scratchpad", "[<scratchpad>]", "Move the focused window to or from a scratchpad",
          KeybindAction::WindowToggleScratchpad, ActionArgKind::OptionalScratchpad},
+        {"window-unsnap", "", "Restore the floating window's size before snapping", KeybindAction::WindowUnsnap},
         {"workspace-focus-last", "", "Focus the previously active workspace", KeybindAction::WorkspaceFocusLast},
         {"workspace-move-down", "", "Move the focused workspace down the list", KeybindAction::WorkspaceMoveDown},
         {"workspace-move-to-output-down", "", "Move every workspace window to the output below",
@@ -452,7 +534,7 @@ namespace umbriel {
         {"workspace-move-up", "", "Move the focused workspace up the list", KeybindAction::WorkspaceMoveUp},
         {"workspace-next", "", "Switch to the next workspace on this output", KeybindAction::WorkspaceNext},
         {"workspace-previous", "", "Switch to the previous workspace on this output", KeybindAction::WorkspacePrevious},
-        {"workspace-set-layout", "<scrolling|dwindle|master|toggle[:mode1,mode2,...]>",
+        {"workspace-set-layout", "<scrolling|dwindle|master|floating|toggle[:mode1,mode2,...]>",
          "Set the active workspace's layout mode", KeybindAction::WorkspaceSetLayout, ActionArgKind::LayoutMode},
         {"workspace-swap-active-output-down", "", "Swap active workspace windows with the output below",
          KeybindAction::WorkspaceSwapActiveOutputDown},
@@ -508,6 +590,17 @@ namespace umbriel {
       return "MouseForward";
     default:
       return nullptr;
+    }
+  }
+
+  uint32_t canonicalMouseButton(uint32_t button) {
+    switch (button) {
+    case BTN_BACK:
+      return BTN_SIDE;
+    case BTN_FORWARD:
+      return BTN_EXTRA;
+    default:
+      return button;
     }
   }
 
@@ -718,6 +811,15 @@ namespace umbriel {
           return true;
         }
         break;
+      case ActionArgKind::SnapRegion:
+        if (takeActionArg(value, spec, arg)) {
+          if (const auto region = snapRegionNamed(arg)) {
+            output.action = spec.action;
+            output.payload = SnapRegionArg{.region = *region};
+            return true;
+          }
+        }
+        break;
       case ActionArgKind::ColumnDisplay:
         if (takeActionArg(value, spec, arg) && (arg == "normal" || arg == "tabbed")) {
           output.action = spec.action;
@@ -750,6 +852,29 @@ namespace umbriel {
           return true;
         }
         break;
+      case ActionArgKind::SdrWhite: {
+        if (!takeActionArg(value, spec, arg)) {
+          break;
+        }
+        // Split at the first '/', so an output name may itself contain one, as effect targets do.
+        const size_t slash = arg.find('/');
+        const std::string_view nitsText = arg.substr(0, slash);
+        const std::string_view target = slash == std::string_view::npos ? std::string_view{} : arg.substr(slash + 1);
+        double nits = 0.0;
+        const auto [nitsPtr, nitsError] = std::from_chars(nitsText.data(), nitsText.data() + nitsText.size(), nits);
+        // The same span the config's `output.<name>.sdr_white` accepts.
+        if (nitsError != std::errc{}
+            || nitsPtr != nitsText.data() + nitsText.size()
+            || !std::isfinite(nits)
+            || nits < 80.0
+            || nits > 1000.0
+            || (slash != std::string_view::npos && target.empty())) {
+          break;
+        }
+        output.action = spec.action;
+        output.payload = SdrWhiteArg{.nits = nits, .output = std::string(target)};
+        return true;
+      }
       case ActionArgKind::LayoutMode: {
         if (!takeActionArg(value, spec, arg)) {
           break;
@@ -781,6 +906,30 @@ namespace umbriel {
         }
         output.action = spec.action;
         output.payload = LayoutModeArg{.mode = std::nullopt, .toggleSequence = std::move(sequence)};
+        return true;
+      }
+      case ActionArgKind::WindowMoveTo: {
+        if (!takeActionArg(value, spec, arg)) {
+          break;
+        }
+        WindowMoveToArg payload;
+        if (!parseWindowMoveToArg(arg, payload)) {
+          break;
+        }
+        output.action = spec.action;
+        output.payload = std::move(payload);
+        return true;
+      }
+      case ActionArgKind::WindowMoveBy: {
+        if (!takeActionArg(value, spec, arg)) {
+          break;
+        }
+        WindowMoveByArg payload;
+        if (!parseWindowMoveByArg(arg, payload)) {
+          break;
+        }
+        output.action = spec.action;
+        output.payload = std::move(payload);
         return true;
       }
       }

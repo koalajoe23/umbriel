@@ -16,7 +16,6 @@ namespace umbriel {
   namespace view_detail {
     // Remove a listener that may never have been added, or was already removed.
     void removeListener(wl_listener& listener);
-    bool scratchpadOwnsOpeningGeometry();
     // Direct child of the xdg scene tree that holds the toplevel subsurface tree.
     wlr_scene_node* toplevelSurfaceTreeNode(wlr_scene_tree* xdgTree, wlr_surface* mainSurface);
     WorkspaceGroup* windowRuleWorkspaceGroup(Server& server, const ResolvedWindowRule& rule, WorkspaceGroup* fallback);

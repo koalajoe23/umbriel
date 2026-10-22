@@ -2,6 +2,7 @@
 
 #include "config/config.h"
 #include "input/cursor.h"
+#include "input/toplevel_drag.h"
 #include "server/server.h"
 #include "wlr.h"
 
@@ -32,9 +33,11 @@ namespace umbriel {
 
     m_startDrag.notify = onStartDrag;
     wl_signal_add(&m_seat->events.start_drag, &m_startDrag);
+    m_toplevelDrags = std::make_unique<ToplevelDragManager>(server);
   }
 
   Seat::~Seat() {
+    m_toplevelDrags.reset();
     wl_list_remove(&m_requestCursor.link);
     wl_list_remove(&m_requestSetShape.link);
     wl_list_remove(&m_pointerFocusChange.link);
@@ -208,7 +211,9 @@ namespace umbriel {
 
   void Seat::handleRequestSetSelection(void* data) {
     auto* event = static_cast<wlr_seat_request_set_selection_event*>(data);
-    wlr_seat_set_selection(m_seat, event->source, event->serial);
+    if (!m_toplevelDrags->rejectSelection(event->source)) {
+      wlr_seat_set_selection(m_seat, event->source, event->serial);
+    }
   }
 
   void Seat::handleRequestSetPrimarySelection(void* data) {
@@ -236,6 +241,7 @@ namespace umbriel {
     m_dragDestroy.notify = onDragDestroy;
     wl_signal_add(&drag->events.destroy, &m_dragDestroy);
     m_server->cursor()->handleDataDragStarted();
+    m_toplevelDrags->start(drag);
     if (drag->icon == nullptr) {
       return;
     }
@@ -251,6 +257,7 @@ namespace umbriel {
     wl_list_remove(&m_dragDestroy.link);
     m_dragDestroy.link.next = nullptr;
     m_dragDestroy.link.prev = nullptr;
+    m_toplevelDrags->finish();
     m_server->cursor()->handleDataDragEnded();
     m_server->restoreActivatedViewKeyboardFocus();
   }

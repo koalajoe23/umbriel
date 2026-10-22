@@ -52,4 +52,14 @@ namespace umbriel {
     return preferred == staged ? nullptr : preferred;
   }
 
+  bool liveModeMatches(const wlr_output& output, const wlr_output_mode* mode) {
+    return output.enabled && output.current_mode == mode;
+  }
+
+  bool outputEnableNeedsStaging(const wlr_output& output, bool enabled) { return !(enabled && output.enabled); }
+
+  bool colorChangeNeedsModeset(const wlr_output& output, uint32_t renderFormat, bool hdr) {
+    return output.render_format != renderFormat || (output.image_description != nullptr) != hdr;
+  }
+
 } // namespace umbriel

@@ -114,7 +114,7 @@ if is_glibc
 endif
 
 xkbcommon_dep = dependency('xkbcommon')
-libinput_dep = dependency('libinput', version: '>=1.23')
+libinput_dep = dependency('libinput', version: '>=1.27')
 pixman_dep = dependency('pixman-1', version: '>=0.43.0')
 tomlplusplus_dep = dependency('tomlplusplus')
 nlohmann_json_dep = dependency('nlohmann_json')
@@ -123,6 +123,8 @@ pangocairo_dep = dependency('pangocairo')
 libdrm_dep = dependency('libdrm', version: '>=2.4.129')
 libdisplay_info_dep = dependency('libdisplay-info', version: '>=0.3.0')
 libudev_dep = dependency('libudev', required: false)
+# sd-bus reads the systemd-localed keymap a keyboard without XKB config uses.
+libsystemd_dep = dependency('libsystemd', version: '>=243', required: get_option('localed'))
 xcb_dep = dependency('xcb')
 xcb_icccm_dep = dependency('xcb-icccm')
 xcb_ewmh_dep = dependency('xcb-ewmh')
@@ -133,6 +135,7 @@ if native_drm_policy_supported
 endif
 add_project_arguments(
   '-DUMBRIEL_HAS_NATIVE_DRM_POLICY=' + native_drm_policy_supported.to_int().to_string(),
+  '-DUMBRIEL_HAS_SD_BUS=' + libsystemd_dep.found().to_int().to_string(),
   language: 'cpp',
 )
 
@@ -248,6 +251,26 @@ xdg_shell_client_c = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+toplevel_drag_xml = wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/xdg-toplevel-drag/xdg-toplevel-drag-v1.xml'
+toplevel_drag_server_h = custom_target(
+  'xdg-toplevel-drag-v1-server-protocol.h',
+  input: toplevel_drag_xml,
+  output: 'xdg-toplevel-drag-v1-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+toplevel_drag_client_h = custom_target(
+  'xdg-toplevel-drag-v1-client-protocol.h',
+  input: toplevel_drag_xml,
+  output: 'xdg-toplevel-drag-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+toplevel_drag_c = custom_target(
+  'xdg-toplevel-drag-v1-protocol.c',
+  input: toplevel_drag_xml,
+  output: 'xdg-toplevel-drag-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 text_input_client_h = custom_target(
   'text-input-unstable-v3-client-protocol.h',
   input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/text-input/text-input-unstable-v3.xml',
@@ -258,6 +281,19 @@ text_input_client_c = custom_target(
   'text-input-unstable-v3-client-protocol.c',
   input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'unstable/text-input/text-input-unstable-v3.xml',
   output: 'text-input-unstable-v3-client-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
+legacy_decoration_client_h = custom_target(
+  'server-decoration-client-protocol.h',
+  input: 'protocols/server-decoration.xml',
+  output: 'server-decoration-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
+legacy_decoration_client_c = custom_target(
+  'server-decoration-client-protocol.c',
+  input: 'protocols/server-decoration.xml',
+  output: 'server-decoration-client-protocol.c',
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
@@ -496,6 +532,12 @@ ext_image_copy_capture_client_c = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+ext_foreign_toplevel_list_client_h = custom_target(
+  'ext-foreign-toplevel-list-v1-client-protocol.h',
+  input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
+  output: 'ext-foreign-toplevel-list-v1-client-protocol.h',
+  command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+)
 ext_foreign_toplevel_list_client_c = custom_target(
   'ext-foreign-toplevel-list-v1-protocol.c',
   input: wayland_protocols_dep.get_variable(pkgconfig: 'pkgdatadir') / 'staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml',
@@ -663,13 +705,16 @@ pure_sources = files(
   'src/input/swipe_tracker.cpp',
   'src/input/keyboard_layout.cpp',
   'src/input/surface_layouts.cpp',
+  'src/input/shortcuts_inhibit.cpp',
   'src/input/shortcut_keysym.cpp',
   'src/input/xcursor_matcher.cpp',
   'src/layout/layout.cpp',
+  'src/scene/ssd_frame_geometry.cpp',
   'src/layout/layout_motion.cpp',
   'src/layout/scrolling.cpp',
   'src/layout/dwindle.cpp',
   'src/layout/master.cpp',
+  'src/layout/floating.cpp',
   'src/output/direction.cpp',
   'src/output/identity.cpp',
   'src/output/enable_overrides.cpp',
@@ -685,9 +730,11 @@ pure_sources = files(
   'src/view/border_ring.cpp',
   'src/view/effects_rules.cpp',
   'src/view/floating.cpp',
+  'src/view/snap.cpp',
   'src/view/drag_physics.cpp',
   'src/pacing/fifo_queue.cpp',
   'src/pacing/commit_timing_policy.cpp',
+  'src/xwayland/xsettings.cpp',
 )
 
 umbriel_pure_deps = [
@@ -737,20 +784,25 @@ core_sources = files(
   'src/config/config_watcher.cpp',
   'src/config/schema.cpp',
   'src/layout/drop_target.cpp',
-  'src/server/wine_color_manager.cpp',
+  'src/server/color_manager.cpp',
+  'src/server/color_description.cpp',
   'src/server/backend_manager.cpp',
   'src/server/allocator.cpp',
   'src/server/server.cpp',
   'src/server/server_events.cpp',
   'src/server/server_keybinds.cpp',
   'src/server/server_outputs.cpp',
+  'src/server/syncobj_acquire_barrier.cpp',
+  'src/server/syncobj_superseded_release.cpp',
   'src/server/syncobj_unmap_release.cpp',
   'src/server/actions.cpp',
   'src/server/effects.cpp',
   'src/output/output.cpp',
   'src/output/hdr_metadata.cpp',
   'src/input/seat.cpp',
+  'src/input/toplevel_drag.cpp',
   'src/input/keyboard.cpp',
+  'src/input/system_keymap.cpp',
   'src/input/text_input.cpp',
   'src/input/cursor.cpp',
   'src/input/gestures.cpp',
@@ -759,7 +811,6 @@ core_sources = files(
   'src/view/decoration.cpp',
   'src/view/effects.cpp',
   'src/view/presentation.cpp',
-  'src/view/resize_crossfade.cpp',
   'src/view/registry.cpp',
   'src/server/focus.cpp',
   'src/xwayland/xwayland.cpp',
@@ -771,8 +822,10 @@ core_sources = files(
   'src/view/view_foreign.cpp',
   'src/view/view_role.cpp',
   'src/view/view_animation.cpp',
+  'src/view/view_attachment.cpp',
   'src/view/view_chrome.cpp',
   'src/view/view_floating.cpp',
+  'src/view/view_snap.cpp',
   'src/view/view_lifecycle.cpp',
   'src/view/view_rules.cpp',
   'src/view/view_state.cpp',
@@ -787,6 +840,7 @@ core_sources = files(
   'src/scene/cheatsheet.cpp',
   'src/scene/text_buffer.cpp',
   'src/scene/tab_bar.cpp',
+  'src/scene/ssd_frame.cpp',
   'src/scene/tab_bar_style.cpp',
   'src/scene/tab_label_cache.cpp',
   'src/lock/session_lock.cpp',
@@ -800,7 +854,6 @@ core_sources = files(
   'src/workspace/workspace.cpp',
   'src/workspace/tab_presenter.cpp',
   'src/workspace/scratchpad.cpp',
-  'src/cli/outputs.cpp',
   'src/cli/ipc_client.cpp',
   'src/server/ipc.cpp',
   'src/server/ipc_commands.cpp',
@@ -821,6 +874,7 @@ umbriel_core_deps = [
   libdrm_dep,
   libdisplay_info_dep,
   native_drm_policy_deps,
+  libsystemd_dep,
   nlohmann_json_dep,
   layer_shell_protocol_dep,
   xcb_dep,
@@ -831,8 +885,9 @@ umbriel_core_deps = [
 umbriel_core = static_library(
   'umbriel-core',
   core_sources + [
-    output_mgmt_client_h,
-    output_mgmt_client_c,
+    toplevel_drag_server_h,
+    toplevel_drag_c,
+    xdg_shell_client_c,
     color_management_server_h,
     color_management_server_c,
     xdg_output_server_h,
@@ -927,7 +982,7 @@ install_data(
 # Bundled effect presets: each directory holds the preset's shader and an
 # effect.toml that defines it without selecting it. Users include the TOML and
 # select the name.
-foreach effect : ['animation/reveal', 'animation/squash', 'border/pulse', 'window/scanlines', 'screen/vignette', 'cursor/glow', 'cursor/trail', 'cursor/trail-path']
+foreach effect : ['animation/reveal', 'animation/squash', 'animation/workspace_wipe', 'border/pulse', 'border/audio', 'window/scanlines', 'screen/vignette', 'cursor/glow', 'cursor/trail', 'cursor/trail-path']
   install_data(
     'examples/effects' / effect / 'shader.glsl',
     'examples/effects' / effect / 'effect.toml',

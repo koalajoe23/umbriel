@@ -34,11 +34,6 @@ namespace umbriel {
     constexpr int kSpringMinDurationMs = 1;
     constexpr int kSpringMaxDurationMs = 10000;
 
-    struct AnimationTransition {
-      uint64_t id;
-      std::array<float, 4> seed;
-    };
-
     [[nodiscard]] uint64_t mixRandom(uint64_t value) {
       value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
       value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
@@ -53,17 +48,6 @@ namespace umbriel {
             ^ reinterpret_cast<uintptr_t>(&salt);
       }
       return mixRandom(salt);
-    }
-
-    [[nodiscard]] AnimationTransition beginAnimationTransition() {
-      static const uint64_t salt = animationRandomSalt();
-      const uint64_t id = nextAnimationTransitionId();
-      AnimationTransition transition{.id = id, .seed = {}};
-      for (std::size_t channel = 0; channel < transition.seed.size(); ++channel) {
-        const uint64_t value = mixRandom(salt ^ mixRandom(id + UINT64_C(0x9e3779b97f4a7c15) * (channel + 1)));
-        transition.seed[channel] = static_cast<float>(value >> 40) * (1.0F / 16777216.0F);
-      }
-      return transition;
     }
 
     [[nodiscard]] std::string normalizeName(std::string_view name) {
@@ -273,6 +257,17 @@ namespace umbriel {
       return impl;
     }
   } // namespace
+
+  [[nodiscard]] AnimationTransition beginAnimationTransition() {
+    static const uint64_t salt = animationRandomSalt();
+    const uint64_t id = nextAnimationTransitionId();
+    AnimationTransition transition{.id = id, .seed = {}};
+    for (std::size_t channel = 0; channel < transition.seed.size(); ++channel) {
+      const uint64_t value = mixRandom(salt ^ mixRandom(id + UINT64_C(0x9e3779b97f4a7c15) * (channel + 1)));
+      transition.seed[channel] = static_cast<float>(value >> 40) * (1.0F / 16777216.0F);
+    }
+    return transition;
+  }
 
   double solveCubicBezier(double x1, double y1, double x2, double y2, double x) {
     if (x <= 0.0) {
@@ -785,6 +780,12 @@ namespace umbriel {
   }
 
   void AnimatedValue::retarget(double to, int durationMs, const AnimationCurve& curve) {
+    // A spring interrupted mid-flight continues from its current speed instead of restarting from rest, so a new target
+    // bends the motion rather than stopping it for a frame.
+    if (curve.easing == Easing::Spring && m_animating && m_velocity != 0.0 && std::isfinite(m_velocity)) {
+      settleSpring(to, curve.spring, m_velocity);
+      return;
+    }
     const AnimationTransition transition = beginAnimationTransition();
     m_transitionId = transition.id;
     m_shaderSeed = transition.seed;
@@ -798,6 +799,7 @@ namespace umbriel {
     m_animating = true;
     m_physics = false;
     m_initialVelocity = 0.0;
+    m_velocity = 0.0;
   }
 
   void AnimatedValue::retarget(double to, int durationMs, std::string_view curveName) {
@@ -859,7 +861,7 @@ namespace umbriel {
 
   double AnimatedValue::progress() const { return m_progress; }
 
-  bool AnimatedValue::tick(uint64_t nowMsec) {
+  bool AnimatedValue::tick(double nowMsec) {
     if (!m_animating) {
       return false;
     }
@@ -867,13 +869,11 @@ namespace umbriel {
       m_startMsec = nowMsec;
     }
 
-    const uint64_t elapsed = nowMsec - std::min(nowMsec, m_startMsec);
+    const double elapsed = std::max(0.0, nowMsec - m_startMsec);
 
     if (m_physics) {
       double velocity = 0.0;
-      m_current = solveSpringPhysics(
-          m_from, m_target, m_initialVelocity, static_cast<double>(elapsed) / 1000.0, m_curve.spring, &velocity
-      );
+      m_current = solveSpringPhysics(m_from, m_target, m_initialVelocity, elapsed / 1000.0, m_curve.spring, &velocity);
       m_velocity = velocity;
       const double span = m_target - m_from;
       m_progress = span != 0.0 ? std::clamp((m_current - m_from) / span, 0.0, 1.0) : 1.0;
@@ -884,10 +884,8 @@ namespace umbriel {
       return true;
     }
 
-    const double linear = std::clamp(static_cast<double>(elapsed) / static_cast<double>(m_durationMsec), 0.0, 1.0);
+    const double linear = std::clamp(elapsed / static_cast<double>(m_durationMsec), 0.0, 1.0);
     m_progress = linear;
-
-    const double prevCurrent = m_current;
 
     if (linear >= 1.0) {
       m_current = m_target;
@@ -899,8 +897,13 @@ namespace umbriel {
     const double eased = applyEasing(m_curve, linear);
     m_current = m_from + (m_target - m_from) * eased;
 
-    const double dtSec = std::max(0.001, static_cast<double>(elapsed) / 1000.0);
-    m_velocity = (m_current - prevCurrent) / dtSec;
+    // The curve's slope at this instant, in units per second, measured over one millisecond of curve time.
+    const double stepMs = 1.0;
+    const double before = std::max(0.0, linear - stepMs / static_cast<double>(m_durationMsec));
+    const double sloped = linear - before;
+    m_velocity = sloped > 0.0
+        ? (m_target - m_from) * (eased - applyEasing(m_curve, before)) / (sloped * m_durationMsec / 1000.0)
+        : 0.0;
 
     return true;
   }
@@ -965,7 +968,7 @@ namespace umbriel {
 
   double AnimatedColor::progress() const { return m_progress; }
 
-  bool AnimatedColor::tick(uint64_t nowMsec) {
+  bool AnimatedColor::tick(double nowMsec) {
     if (!m_animating) {
       return false;
     }
@@ -973,8 +976,8 @@ namespace umbriel {
       m_startMsec = nowMsec;
     }
 
-    const uint64_t elapsed = nowMsec - std::min(nowMsec, m_startMsec);
-    const double linear = std::clamp(static_cast<double>(elapsed) / static_cast<double>(m_durationMsec), 0.0, 1.0);
+    const double elapsed = std::max(0.0, nowMsec - m_startMsec);
+    const double linear = std::clamp(elapsed / static_cast<double>(m_durationMsec), 0.0, 1.0);
     m_progress = linear;
 
     if (linear >= 1.0) {

@@ -8,8 +8,20 @@ A node is therefore only usable if `umbrielfx` allocated it. Every scene helper
 that creates or destroys nodes has to live in `umbrielfx/types/scene/`, even the
 ones that are thin wrappers over wlroots types and carry no effects of their
 own: `surface.c`, `subsurface_tree.c`, `xdg_shell.c`, `layer_shell_v1.c`,
-`drag_icon.c`, `output_layout.c`. They are vendored from wlroots 0.20.2 and
-adapted only in their includes.
+`drag_icon.c`, `output_layout.c`. They are vendored from wlroots 0.20.2. The
+scene-node image capture helper in `capture.c` is also vendored and guarded:
+it creates and destroys a scene output, whose struct UmbrielFX extends. Its
+scale setter lets window captures follow the assigned output's render scale.
+When updating wlroots, compare its capture helper for relevant fixes as well
+as the node helpers.
+
+The surface helper also resolves Umbriel's committed color state before applying
+scene setters, keeping unchanged commits free of color reset and restore damage.
+Compositor opacity is retained in an addon on the window's content tree. Each
+scene surface combines its inherited multiplier with committed client alpha
+before its setter runs. Late subsurfaces and popups inherit it automatically,
+without a per-commit window walk, a public struct layout change, or sharing
+desktop opacity with a separate window-capture scene.
 
 ## Why borrowing them looked fine
 
@@ -75,7 +87,7 @@ resolves to /usr/lib/x86_64-linux-gnu/libwlroots-0.20.so instead of umbrielfx
 (./build-debug/umbriel).
 ```
 
-To reproduce, drop one of the six from `umbrielfx_sources` in
+To reproduce, drop one of the guarded helpers from `umbrielfx_sources` in
 `umbrielfx/meson.build` and start the compositor.
 
 The guard exists because the failure is otherwise silent: the compositor starts,

@@ -16,6 +16,7 @@
 #include "scene/cheatsheet.h"
 #include "scene/hint_rect.h"
 #include "scene/quit_confirm.h"
+#include "scene/ssd_frame.h"
 #include "server/server.h"
 #include "view/size_hints.h"
 #include "view/view.h"
@@ -41,6 +42,11 @@ namespace umbriel {
     constexpr double kHotCornerExtent = 8.0;
     constexpr int kDataDragEdgeScrollTickMs = 16;
     constexpr uint32_t kDataDragEdgeScrollMaxElapsedMs = 50;
+    // Mod+right-click pairing and the motion threshold that promotes its
+    // deferred resize grab share one boundary: inside it a press may still
+    // pair up, so no grab may run and drop the layout's maximize bookkeeping.
+    constexpr uint32_t kDoubleClickMsec = 300;
+    constexpr double kDoubleClickSlop = 8.0;
 
     // Panels (top/overlay) keep working inside the overview. Background- and bottom-layer surfaces are part of the
     // inert backdrop behind the filmstrip, so their clicks belong to the overview instead.
@@ -184,6 +190,9 @@ namespace umbriel {
   }
 
   Cursor::~Cursor() {
+    if (m_snapDwellTimer != nullptr) {
+      wl_event_source_remove(m_snapDwellTimer);
+    }
     if (m_dataDragEdgeScrollTimer != nullptr) {
       wl_event_source_remove(m_dataDragEdgeScrollTimer);
     }
@@ -930,6 +939,9 @@ namespace umbriel {
     if (const auto* grab = std::get_if<TiledResizeGrab>(&m_grab)) {
       return grab->view;
     }
+    if (const auto* grab = std::get_if<PendingResizeGrab>(&m_grab)) {
+      return grab->view;
+    }
     return nullptr;
   }
 
@@ -946,18 +958,28 @@ namespace umbriel {
     return grab != nullptr && !grab->pending && grab->target == DragTarget::Tiled;
   }
 
+  bool Cursor::isResizingView(const View* view) const {
+    if (view == nullptr) {
+      return false;
+    }
+    if (const auto* grab = std::get_if<FloatingResizeGrab>(&m_grab)) {
+      return grab->view == view;
+    }
+    const auto* grab = std::get_if<TiledResizeGrab>(&m_grab);
+    return grab != nullptr && grab->view == view;
+  }
+
   bool Cursor::isResizingWorkspace(const Workspace* workspace) const {
     const auto* grab = std::get_if<TiledResizeGrab>(&m_grab);
     return workspace != nullptr && grab != nullptr && grab->workspace == workspace;
   }
 
-  bool Cursor::beginMove(View* view, uint32_t button, bool deferred) {
+  bool Cursor::beginMove(View* view, uint32_t button, bool deferUntilThreshold) {
     if (view == nullptr || !view->mapped() || button == 0) {
       return false;
     }
-    // A modal dialog has no place of its own: dragging it drags the window it is attached to, tiled or floating, and
-    // the dialog stays centered on it.
-    view = view->attachedRoot();
+    // An attached dialog's place is its parent's, so dragging it drags the window it lives in.
+    view = view->placementRoot();
     if (!isPassthrough()) {
       resetMode();
     }
@@ -969,6 +991,9 @@ namespace umbriel {
       tiled = false;
     }
 
+    if (!tiled && (view->snapRegion() || view->floatingMaximized())) {
+      deferUntilThreshold = true;
+    }
     setActiveConstraint(nullptr);
     const bool pinned = !tiled && view->pinned();
     // A pinned window is floating, but it remembers whether it was tiled when
@@ -976,15 +1001,23 @@ namespace umbriel {
     const bool tiledUnderneath = tiled || (pinned && view->restoresTiledOnUnpin());
     MoveGrab grab{
         .view = view,
-        .offsetX = m_cursor->x - view->sceneTree()->node.x,
-        .offsetY = m_cursor->y - view->sceneTree()->node.y,
+        .offsetX = m_cursor->x - view->layoutX(),
+        .offsetY = m_cursor->y - view->layoutY(),
         .target = tiled ? DragTarget::Tiled : (pinned ? DragTarget::Pinned : DragTarget::Floating),
+        .floatingLayout = !tiled
+            && !pinned
+            && view->workspace() != nullptr
+            && view->workspace()->layoutMode() == LayoutMode::Floating,
         .unpinned = tiledUnderneath ? DragTarget::Tiled : DragTarget::Floating,
         .sourceWorkspace = tiled ? view->workspace() : nullptr,
         .sourceColumn = -1,
         .sourceWidth = std::nullopt,
         .drop = {},
-        .pending = tiled || deferred,
+        .snap = std::nullopt,
+        .preDragX = view->layoutTargetX(),
+        .preDragY = view->layoutTargetY(),
+        .preDragArea = view->floatingUsableArea(),
+        .pending = tiled || deferUntilThreshold,
         .startX = m_cursor->x,
         .startY = m_cursor->y,
         .lastX = m_cursor->x,
@@ -1008,6 +1041,36 @@ namespace umbriel {
     return true;
   }
 
+  void Cursor::beginToplevelDrag(View* view, int x, int y, bool tileOnDrop) {
+    const uint32_t button = m_server->seat()->wlr()->pointer_state.grab_button;
+    if (!beginMove(view, button)) {
+      return;
+    }
+    m_toplevelDrag = true;
+    auto& grab = std::get<MoveGrab>(m_grab);
+    grab.offsetX = x;
+    grab.offsetY = y;
+    if (tileOnDrop && !view->pinned()) {
+      grab.target = DragTarget::Tiled;
+      grab.sourceWorkspace = view->workspace();
+    }
+    if (grab.pending) {
+      beginDrag(grab);
+    }
+    processMotion(monotonicMsec(), m_cursor->x, m_cursor->y, false);
+  }
+
+  void Cursor::finishToplevelDrag(bool place) {
+    if (!m_toplevelDrag) {
+      return;
+    }
+    if (place && !m_server->sessionLocked()) {
+      finishMove();
+    } else {
+      resetMode();
+    }
+  }
+
   bool Cursor::beginResize(View* view, uint32_t edges, uint32_t button) {
     if (view == nullptr || !view->mapped() || button == 0) {
       return false;
@@ -1017,7 +1080,7 @@ namespace umbriel {
     }
     bool tiled = view->tiled();
     if (ScratchpadManager* scratchpad = m_server->scratchpadManager();
-        scratchpad != nullptr && scratchpad->contains(view)) {
+        scratchpad != nullptr && !view->attached() && scratchpad->contains(view)) {
       view->setFloating(true);
       tiled = false;
     }
@@ -1033,18 +1096,10 @@ namespace umbriel {
       if (edges != 0) {
         resolvedEdges = layout.resolveResizeEdges(view, edges, m_cursor->x, m_cursor->y);
       } else {
-        const wlr_box presented = workspace->presentedTiledBox(view);
-        const wlr_box visible = workspace->usableArea();
-        wlr_box reachable{};
-        if (wlr_box_intersection(&reachable, &presented, &visible)) {
-          resolvedEdges = layout.sanitizeResizeEdges(view, resizeEdgesForPoint(reachable, m_cursor->x, m_cursor->y));
-        }
+        resolvedEdges = tiledResizeEdges(view, m_cursor->x, m_cursor->y);
       }
       if (resolvedEdges == 0) {
-        if (workspace->focusedView() == view) {
-          workspace->ensureFocusedVisible();
-          workspace->markArrange(true);
-        }
+        revealClickedTile(view);
         refreshInteractiveCursor();
         return false;
       }
@@ -1083,16 +1138,14 @@ namespace umbriel {
     }
 
     const wlr_box& geometry = view->geometryBox();
-    const double borderX =
-        (view->sceneTree()->node.x + geometry.x) + ((edges & WLR_EDGE_RIGHT) != 0 ? geometry.width : 0);
-    const double borderY =
-        (view->sceneTree()->node.y + geometry.y) + ((edges & WLR_EDGE_BOTTOM) != 0 ? geometry.height : 0);
+    const double borderX = (view->layoutX() + geometry.x) + ((edges & WLR_EDGE_RIGHT) != 0 ? geometry.width : 0);
+    const double borderY = (view->layoutY() + geometry.y) + ((edges & WLR_EDGE_BOTTOM) != 0 ? geometry.height : 0);
     m_grab = FloatingResizeGrab{
         .view = view,
         .offsetX = m_cursor->x - borderX,
         .offsetY = m_cursor->y - borderY,
-        .geometryX = geometry.x + view->sceneTree()->node.x,
-        .geometryY = geometry.y + view->sceneTree()->node.y,
+        .geometryX = geometry.x + view->layoutX(),
+        .geometryY = geometry.y + view->layoutY(),
         .geometryWidth = geometry.width,
         .geometryHeight = geometry.height,
         .edges = edges,
@@ -1199,6 +1252,7 @@ namespace umbriel {
   }
 
   void Cursor::resetMode() {
+    clearSnapPreview();
     m_server->hideInsertHint();
     cancelDataDragEdgeScroll();
     View* view = grabbedView();
@@ -1215,6 +1269,7 @@ namespace umbriel {
     if (std::holds_alternative<FloatingResizeGrab>(m_grab) && view != nullptr) {
       view->finishFloatingResize();
     }
+    m_toplevelDrag = false;
     m_grab = PassthroughGrab{};
     m_grabButton = 0;
     if (restoreDragPresentation && view != nullptr) {
@@ -1237,6 +1292,17 @@ namespace umbriel {
   }
 
   void Cursor::cancelStaleTiledResize() {
+    if (const auto* pending = std::get_if<PendingResizeGrab>(&m_grab); pending != nullptr) {
+      // The deferred press carries press-time edges; a layout swap since then
+      // makes them mean something else.
+      if (pending->view == nullptr
+          || (pending->layout != nullptr
+              && (pending->view->workspace() != pending->workspace
+                  || &pending->workspace->layout() != pending->layout))) {
+        resetMode();
+      }
+      return;
+    }
     const auto* grab = std::get_if<TiledResizeGrab>(&m_grab);
     if (grab != nullptr
         && (grab->workspace == nullptr
@@ -1249,7 +1315,10 @@ namespace umbriel {
   void Cursor::cancelLayoutInteraction() {
     // An axis change keeps the same layout object, so cancelStaleTiledResize()
     // cannot see it; the session's edges would still mean the old orientation.
-    if (std::holds_alternative<ScrollDragGrab>(m_grab) || std::holds_alternative<TiledResizeGrab>(m_grab)) {
+    // A deferred resize press stores the same kind of press-time edges.
+    if (std::holds_alternative<ScrollDragGrab>(m_grab)
+        || std::holds_alternative<TiledResizeGrab>(m_grab)
+        || std::holds_alternative<PendingResizeGrab>(m_grab)) {
       resetMode();
     }
   }
@@ -1310,6 +1379,7 @@ namespace umbriel {
     }
 
     confineRuleDelta(&dx, &dy);
+    promotePendingModRightResize(m_cursor->x + dx, m_cursor->y + dy);
     const double oldX = m_cursor->x;
     const double oldY = m_cursor->y;
     wlr_cursor_move(m_cursor, &event->pointer->base, dx, dy);
@@ -1341,6 +1411,7 @@ namespace umbriel {
       return;
     }
     confineRuleDelta(&dx, &dy);
+    promotePendingModRightResize(m_cursor->x + dx, m_cursor->y + dy);
     wlr_cursor_move(m_cursor, &event->pointer->base, dx, dy);
     processMotion(event->time_msec, oldX, oldY);
   }
@@ -1348,6 +1419,36 @@ namespace umbriel {
   void Cursor::handleButton(void* data) {
     auto* event = static_cast<wlr_pointer_button_event*>(data);
     processButton(event->time_msec, event->button, event->state);
+  }
+
+  bool Cursor::isModRightDoubleClick(uint32_t timeMsec, const View* view) const {
+    return m_lastModRightClick.view == view
+        && timeMsec - m_lastModRightClick.timeMsec <= kDoubleClickMsec
+        && std::abs(m_cursor->x - m_lastModRightClick.x) <= kDoubleClickSlop
+        && std::abs(m_cursor->y - m_lastModRightClick.y) <= kDoubleClickSlop;
+  }
+
+  void Cursor::recordModRightClick(uint32_t timeMsec, View* view) {
+    m_lastModRightClick = ModRightClick{timeMsec, m_cursor->x, m_cursor->y, view};
+  }
+
+  void Cursor::promotePendingModRightResize(double nextX, double nextY) {
+    const auto* pending = std::get_if<PendingResizeGrab>(&m_grab);
+    if (pending == nullptr) {
+      return;
+    }
+    if (m_server->sessionLocked()) {
+      resetMode();
+      return;
+    }
+    if (std::abs(nextX - pending->startX) <= kDoubleClickSlop
+        && std::abs(nextY - pending->startY) <= kDoubleClickSlop) {
+      return;
+    }
+    const PendingResizeGrab grab = *pending;
+    // A drag is not a double-click's first press.
+    m_lastModRightClick = ModRightClick{};
+    beginResize(grab.view, grab.edges, grab.button);
   }
 
   void Cursor::processButton(uint32_t timeMsec, uint32_t button, wl_pointer_button_state state) {
@@ -1402,6 +1503,26 @@ namespace umbriel {
         }
         m_swallowedButtons.push_back(button);
         return;
+      }
+    }
+    if (state == WL_POINTER_BUTTON_STATE_RELEASED && button == BTN_LEFT && m_ssdButtonPress.view != nullptr) {
+      const SsdButtonPress press = m_ssdButtonPress;
+      m_ssdButtonPress = {};
+      if (press.view->ssdFrame() != nullptr)
+        press.view->ssdFrame()->setPressed(SsdFramePart::None);
+      const auto hit = m_server->ssdFrameAt(m_cursor->x, m_cursor->y);
+      if (hit
+          && hit->view == press.view
+          && hit->part == press.part
+          && m_server->exclusiveKeyboardLayer() == nullptr
+          && !press.view->blocked()) {
+        if (press.part == SsdFramePart::Close) {
+          press.view->requestClose();
+        } else if (press.part == SsdFramePart::Maximize && press.view->ssdFrame()->maximizeEnabled()) {
+          const bool maximized =
+              press.view->maximizedToEdges() || press.view->scheduledMaximized() || press.view->floatingMaximized();
+          press.view->setMaximizedLikeClientRequest(!maximized);
+        }
       }
     }
     if (state == WL_POINTER_BUTTON_STATE_RELEASED && std::erase(m_swallowedButtons, button) > 0) {
@@ -1499,18 +1620,22 @@ namespace umbriel {
         resetMode();
         return;
       }
+      if (const auto* pending = std::get_if<PendingResizeGrab>(&m_grab)) {
+        revealClickedTile(pending->view);
+        // A deferred Mod+right resize that never left the click's slop ends as
+        // a plain click. Its press reached no client, so swallow the release
+        // too rather than deliver an unmatched one; the click pair stays
+        // recorded for the double-click.
+        resetMode();
+        return;
+      }
       m_server->seat()->notifyPointerModifiers();
       wlr_seat_pointer_notify_button(m_server->seat()->wlr(), timeMsec, button, state);
 
       // After the final release, realign pointer focus (pinned by the implicit grab) with the surface under the cursor,
-      // so a press without intervening motion targets it. The overview keeps the desktop inert, so focus goes nowhere.
+      // retaining panel focus in overview so release-driven menus keep their pointer anchor.
       if (m_server->seat()->wlr()->pointer_state.button_count == 0) {
-        const Overview* overview = m_server->overview();
-        if (overview != nullptr && overview->active() && !m_server->sessionLocked()) {
-          clearPointerFocus();
-        } else {
-          refreshPointerFocus();
-        }
+        refreshPointerFocus();
       }
 
       resetMode();
@@ -1544,6 +1669,48 @@ namespace umbriel {
         }
       }
       return;
+    }
+
+    // Scene hit testing lets covered chrome stay covered by windows and panels.
+    if (m_server->exclusiveKeyboardLayer() == nullptr
+        && isPassthrough()
+        && !wlr_seat_pointer_has_grab(m_server->seat()->wlr())) {
+      if (const auto hit = m_server->ssdFrameAt(m_cursor->x, m_cursor->y)) {
+        View* target = hit->view;
+        clearPointerFocus();
+        if (button == BTN_LEFT && hit->part == SsdFramePart::Resize) {
+          m_server->focusView(target, FocusReason::Grab);
+          if (beginResize(target, hit->edges, button))
+            return;
+        } else if (button == BTN_LEFT && hit->part == SsdFramePart::TitleBar) {
+          m_server->focusView(target, FocusReason::PointerPress);
+          const double dx = m_cursor->x - m_lastTitleBarClick.x;
+          const double dy = m_cursor->y - m_lastTitleBarClick.y;
+          if (m_lastTitleBarClick.view == target
+              && timeMsec - m_lastTitleBarClick.timeMsec <= kDoubleClickMsec
+              && dx * dx + dy * dy <= kDoubleClickSlop * kDoubleClickSlop) {
+            m_lastTitleBarClick = {};
+            const bool maximized =
+                target->maximizedToEdges() || target->scheduledMaximized() || target->floatingMaximized();
+            target->setMaximizedLikeClientRequest(!maximized);
+          } else {
+            m_lastTitleBarClick = {timeMsec, m_cursor->x, m_cursor->y, target};
+            if (beginMove(target, button, true))
+              return;
+          }
+        } else if (
+            button == BTN_LEFT
+            && !target->blocked()
+            && (hit->part == SsdFramePart::Close
+                || (hit->part == SsdFramePart::Maximize && target->ssdFrame()->maximizeEnabled()))
+        ) {
+          m_server->focusView(target, FocusReason::PointerPress);
+          m_ssdButtonPress = {target, hit->part};
+          target->ssdFrame()->setPressed(hit->part);
+        }
+        m_swallowedButtons.push_back(button);
+        return;
+      }
     }
 
     // A press on a tab bar is the compositor's: no client sees it or its release. The left button selects the tab and
@@ -1580,14 +1747,45 @@ namespace umbriel {
     }
     if (button == BTN_RIGHT && modHeld && view != nullptr) {
       m_server->focusView(view, FocusReason::Grab);
-      beginResize(view, view->tiled() ? 0 : floatResizeEdges(view), button);
-      return;
-    }
-    // A window blocked by a modal dialog cannot use the press, so dragging it moves it the way Mod+drag does. Until the
-    // pointer travels, the press is a plain click that lands the focus on the dialog.
-    if (button == BTN_LEFT && view != nullptr && layer == nullptr && view->blockingDialog() != nullptr) {
-      m_server->focusView(view, FocusReason::Grab);
-      beginMove(view, button, true);
+      if (config().input.modRightDoubleClick == ModRightDoubleClick::None) {
+        beginResize(view, view->tiled() ? 0 : floatResizeEdges(view), button);
+        return;
+      }
+      // A second Mod+right-click on the same window within the double-click
+      // window applies the opposite maximize state with a titlebar
+      // double-click's semantics. The direction is read at this press: the
+      // first press only holds a deferred grab (below), so no grab has
+      // perturbed the maximize state in between.
+      if (isModRightDoubleClick(timeMsec, view)) {
+        // Completing a pair clears the record so a third rapid click starts a
+        // fresh window. No grab owns this press, so its release would reach the
+        // client unmatched; swallow both like the tab-bar path does.
+        m_lastModRightClick = ModRightClick{};
+        m_swallowedButtons.push_back(button);
+        const bool wasMaximized = view->maximizedToEdges() || view->scheduledMaximized() || view->floatingMaximized();
+        view->setMaximizedLikeClientRequest(!wasMaximized);
+        return;
+      }
+      recordModRightClick(timeMsec, view);
+      // Defer the grab until the pointer leaves the slop: a grab would drop the
+      // maximize state the second click reads. Edges are snapshotted at the
+      // press point; a press proposing none is a plain click.
+      const uint32_t edges = view->tiled() ? tiledResizeEdges(view, m_cursor->x, m_cursor->y) : floatResizeEdges(view);
+      if (edges != 0) {
+        m_grab = PendingResizeGrab{
+            .view = view,
+            .button = button,
+            .startX = m_cursor->x,
+            .startY = m_cursor->y,
+            .edges = edges,
+            .workspace = view->tiled() ? view->workspace() : nullptr,
+            .layout = view->tiled() && view->workspace() != nullptr ? &view->workspace()->layout() : nullptr,
+        };
+        m_grabButton = button;
+        updateInteractiveCursor(view);
+      } else if (view->tiled()) {
+        revealClickedTile(view);
+      }
       return;
     }
 
@@ -1922,6 +2120,9 @@ namespace umbriel {
   void Cursor::processMotion(uint32_t timeMsec, double oldX, double oldY, bool allowFocusChange) {
     updateHotCorner();
     forwardEffectPointer();
+    if (const wlr_drag* drag = m_server->seat()->wlr()->drag; drag != nullptr && drag->dropped) {
+      return;
+    }
     if (auto* grab = std::get_if<ScrollDragGrab>(&m_grab)) {
       if (m_server->sessionLocked()) {
         m_server->gestures()->endPointerScroll(true, timeMsec);
@@ -1976,8 +2177,17 @@ namespace umbriel {
         }
         processMove();
         updateDropTarget();
+        if (config().input.windowSnapping && grab->target == DragTarget::Floating && !m_toplevelDrag) {
+          updateSnapPreview();
+        } else {
+          clearSnapPreview();
+        }
         updateDataDragEdgeScroll();
-        return;
+        // A toplevel drag moves a real window while wlroots keeps delivering
+        // data-device enter and motion to the surfaces underneath it.
+        if (!m_toplevelDrag) {
+          return;
+        }
       }
     }
     if (std::holds_alternative<FloatingResizeGrab>(m_grab)) {
@@ -1995,6 +2205,14 @@ namespace umbriel {
         processResizeTile();
         return;
       }
+    }
+    if (std::holds_alternative<PendingResizeGrab>(m_grab)) {
+      // Motion inside the slop belongs to the deferred press, not to clients
+      // or focus-follows-mouse.
+      if (!m_server->sessionLocked()) {
+        return;
+      }
+      resetMode();
     }
 
     wlr_seat* seat = m_server->seat()->wlr();
@@ -2045,6 +2263,21 @@ namespace umbriel {
       );
     }
 
+    const auto frameHit = m_server->ssdFrameAt(m_cursor->x, m_cursor->y);
+    View* frameView = frameHit ? frameHit->view : nullptr;
+    if (m_ssdHoverView != frameView && m_ssdHoverView != nullptr && m_ssdHoverView->ssdFrame() != nullptr) {
+      m_ssdHoverView->ssdFrame()->setHovered(SsdFramePart::None);
+    }
+    m_ssdHoverView = frameView;
+    if (frameView != nullptr)
+      frameView->ssdFrame()->setHovered(frameHit->part);
+    if (m_ssdButtonPress.view != nullptr && m_ssdButtonPress.view->ssdFrame() != nullptr) {
+      m_ssdButtonPress.view->ssdFrame()->setPressed(
+          frameHit && frameView == m_ssdButtonPress.view && frameHit->part == m_ssdButtonPress.part
+              ? m_ssdButtonPress.part
+              : SsdFramePart::None
+      );
+    }
     updateConstraintForSurface(surface);
     updateInteractiveCursor(view);
   }
@@ -2089,9 +2322,9 @@ namespace umbriel {
     // invalidated hover must not immediately focus it again. A real re-entry (or a click) can still focus it.
     const bool entered = view != oldView || (refocus && !ruleConstraintApplies(*view));
     // Workspace focus is remembered independently from the seat. A pinned window from another workspace can own the
-    // seat while this view remains its active workspace's remembered focus, so only seat-global activation makes this
-    // handoff redundant.
-    const bool alreadyFocused = view->activated();
+    // seat while this view remains its active workspace's remembered focus, so only seat-global activation of the
+    // window that would take the keyboard (a dialog attached to this one) makes this handoff redundant.
+    const bool alreadyFocused = view->placementRoot()->inputDelegate()->activated();
     if (entered && !alreadyFocused) {
       m_server->focusView(view, FocusReason::PointerHover);
       // Scroll may have moved another surface under the cursor; refresh hit-test for
@@ -2412,7 +2645,8 @@ namespace umbriel {
       return;
     }
     grab->view->setDragPosition(
-        static_cast<int>(m_cursor->x - grab->offsetX), static_cast<int>(m_cursor->y - grab->offsetY)
+        static_cast<int>(m_cursor->x - grab->offsetX), static_cast<int>(m_cursor->y - grab->offsetY),
+        grab->floatingLayout
     );
     if (grab->physics) {
       grab->view->moveDragPhysics(m_cursor->x - grab->lastX, m_cursor->y - grab->lastY);
@@ -2434,6 +2668,22 @@ namespace umbriel {
   }
 
   void Cursor::beginDrag(MoveGrab& grab) {
+    if (grab.target == DragTarget::Floating && (grab.view->floatingMaximized() || grab.view->snapRegion())) {
+      View* view = grab.view;
+      const int width = view->floatingSize()[0];
+      const double fraction = width > 0 ? std::clamp((grab.startX - view->layoutX()) / width, 0.0, 1.0) : 0.5;
+      view->restoreMaximizedForMove();
+      view->unsnap(false);
+      grab.preDragX = view->layoutTargetX();
+      grab.preDragY = view->layoutTargetY();
+      const auto restored = view->floatingSize();
+      grab.offsetX = fraction * restored[0];
+      const int h = view->titleBarHeight();
+      if (h > 0)
+        grab.offsetY = std::clamp(grab.offsetY, -static_cast<double>(h), -1.0);
+      view->setDragPosition(m_cursor->x - grab.offsetX, m_cursor->y - grab.offsetY, grab.floatingLayout);
+    }
+    m_lastTitleBarClick = {};
     grab.pending = false;
     if (grab.sourceWorkspace != nullptr) {
       grab.sourceWorkspace->layoutDetach(grab.view);
@@ -2485,6 +2735,102 @@ namespace umbriel {
     grab->view->raiseToTop();
   }
 
+  void Cursor::clearSnapPreview() {
+    if (m_snapDwellTimer != nullptr) {
+      wl_event_source_timer_update(m_snapDwellTimer, 0);
+    }
+    if (auto* grab = std::get_if<MoveGrab>(&m_grab)) {
+      if (grab->snap) {
+        m_server->hideInsertHint();
+      }
+      grab->snap.reset();
+      grab->snapOutput = nullptr;
+      grab->dwellOutput = nullptr;
+      grab->dwellEdges = 0;
+      grab->dwellReady = false;
+    }
+  }
+
+  int Cursor::onSnapDwellTimer(void* data) {
+    auto* self = static_cast<Cursor*>(data);
+    if (auto* grab = std::get_if<MoveGrab>(&self->m_grab)) {
+      grab->dwellReady = true;
+      self->updateSnapPreview();
+    }
+    return 0;
+  }
+
+  void Cursor::updateSnapPreview() {
+    auto* grab = std::get_if<MoveGrab>(&m_grab);
+    if (grab == nullptr
+        || grab->pending
+        || grab->target != DragTarget::Floating
+        || m_toplevelDrag
+        || !config().input.windowSnapping
+        || m_server->seat()->wlr()->drag != nullptr
+        || !grab->view->canSnap()) {
+      clearSnapPreview();
+      return;
+    }
+    Output* output =
+        m_server->outputFromWlr(wlr_output_layout_output_at(m_server->outputLayout(), m_cursor->x, m_cursor->y));
+    if (output == nullptr || output->workspaceGroup() == nullptr) {
+      clearSnapPreview();
+      return;
+    }
+    const wlr_box area = output->layoutBox();
+    uint32_t shared = 0;
+    const auto adjacent = [&](double x, double y) {
+      wlr_output* other = wlr_output_layout_output_at(m_server->outputLayout(), x, y);
+      return other != nullptr && other != output->wlr();
+    };
+    if (m_cursor->x - area.x < kSnapEdge && adjacent(area.x - 1, m_cursor->y))
+      shared |= WLR_EDGE_LEFT;
+    if (area.x + area.width - m_cursor->x <= kSnapEdge && adjacent(area.x + area.width, m_cursor->y))
+      shared |= WLR_EDGE_RIGHT;
+    if (m_cursor->y - area.y < kSnapEdge && adjacent(m_cursor->x, area.y - 1))
+      shared |= WLR_EDGE_TOP;
+    if (area.y + area.height - m_cursor->y <= kSnapEdge && adjacent(m_cursor->x, area.y + area.height))
+      shared |= WLR_EDGE_BOTTOM;
+    if (grab->dwellOutput != output || grab->dwellEdges != shared) {
+      if (m_snapDwellTimer != nullptr)
+        wl_event_source_timer_update(m_snapDwellTimer, 0);
+      grab->dwellOutput = output;
+      grab->dwellEdges = shared;
+      grab->dwellReady = false;
+      if (shared != 0) {
+        if (m_snapDwellTimer == nullptr) {
+          m_snapDwellTimer =
+              wl_event_loop_add_timer(wl_display_get_event_loop(m_server->display()), onSnapDwellTimer, this);
+        }
+        if (m_snapDwellTimer != nullptr)
+          wl_event_source_timer_update(m_snapDwellTimer, kSnapDwellMs);
+      }
+    }
+    const auto hit = snapZoneAt(area, m_cursor->x, m_cursor->y, grab->dwellReady ? 0 : shared);
+    if (!hit) {
+      grab->snap.reset();
+      grab->snapOutput = nullptr;
+      m_server->hideInsertHint();
+      return;
+    }
+    const Workspace* workspace = output->workspaceGroup()->active();
+    const auto* layout = workspace != nullptr ? &workspace->layoutConfig() : nullptr;
+    std::optional<wlr_box> content = grab->view->floatingSnappedBox(*hit, output->usableArea(), layout);
+    if (!content || content->width <= 0 || content->height <= 0) {
+      grab->snap.reset();
+      grab->snapOutput = nullptr;
+      m_server->hideInsertHint();
+      return;
+    }
+    const int bar = grab->view->titleBarHeight();
+    content->y -= bar;
+    content->height += bar;
+    grab->snap = hit;
+    grab->snapOutput = output;
+    m_server->insertHint().show(output, *content, config().appearance.cornerRadius);
+  }
+
   void Cursor::finishMove() {
     auto* grab = std::get_if<MoveGrab>(&m_grab);
     if (grab == nullptr || grab->view == nullptr || !grab->view->mapped()) {
@@ -2498,12 +2844,19 @@ namespace umbriel {
     // Where the drag left the window. Read before the state change: becoming
     // floating re-places the window at its remembered origin, immediately when
     // position animations are off.
-    const int dropX = view->sceneTree()->node.x;
-    const int dropY = view->sceneTree()->node.y;
+    const int dropX = view->layoutX();
+    const int dropY = view->layoutY();
     // State first, placement second: a window that refused the drag's target
     // (a fullscreen window cannot be pinned) is still tiled here and drops back
     // into the layout rather than staying detached.
-    applyDragTarget(*grab);
+    Output* destination =
+        m_server->outputFromWlr(wlr_output_layout_output_at(m_server->outputLayout(), m_cursor->x, m_cursor->y));
+    Workspace* workspace = destination != nullptr ? destination->workspaceGroup()->active() : nullptr;
+    if (grab->target == DragTarget::Tiled && workspace != nullptr && workspace->layoutMode() == LayoutMode::Floating) {
+      view->floatForLayout();
+    } else {
+      applyDragTarget(*grab);
+    }
     if (view->tiled()) {
       finishTileMove();
     } else {
@@ -2558,6 +2911,13 @@ namespace umbriel {
   }
 
   void Cursor::finishFloatMove(int x, int y) {
+    const auto* grab = std::get_if<MoveGrab>(&m_grab);
+    const auto snap = grab != nullptr && config().input.windowSnapping ? grab->snap : std::nullopt;
+    Output* snapOutput = grab != nullptr ? grab->snapOutput : nullptr;
+    const int preDragX = grab != nullptr ? grab->preDragX : x;
+    const int preDragY = grab != nullptr ? grab->preDragY : y;
+    const wlr_box preDragArea = grab != nullptr ? grab->preDragArea : wlr_box{};
+    const bool floatingLayout = grab != nullptr && grab->floatingLayout;
     View* view = grabbedView();
     if (view == nullptr || !view->mapped()) {
       resetMode();
@@ -2575,12 +2935,26 @@ namespace umbriel {
         target->exitFullscreenForIncomingView(view);
       }
     }
-    // Drag presentation moves only the scene node. Commit its final position
-    // after any workspace transfer so later restores use the dropped origin.
-    view->setPosition(x, y);
+    // Commit the final position after any workspace transfer, including drags whose target was deferred until
+    // release, so later restores use the dropped origin.
+    const FloatingPoint reachable = keepTitleBarReachable({x, y}, view->titleBarHeight(), view->floatingUsableArea());
+    view->setPosition(reachable.x, reachable.y);
     view->rememberFloatingPosition();
 
     resetMode();
+    if (snap && snapOutput == output && view->canSnap()) {
+      FloatingGeometry normalPosition;
+      normalPosition.rememberPositionFraction({preDragX, preDragY}, preDragArea);
+      const auto restore =
+          normalPosition.restoredOrigin(view->floatingUsableArea()).value_or(FloatingPoint{preDragX, preDragY});
+      if (!floatingLayout) {
+        view->setPosition(restore.x, restore.y);
+      }
+      if (!view->snapTo(*snap, floatingLayout ? std::optional{restore} : std::nullopt)) {
+        // Client constraints can change after the preview was drawn. Keep the free drop when it no longer fits.
+        view->setPosition(reachable.x, reachable.y);
+      }
+    }
     m_server->focusView(view, FocusReason::DragDrop);
   }
 
@@ -2608,6 +2982,7 @@ namespace umbriel {
       beginDrag(*grab);
     }
 
+    clearSnapPreview();
     if (toggle == WindowDragToggle::Pinned) {
       grab->target = grab->target == DragTarget::Pinned ? grab->unpinned : DragTarget::Pinned;
     } else {
@@ -2699,13 +3074,49 @@ namespace umbriel {
     grab->view->resizeFloating(newRight - newLeft, newBottom - newTop);
   }
 
+  void Cursor::revealClickedTile(View* view) {
+    Workspace* workspace = view->workspace();
+    if (view->tiled() && workspace != nullptr && workspace->focusedView() == view) {
+      workspace->ensureFocusedVisible();
+      workspace->markArrange(true);
+    }
+  }
+
+  uint32_t Cursor::tiledResizeEdges(View* view, double x, double y) const {
+    Workspace* workspace = view->workspace();
+    if (workspace == nullptr || workspace->group() == nullptr || workspace->group()->output() == nullptr) {
+      return 0;
+    }
+    const wlr_box presented = workspace->presentedTiledBox(view);
+    const wlr_box visible = workspace->usableArea();
+    wlr_box reachable{};
+    if (!wlr_box_intersection(&reachable, &presented, &visible)) {
+      return 0;
+    }
+    return workspace->layout().sanitizeResizeEdges(view, resizeEdgesForPoint(reachable, x, y));
+  }
+
+  void Cursor::forgetView(const View* view) {
+    if (m_lastTitleBarClick.view == view)
+      m_lastTitleBarClick = {};
+    if (m_ssdButtonPress.view == view)
+      m_ssdButtonPress = {};
+    if (m_ssdHoverView == view)
+      m_ssdHoverView = nullptr;
+    // Only the click pair sits outside the grab machinery: the deferred press
+    // is a grab and handleUnmap's resetMode() drops it.
+    if (m_lastModRightClick.view == view) {
+      m_lastModRightClick = ModRightClick{};
+    }
+  }
+
   uint32_t Cursor::floatResizeEdges(View* view) const {
     if (view == nullptr || view->sceneTree() == nullptr) {
       return WLR_EDGE_RIGHT | WLR_EDGE_BOTTOM;
     }
     const wlr_box& geo = view->geometryBox();
-    const int x = view->sceneTree()->node.x + geo.x;
-    const int y = view->sceneTree()->node.y + geo.y;
+    const int x = view->layoutX() + geo.x;
+    const int y = view->layoutY() + geo.y;
     const wlr_box box{.x = x, .y = y, .width = geo.width, .height = geo.height};
     return resizeEdgesForPoint(box, m_cursor->x, m_cursor->y);
   }
@@ -2722,8 +3133,8 @@ namespace umbriel {
         return 0;
       }
       const wlr_box& geo = view->geometryBox();
-      const double left = view->sceneTree()->node.x + geo.x;
-      const double top = view->sceneTree()->node.y + geo.y;
+      const double left = view->layoutX() + geo.x;
+      const double top = view->layoutY() + geo.y;
       const double right = left + geo.width;
       const double bottom = top + geo.height;
       const double distLeft = std::abs(m_cursor->x - left);
@@ -2827,6 +3238,11 @@ namespace umbriel {
       return;
     }
     wlr_seat* seat = m_server->seat()->wlr();
+    // Drop placement can change the scene before wlroots releases its grab.
+    // Retargeting then would invalidate the offer the recipient must finish.
+    if (seat->drag != nullptr && seat->drag->dropped) {
+      return;
+    }
     if (surface == seat->pointer_state.focused_surface) {
       wlr_seat_pointer_notify_motion(seat, timeMsec, sx, sy);
     } else {
@@ -2847,7 +3263,14 @@ namespace umbriel {
     double sx = 0;
     double sy = 0;
     wlr_surface* surface = nullptr;
-    m_server->viewAt(m_cursor->x, m_cursor->y, &surface, &sx, &sy);
+    LayerSurface* layer = nullptr;
+    m_server->viewAt(m_cursor->x, m_cursor->y, &surface, &sx, &sy, &layer);
+    if (const Overview* overview = m_server->overview(); overview != nullptr
+        && overview->active()
+        && !m_server->sessionLocked()
+        && (overview->dragging() || !overviewPassthroughLayer(layer))) {
+      surface = nullptr;
+    }
     const bool stale = !pointerFocusPinned() && pointerContentsStale(surface, sx, sy);
     setPointerFocus(surface, sx, sy, monotonicMsec());
     if (stale) {
@@ -2865,6 +3288,9 @@ namespace umbriel {
     }
     if (seat->drag != nullptr) {
       updateDataDragEdgeScroll();
+      if (seat->drag->dropped) {
+        return;
+      }
       if (m_server->sessionLocked()) {
         wlr_seat_pointer_notify_clear_focus(seat);
         wlr_seat_pointer_notify_frame(seat);
@@ -2933,6 +3359,8 @@ namespace umbriel {
       resizeEdges = grab->edges;
     } else if (const auto* grab = std::get_if<TiledResizeGrab>(&m_grab)) {
       resizeEdges = grab->edges;
+    } else if (const auto* grab = std::get_if<PendingResizeGrab>(&m_grab)) {
+      resizeEdges = grab->edges;
     }
     if (resizeEdges != 0) {
       const char* name = wlr_xcursor_get_resize_name(static_cast<enum wlr_edges>(resizeEdges));
@@ -2956,6 +3384,15 @@ namespace umbriel {
       return;
     }
 
+    if (!modHeld) {
+      if (const auto hit = m_server->ssdFrameAt(m_cursor->x, m_cursor->y)) {
+        const char* name = hit->part == SsdFramePart::Resize
+            ? wlr_xcursor_get_resize_name(static_cast<enum wlr_edges>(hit->edges))
+            : "default";
+        setCompositorCursor(name != nullptr ? name : "default");
+        return;
+      }
+    }
     setCompositorCursor(nullptr);
   }
 

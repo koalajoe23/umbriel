@@ -137,6 +137,11 @@ namespace {
       requestFullscreen(state, true);
     } else if (command == "fullscreen false") {
       requestFullscreen(state, false);
+    } else if (command.starts_with("decorations ")) {
+      const xcb_atom_t motif = internAtom(state.connection, "_MOTIF_WM_HINTS");
+      const uint32_t hints[]{2, 0, command == "decorations on" ? 1U : 0U, 0, 0};
+      xcb_change_property(state.connection, XCB_PROP_MODE_REPLACE, state.windows[0], motif, motif, 32, 5, hints);
+      xcb_flush(state.connection);
     } else if (command == "quit") {
       state.running = false;
     } else if (!command.empty()) {

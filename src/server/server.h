@@ -1,10 +1,13 @@
 #pragma once
+#include "config/change.h"
 #include "config/value_parse.h"
 #include "core/animation.h"
 #include "core/application_scope.h"
 #include "core/dirty.h"
+#include "input/keyboard_layout.h"
 #include "input/lid_state.h"
 #include "input/modifier_tap.h"
+#include "input/shortcuts_inhibit.h"
 #include "input/surface_layouts.h"
 #include "output/enable_overrides.h"
 #include "scene/border_rect.h"
@@ -17,6 +20,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <memory>
 #include <optional>
 #include <span>
@@ -31,7 +35,6 @@ struct wlr_allocator;
 struct wlr_backend;
 struct wlr_box;
 struct wlr_compositor;
-struct wlr_color_manager_v1;
 struct wlr_content_type_manager_v1;
 struct wlr_image_description_v1_data;
 struct wlr_ext_foreign_toplevel_handle_v1;
@@ -106,9 +109,11 @@ namespace umbriel {
     uint64_t serial = 0;
   };
 
-  // Slow tick that ferries wl_surface.frame callbacks to toplevels that are mapped but not on the active workspace.
-  // wlroots' scene helper only walks enabled scene nodes, so a hidden view otherwise never receives another frame_done
-  // and a client that gates its game/network loop on the frame callback stalls. 10 Hz keeps such loops alive cheaply.
+  // Slow tick that ferries wl_surface.frame callbacks to mapped toplevels that are off the rendered scene but could not
+  // be told they are suspended (X11 windows and xdg clients older than version 6). wlroots' scene helper only walks
+  // enabled scene nodes, so such a view otherwise never receives another frame_done and a client that gates its
+  // game/network loop on the frame callback stalls. A suspended view gets none: clients such as Firefox detect
+  // occlusion only from a long callback gap, and a slow tick reads as a slow display that drops video frames.
   inline constexpr int kBackgroundFrameIntervalMs = 100;
   inline constexpr std::string_view kLaunchTokenEnvironment = "UMBRIEL_LAUNCH_TOKEN";
 
@@ -126,7 +131,9 @@ namespace umbriel {
   class ConfigWatcher;
   class InputMethodRelay;
   class Gestures;
-  class WineColorManager;
+  class ColorManager;
+  class SyncobjAcquireBarrier;
+  class SyncobjSupersededRelease;
   class SyncobjUnmapRelease;
   class HintRect;
   class Keyboard;
@@ -139,6 +146,7 @@ namespace umbriel {
   class View;
   class Workspace;
   class WorkspaceGroup;
+  struct DisplacedWorkspace;
   struct WorkspaceLaunchAnchor;
   class ScratchpadManager;
   class ConfigBanner;
@@ -159,6 +167,7 @@ namespace umbriel {
     bool start(const char* startupCmd = nullptr);
     void run();
     void stop();
+    void requestSessionExit();
     [[nodiscard]] bool stopping() const { return m_stopping; }
 
     [[nodiscard]] wl_display* display() const { return m_display; }
@@ -174,12 +183,11 @@ namespace umbriel {
     // The security-context metadata for a restricted client, or null for a
     // client on the ordinary socket.
     [[nodiscard]] const wlr_security_context_v1_state* clientSecurityContext(const wl_client* client) const;
-    [[nodiscard]] wlr_color_manager_v1* colorManager() const { return m_colorManager; }
     [[nodiscard]] wlr_export_dmabuf_manager_v1* exportDmabufManager() const { return m_exportDmabufManager; }
     // True while a live cursor session is attached to a capture source of this output.
     [[nodiscard]] bool hasCopyCaptureFor(const wlr_output* output) const;
     [[nodiscard]] wlr_tearing_control_manager_v1* tearingControlManager() const { return m_tearingControlManager; }
-    [[nodiscard]] WineColorManager* wineColorManager() const { return m_wineColorManager.get(); }
+    [[nodiscard]] ColorManager* colorManager() const { return m_colorManager.get(); }
     [[nodiscard]] const wlr_image_description_v1_data* surfaceImageDescription(wlr_surface* surface) const;
     [[nodiscard]] const wlr_image_description_v1_data* surfaceTreeHdrDescription(wlr_surface* surface) const;
     void updateColorPreferences();
@@ -235,16 +243,18 @@ namespace umbriel {
 
     // Central animation tick: advances every registered owner once per msec and
     // reports whether anything is still animating.
-    bool tickAnimations(uint64_t nowMsec);
-    void flushPendingViewOpacities();
+    bool tickAnimations(double nowMsec);
     [[nodiscard]] bool animationsActive() const;
     [[nodiscard]] bool animationsActiveFor(const Output* output) const;
     // No animation is running, no workspace has an arrange waiting for the next frame, and every mapped window has
     // committed its latest configure.
     [[nodiscard]] bool settled() const;
-    // Milliseconds on the clock every animation ticks from. It follows the monotonic clock unless a test build froze
-    // it.
+    // Whole milliseconds on the clock every animation ticks from, for timers and effect time. It follows the monotonic
+    // clock unless a test build froze it.
     [[nodiscard]] uint64_t animationClockMsec() const;
+    // The animation clock, in fractional milliseconds, at a CLOCK_MONOTONIC instant such as an output's latest vblank.
+    // Frames tick from it, so motion steps keep sub-millisecond spacing.
+    [[nodiscard]] double animationFrameClockMsec(double monotonicMsec) const;
 #ifdef UMBRIEL_TEST_IPC
     void freezeAnimationClock();
     // Moves a frozen clock forward and schedules a frame on every output. False when the clock is not frozen.
@@ -325,10 +335,16 @@ namespace umbriel {
     void relayoutCheatsheet();
     void relayoutQuitConfirm();
     void spawn(const char* command, const char* description = nullptr, bool withActivationToken = false);
-    void handleConfigReload();
+    void handleConfigReload(const ConfigReloadResult& result);
     // Re-evaluate application idle inhibitors after a surface's presentation
     // visibility changes.
     void updateIdleInhibit();
+    // Re-derive every toplevel's suspended state once the current dispatch settles, so a transition that hides and
+    // shows a window within one dispatch never reaches the client.
+    void scheduleSuspensionSync();
+    // True while `view`'s client must keep drawing although its frame is hidden: an overview card or a toplevel capture
+    // draws its content off the shared scene, or a `background_render` rule asks for it.
+    [[nodiscard]] bool viewRenderedOffscreen(const View& view) const;
     // Lock the next group on one physical keyboard, then synchronize matching
     // named layouts across the remaining keyboards.
     bool cycleKeyboardLayout();
@@ -338,8 +354,10 @@ namespace umbriel {
 
     // The one way keyboard focus reaches a surface. Toplevels, layer-shell
     // surfaces and the lock screen all route through here so that
-    // input.keyboard.track_layout sees every focus change.
-    void notifyKeyboardEnter(wlr_surface* surface);
+    // input.keyboard.track_layout sees every focus change. Bypass delivers the
+    // enter through an active keyboard grab instead of letting the grab swallow it.
+    enum class KeyboardGrab : uint8_t { Respect, Bypass };
+    void notifyKeyboardEnter(wlr_surface* surface, KeyboardGrab grab = KeyboardGrab::Respect);
     void notifyKeyboardClearFocus();
     // Drop every keyboard's consumed-press bookkeeping, for transitions that
     // eat the matching releases.
@@ -352,6 +370,8 @@ namespace umbriel {
     // The canonical physical keyboard's layout vocabulary and effective group.
     // Nullopt when no configured physical keyboard exists.
     [[nodiscard]] std::optional<KeyboardLayoutState> keyboardLayoutState() const;
+    // systemd-localed's keymap, for keyboards whose config sets no XKB names. Empty when unused or unavailable.
+    [[nodiscard]] const XkbNames& systemKeymap() const { return m_systemKeymap; }
     void notifyKeyboardLayoutIpc();
     void notifyOverviewChanged();
     void notifySubmapChanged();
@@ -361,6 +381,10 @@ namespace umbriel {
     // Same coalescing for the workspace list: layout mode, activation, names and membership all land in one payload,
     // so a switch that renames, reindexes and reactivates emits once.
     void scheduleIpcWorkspacesEvent();
+    // Same coalescing for the layer-shell surface list.
+    void scheduleIpcLayersEvent();
+    // Same coalescing for the output list.
+    void scheduleIpcOutputsEvent();
 
     // Focus lives in FocusManager; these forward so call sites that already
     // hold a Server do not need a second reference.
@@ -368,6 +392,9 @@ namespace umbriel {
     void restoreActivatedViewKeyboardFocus() { m_focus.restoreActivatedViewKeyboardFocus(); }
     View* viewAt(double lx, double ly, wlr_surface** surface, double* sx, double* sy, LayerSurface** layer = nullptr) {
       return m_focus.viewAt(lx, ly, surface, sx, sy, layer);
+    }
+    [[nodiscard]] std::optional<SsdFrameHit> ssdFrameAt(double lx, double ly) const {
+      return m_focus.ssdFrameAt(lx, ly);
     }
     std::optional<Keybind> handleKeybind(uint32_t keysym, uint32_t rawKeysym, uint32_t modifiers);
     // The bind this press would fire, without running it. Null when nothing
@@ -396,6 +423,15 @@ namespace umbriel {
     [[nodiscard]] wlr_output* preferredOutput() const;
     [[nodiscard]] Output* outputFromWlr(wlr_output* output) const;
     [[nodiscard]] Output* outputFromName(const std::string& name) const;
+    // Named workspaces on enabled outputs, with native local names taking precedence over displaced ones. A qualifier
+    // for an unavailable output identifies a displaced workspace's original output; positions remain output-local.
+    [[nodiscard]] std::expected<Workspace*, std::string> resolveNamedWorkspace(
+        std::string_view name, WorkspaceGroup* preferred = nullptr, std::string_view output = {}
+    ) const;
+    // Acquire a temporary destination for an absent workspace, including when a scratchpad return outlives its refuge.
+    Workspace* displacedWorkspaceDestination(
+        const std::shared_ptr<const DisplacedWorkspace>& home, Output* preferred, Output* excluded = nullptr
+    );
     [[nodiscard]] wlr_box usableAreaAt(double lx, double ly) const;
     void updateOutputManagerConfig();
     // Change logical desktop membership through the same atomic transaction as
@@ -456,7 +492,8 @@ namespace umbriel {
     // is dropped.
     [[nodiscard]] CloseSnapshotId animateCloseSnapshot(
         Output* output, wlr_scene_tree* tree, wlr_scene_tree* content, std::vector<BorderSnapshot> borders,
-        const wlr_box& box, std::optional<CloseSnapshotOverrides> overrides = std::nullopt, ShadowSnapshot shadow = {}
+        const wlr_box& box, std::optional<CloseSnapshotOverrides> overrides = std::nullopt, ShadowSnapshot shadow = {},
+        int topExtension = 0
     );
     // Place a snapshot's captured box at a canvas origin in output-root coordinates, or hide it while its workspace
     // is not showing.
@@ -466,8 +503,6 @@ namespace umbriel {
 
   private:
     friend class Output;
-
-    enum class SpawnClass { Application, SessionHelper };
 
     bool requestScreenCastCommand(ScreenCastCommandKind kind, std::string value, std::string* error);
 
@@ -480,6 +515,7 @@ namespace umbriel {
     static void onNewXdgDialog(wl_listener* listener, void* data);
     static void onNewXdgPopup(wl_listener* listener, void* data);
     static void onNewXdgDecoration(wl_listener* listener, void* data);
+    static void onNewLegacyDecoration(wl_listener* listener, void* data);
     static void onNewLayerSurface(wl_listener* listener, void* data);
     static void onNewSessionLock(wl_listener* listener, void* data);
     static void onNewPointerConstraint(wl_listener* listener, void* data);
@@ -516,13 +552,19 @@ namespace umbriel {
     static void onRendererLost(wl_listener* listener, void* data);
     static void onRendererRecoveryIdle(void* data);
     static int onBackgroundFrameTimer(void* data);
+    static int onBackgroundRenderTimer(void* data);
+    // Arms the background-render tick for the fastest refresh among hidden `background_render` windows, or disarms it
+    // when there are none.
+    void armBackgroundRenderTimer();
     static int onStartupRulesTimer(void* data);
     static int onTerminateSignal(int signal, void* data);
     static void onIpcWindowsIdle(void* data);
     static void onIpcWorkspacesIdle(void* data);
+    static void onIpcLayersIdle(void* data);
+    static void onIpcOutputsIdle(void* data);
+    static void onLayerKeyboardFocusChange(wl_listener* listener, void* data);
     static void onDisplacedRestoreIdle(void* data);
-
-    void spawnCommand(const char* command, const char* description, bool withActivationToken, SpawnClass spawnClass);
+    static void onSuspensionSyncIdle(void* data);
 
     void trackActivationToken(wlr_xdg_activation_token_v1* token, bool compositorIssued);
     void assignLaunchOriginFromEnvironment(View& view);
@@ -584,6 +626,10 @@ namespace umbriel {
     void beginSessionLock(wlr_session_lock_v1* lock);
     void recreateRenderer();
     void applyConfig(const ConfigEffects& effects);
+    // Recompile every keyboard's keymap from the current config and system keymap.
+    void applyKeyboardConfig();
+    // Re-read the system keymap when the config uses it; true when it changed.
+    bool refreshSystemKeymap();
     void showConfigDiagnostics();
     void clearNormalFocus() { m_focus.clearNormalFocus(); }
     void setLockBlankEnabled(bool enabled);
@@ -594,6 +640,7 @@ namespace umbriel {
     [[nodiscard]] bool initialOutputEnabled(const Output& output);
     void rememberOutputEnableOverride(const Output& output, bool enabled);
     void restoreDisplacedViews();
+    void refreshDisplacedWorkspace(Workspace& workspace);
     [[nodiscard]] WorkspaceGroup* workspaceGroupFromHandle(wlr_ext_workspace_group_handle_v1* handle) const;
 
     struct IdleInhibitorWatch {
@@ -639,6 +686,7 @@ namespace umbriel {
       bool pointerBacked = false;
       bool launchClaimed = false;
       std::shared_ptr<WorkspaceLaunchAnchor> launchWorkspace;
+      std::string launchScratchpad;
       std::string tokenName;
       std::string launchOutputName;
       std::string launchWorkspaceId;
@@ -655,12 +703,13 @@ namespace umbriel {
     wlr_compositor* m_compositor = nullptr;
     wlr_output_layout* m_outputLayout = nullptr;
     wlr_scene* m_scene = nullptr;
-    wlr_color_manager_v1* m_colorManager = nullptr;
     wlr_content_type_manager_v1* m_contentTypeManager = nullptr;
     wlr_security_context_manager_v1* m_securityContextManager = nullptr;
-    std::unique_ptr<WineColorManager> m_wineColorManager;
+    std::unique_ptr<ColorManager> m_colorManager;
+    std::unique_ptr<SyncobjAcquireBarrier> m_syncobjAcquireBarrier;
     std::unique_ptr<SyncobjUnmapRelease> m_syncobjUnmapRelease;
     std::unique_ptr<Pacing> m_pacing;
+    std::unique_ptr<SyncobjSupersededRelease> m_syncobjSupersededRelease;
     EffectRegistry m_effects;
     EffectSelection m_effectSelection;
     EffectSlot m_cursorEffectSlot;
@@ -687,6 +736,7 @@ namespace umbriel {
     wlr_idle_inhibit_manager_v1* m_idleInhibitManager = nullptr;
     wlr_keyboard_shortcuts_inhibit_manager_v1* m_shortcutsInhibitManager = nullptr;
     wlr_idle_notifier_v1* m_idleNotifier = nullptr;
+    bool m_idleInhibited = false;
     wlr_xdg_activation_v1* m_xdgActivation = nullptr;
     wlr_gamma_control_manager_v1* m_gammaManager = nullptr;
     wlr_output_manager_v1* m_outputManager = nullptr;
@@ -725,8 +775,8 @@ namespace umbriel {
     };
     std::vector<BindCooldown> m_bindCooldowns;
     std::vector<std::string> m_activeSubmaps;
-    // Same-msec dedupe: several outputs can call tickAnimations per vblank.
-    uint64_t m_lastAnimTickMsec = 0;
+    // The last tick's instant: an output's earlier one is skipped, and several outputs can tick per vblank.
+    double m_lastAnimTickMsec = 0;
     std::chrono::steady_clock::time_point m_startTime;
 
     // A fading copy of a closed window's scene tree. Owns that tree and destroys it once the fade completes.
@@ -735,7 +785,7 @@ namespace umbriel {
       CloseSnapshot(
           Server& server, CloseSnapshotId id, Output* output, wlr_scene_tree* tree, wlr_scene_tree* content,
           std::vector<BorderSnapshot> borders, const wlr_box& box, int durationMs, const AnimationCurve& curve,
-          std::string_view style, double scale, AnimationEvent event, ShadowSnapshot shadow
+          std::string_view style, double scale, AnimationEvent event, ShadowSnapshot shadow, int topExtension
       );
       ~CloseSnapshot() override;
 
@@ -745,7 +795,7 @@ namespace umbriel {
       void present(int canvasX, int canvasY, bool visible);
 
       [[nodiscard]] AnimationPhase animationPhase() const override { return AnimationPhase::Overlays; }
-      bool tickAnimations(uint64_t nowMsec) override;
+      bool tickAnimations(double nowMsec) override;
       [[nodiscard]] bool hasActiveAnimations() const override { return m_alpha.animating() || m_slide.animating(); }
       [[nodiscard]] bool animatesOn(const Output* output) const override { return m_output == output; }
 
@@ -780,6 +830,14 @@ namespace umbriel {
         int height = 0;
       };
       std::vector<Buffer> m_buffers;
+      struct Rect {
+        wlr_scene_rect* node = nullptr;
+        std::array<float, 4> color{};
+        wlr_box box{};
+        int radius = 0;
+      };
+      std::vector<Rect> m_rects;
+      int m_topExtension = 0;
       std::vector<BorderSnapshot> m_borders;
       ShadowSnapshot m_shadow;
       bool m_retainedPersistent = false;
@@ -824,24 +882,35 @@ namespace umbriel {
     bool m_nested = false;
     bool m_stopping = false;
     bool m_applicationScopesRequired = false;
+    bool m_sessionShutdownAvailable = false;
+    bool m_sessionExitRequested = false;
+    int m_sessionExitResultFd = -1;
+    wl_event_source* m_sessionExitResultSource = nullptr;
     std::string m_socketName;
     std::string m_systemdRunExecutable;
+    std::string m_systemctlExecutable;
     std::string m_applicationScopePartOfProperty;
     std::string m_applicationScopeBindsToProperty;
+    std::string m_applicationScopeAfterProperty;
     SystemdControlEnvironment m_systemdControlEnvironment;
     ApplicationScopeEnvironmentArguments m_applicationScopeEnvironmentArguments;
     uint64_t m_nextApplicationScopeId = 1;
 
     std::unique_ptr<Xwayland> m_xwayland;
     wl_event_source* m_backgroundFrameTimer = nullptr;
+    // Paces hidden `background_render` windows at their output's refresh rate; disarmed while none is hidden.
+    wl_event_source* m_backgroundRenderTimer = nullptr;
     // One-shot refresh when dynamic startup rules expire.
     wl_event_source* m_startupRulesTimer = nullptr;
     // Non-null while a windows-event idle callback is pending. The idle source
     // removes itself when it runs, so a non-null pointer means "already queued".
     wl_event_source* m_ipcWindowsIdle = nullptr;
     wl_event_source* m_ipcWorkspacesIdle = nullptr;
+    wl_event_source* m_ipcLayersIdle = nullptr;
+    wl_event_source* m_ipcOutputsIdle = nullptr;
     wl_event_source* m_lidStateReconcileIdle = nullptr;
     wl_event_source* m_displacedRestoreIdle = nullptr;
+    wl_event_source* m_suspensionSyncIdle = nullptr;
     // Coalesces renderer-loss notifications until their signal dispatch and
     // active render calls have unwound.
     wl_event_source* m_rendererRecoveryIdle = nullptr;
@@ -868,6 +937,7 @@ namespace umbriel {
     wl_listener m_newXdgDialog{};
     wl_listener m_newXdgPopup{};
     wl_listener m_newXdgDecoration{};
+    wl_listener m_newLegacyDecoration{};
     wl_listener m_newLayerSurface{};
     wl_listener m_newSessionLock{};
     wl_listener m_newPointerConstraint{};
@@ -889,11 +959,15 @@ namespace umbriel {
     wl_listener m_toplevelCaptureRequest{};
     wl_listener m_rendererLost{};
     wl_listener m_padKeyboardFocusChange{};
+    // The IPC layer listing reports which layer surface holds the keyboard.
+    wl_listener m_layerKeyboardFocusChange{};
 
     std::vector<std::unique_ptr<Output>> m_outputs;
     std::vector<std::unique_ptr<Keyboard>> m_keyboards;
     std::vector<std::unique_ptr<ShortcutsInhibitorWatch>> m_shortcutsInhibitors;
+    ManualShortcutsInhibit m_manualShortcutsInhibit;
     SurfaceLayoutMemory m_surfaceLayouts;
+    XkbNames m_systemKeymap;
     Keyboard* m_keyboardLayoutSource = nullptr;
     Keyboard* m_keyboardInputSource = nullptr;
     ModifierTapState m_modifierTap;

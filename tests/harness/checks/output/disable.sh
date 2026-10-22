@@ -44,8 +44,24 @@ wait_for_workspace() {
   return 1
 }
 
+wait_for_temporary_workspace() {
+  local native=$1 workspace=
+  for _ in $(seq 40); do
+    workspace=$("$UMBRIEL" windows --json | jq -r '.[0].workspace // ""')
+    if [[ $workspace == HEADLESS-1:* && $workspace != "$native" ]] \
+      && "$UMBRIEL" workspaces --json | jq -e --arg id "$workspace" \
+        'any(.[]; .id == $id and .named == false)' > /dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "expected a separate anonymous temporary workspace on HEADLESS-1, got '$workspace' (native '$native')"
+  return 1
+}
+
 spawn_client
 wait_for_workspace 'HEADLESS-2:1'
+native_refuge=$("$UMBRIEL" workspaces --json | jq -r '.[] | select(.output == "HEADLESS-1" and .index == 1) | .id')
 
 # Disable the output through a live reload.
 mark=$(log_mark)
@@ -59,7 +75,7 @@ if ! wait_for_log_since "$mark" "output 'HEADLESS-2': disabled by config"; then
   tail -8 "$UMBRIEL_LOG" | sed 's/^/  | /'
   exit 1
 fi
-wait_for_workspace 'HEADLESS-1:1'
+wait_for_temporary_workspace "$native_refuge"
 
 # Re-enable: the compositor must survive the disable and come back with a mode.
 mark=$(log_mark)

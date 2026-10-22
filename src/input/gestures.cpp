@@ -623,24 +623,16 @@ namespace umbriel {
     // Where the swipe would coast to a stop under deceleration.
     const double projected = m_scrollStart - m_scrollTracker.projectedEndPos() * m_scrollScale;
 
-    const auto maxScroll = static_cast<double>(scrolling->maxScroll(m_viewportPrimary));
     const auto columnCount = static_cast<int>(scrolling->columns().size());
 
-    // Snapping points are the scroll offsets aligning each column flush with either viewport edge,
-    // folded into the strip range. Release settles on the point closest to the projected position,
-    // so a flick commits whatever column it would decelerate past, not merely the one under the
-    // fingers.
+    // Snapping points are each column's resting offsets (ScrollingLayout::snapScrolls). Release settles on the point
+    // closest to the projected position, so a flick commits whatever column it would decelerate past, not merely the
+    // one under the fingers.
     int best = -1;
     double bestDist = 1e18;
     double bestSnap = currentScroll;
     for (int i = 0; i < columnCount; ++i) {
-      const auto x = static_cast<double>(scrolling->columnX(i, m_viewportPrimary));
-      const auto w = static_cast<double>(scrolling->columnWidth(i, m_viewportPrimary));
-      const double snaps[2] = {
-          std::clamp(x, 0.0, maxScroll),
-          std::clamp(x + w - static_cast<double>(m_viewportPrimary), 0.0, maxScroll),
-      };
-      for (const double snap : snaps) {
+      for (const double snap : scrolling->snapScrolls(i, m_viewportPrimary)) {
         const double dist = std::abs(snap - projected);
         if (dist < bestDist) {
           bestDist = dist;

@@ -18,7 +18,6 @@ enabled = false
 [animation.scratchpad]
 dim = 0.0
 blur = false
-scale = 0
 
 [appearance]
 border_width = 0

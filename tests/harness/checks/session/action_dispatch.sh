@@ -356,6 +356,37 @@ if [[ $dx -lt -3 || $dx -gt 3 || $dy -lt -3 || $dy -gt 3 ]]; then
   echo "expected the window centered at ($want_x, $want_y), got ($cur_x, $cur_y)"
   exit 1
 fi
+
+# window-move-to and window-move-by, on the same floating window and usable area.
+wait_window_at() {
+  local want_x=$1 want_y=$2 action=$3 cur_x=0 cur_y=0
+  for _ in $(seq 40); do
+    read -r cur_x cur_y <<< "$(jq -r '.[0] | "\(.x) \(.y)"' <<< "$("$UMBRIEL" windows --json)")"
+    [[ "$cur_x $cur_y" == "$want_x $want_y" ]] && return 0
+    sleep 0.1
+  done
+  echo "$action: expected the window at ($want_x, $want_y), got ($cur_x, $cur_y)"
+  exit 1
+}
+accepts "window-move-to:top_left/10/20"
+wait_window_at 10 20 "window-move-to:top_left/10/20"
+accepts "window-move-by:+30/-5"
+wait_window_at 40 15 "window-move-by:+30/-5"
+accepts "window-move-to:bottom_right/10/20"
+wait_window_at $((1280 - w - 10)) $((720 - h - 20)) "window-move-to:bottom_right/10/20"
+
+# Directional moves take a float to that edge inside gap plus border (8 + 2) and keep the other axis.
+accepts "window-move-to:top_left/100/50"
+wait_window_at 100 50 "window-move-to:top_left/100/50"
+accepts "window-move-left"
+wait_window_at 10 50 "window-move-left"
+accepts "window-move-down"
+wait_window_at 10 $((720 - h - 10)) "window-move-down"
+accepts "window-move-right"
+wait_window_at $((1280 - w - 10)) $((720 - h - 10)) "window-move-right"
+accepts "window-move-up"
+wait_window_at $((1280 - w - 10)) 10 "window-move-up"
+
 accepts "window-toggle-floating" # restore tiled
 
 spawn_client window-toggle-unfoucsed

@@ -16,14 +16,10 @@ namespace umbriel {
   }
 
   void ViewRegistry::remove(View* view) {
-    std::erase(m_modalDialogs, view);
     std::erase_if(m_views, [view](const std::unique_ptr<View>& entry) { return entry.get() == view; });
   }
 
-  void ViewRegistry::clear() {
-    m_modalDialogs.clear();
-    m_views.clear();
-  }
+  void ViewRegistry::clear() { m_views.clear(); }
 
   void ViewRegistry::promote(View* view) {
     auto it = std::ranges::find_if(m_views, [view](const std::unique_ptr<View>& entry) { return entry.get() == view; });
@@ -35,13 +31,7 @@ namespace umbriel {
     m_views.insert(m_views.begin(), std::move(entry));
   }
 
-  void ViewRegistry::setModalDialog(View* view, bool modal) {
-    const bool listed = std::ranges::find(m_modalDialogs, view) != m_modalDialogs.end();
-    if (modal && !listed) {
-      m_modalDialogs.push_back(view);
-    } else if (!modal && listed) {
-      std::erase(m_modalDialogs, view);
-    }
-  }
+  // clear() runs view destructors that scan the registry, by then holding the entries already destroyed as null.
+  bool ViewRegistry::isPlacementRoot(const std::unique_ptr<View>& view) { return view != nullptr && !view->attached(); }
 
 } // namespace umbriel

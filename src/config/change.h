@@ -84,6 +84,8 @@ namespace umbriel {
     bool overviewPresentation = false;
     bool internalUi = false;
     bool effects = false;
+    // Whether a modal dialog attaches to its parent: the global switch or a rule that may opt one out.
+    bool dialogAttachment = false;
 
     [[nodiscard]] bool any() const {
       return outputState
@@ -98,7 +100,8 @@ namespace umbriel {
           || input
           || overviewPresentation
           || internalUi
-          || effects;
+          || effects
+          || dialogAttachment;
     }
 
     [[nodiscard]] bool invalidatesOverview() const {

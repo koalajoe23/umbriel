@@ -41,7 +41,7 @@ namespace umbriel {
     void snapTo(int width, int height);
     // Advance both axes. Returns true when the presented size moved this tick,
     // which is the caller's cue to re-derive everything drawn from it.
-    bool tick(uint64_t nowMsec);
+    bool tick(double nowMsec);
 
     // Fullscreen
     void createBackdrop(wlr_scene_tree* parent);

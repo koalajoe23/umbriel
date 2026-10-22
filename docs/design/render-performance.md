@@ -13,13 +13,16 @@ when the render list holds exactly one entry, no color transform applies, no
 gamma LUT upload is pending, SDR capture is off, and damage highlighting is off
 (`:5392-5396`).
 
-The fork adds three conditions upstream does not have:
+The fork adds four conditions upstream does not have:
 
-- A transient animation slot anywhere in the scene vetoes scanout (`:4702`).
-  The same predicate also disables visibility and opaque culling (`:5260`,
-  `:687`) and forces whole-output damage (`:5342-5344`). It is scene-global,
-  not per output and not per subtree, so one animating node changes the cost
-  of every frame on every output until it settles.
+- A transient animation slot anywhere in the scene vetoes scanout. The same
+  predicate also disables visibility and opaque culling and forces
+  whole-output damage. It is scene-global, not per output and not per subtree,
+  so one animating node changes the cost of every frame on every output until
+  it settles. A bounded slot is exempt: a transient slot whose program is
+  shape-preserving, such as the built-in open and close fade, damages only its
+  node's bounds, keeps culling outside its subtree, and vetoes scanout only on
+  outputs whose render list holds part of that subtree.
 - A persistent effect visible on the output vetoes scanout there (`:4703`).
   `render_data.persistent_visible` (`:5301-5318`) is set when a render-list
   entry sits under a node carrying a window, overlay, or border-effect slot, or
@@ -29,6 +32,12 @@ The fork adds three conditions upstream does not have:
 - A node's `visible` region must equal its full rect (`:4710-4722`), because
   scanout bypasses `node->visible`. An ancestor tree clip therefore forces
   composition even when nothing overlaps the node.
+- A non-neutral HDR white-point adjustment on a PQ output vetoes direct
+  scanout. It also requires software cursors so the whole displayed image
+  receives the same transform. Restoring neutral white or returning to SDR
+  releases this constraint. The adjustment is folded into the existing output
+  matrix before PQ encoding, without an extra render pass. See
+  [HDR white-point adjustment](client-buffer-constraints.md#hdr-white-point-adjustment).
 
 Umbriel holds `wlr_output_lock_attach_render` while an output animates
 ([`output.cpp:1343-1346`](../../src/output/output.cpp)) and vetoes tearing for
@@ -38,6 +47,21 @@ the same frames (`:1385-1387`). Persistent effects trigger neither.
 process-wide, forces composition. Both are documented in the
 [output guide](../user/outputs.md#direct-scanout) and exist for drivers that
 mispresent scanned-out buffers.
+
+## Output background clearing
+
+The scene background follows `colors.backdrop`, including its alpha. At the
+start of composition, the background draw replaces uncovered damaged pixels
+with `WLR_RENDER_BLEND_MODE_NONE`. It must not blend with the previous frame
+in a reused swapchain buffer: transparent black would leave old window pixels
+intact, and a translucent background would retain faded remnants. Ordinary
+scene nodes still blend over this initialized background, and opaque culling
+still excludes regions that those nodes will overwrite.
+
+The `effects-background-clear` regression moves an opaque rectangle, checks
+that its framebuffer is reused, and verifies that its old location becomes
+the configured background, including alpha. It covers transparent,
+translucent, and opaque backgrounds.
 
 ## What puts a second entry in the render list
 
@@ -84,11 +108,57 @@ size and sets a logical destination, so no plane scaling is involved. A client
 that ignores the protocol presents at the logical size, and then
 `scene_entry_try_direct_scanout` stages a `buffer_dst_box` larger than the
 buffer and asks the backend to accept primary-plane scaling
-(`wlr_scene.c:4789-4814`). Hyprland rejects that case outright
-(`bufferSize != m_pixelSize`, its `Monitor.cpp:1995`) but has no
-fractional-scale condition of its own, because it has no background node to
-skip and decides eligibility from window state instead of render-list
-cardinality.
+(`wlr_scene.c:4789-4814`). Rejecting every buffer whose size differs from the
+output pixel size would also exclude this case, but Umbriel keys eligibility
+on render-list cardinality, so the background node is what must be skipped.
+
+## Background blur invalidation
+
+Each output observes visual changes in its background scene subtree through an
+UmbrielFX addon. Node changes and nonempty buffer damage invalidate the shared
+optimized blur cache, including desynchronized subsurface updates, child
+placement, layer geometry, fades, and color changes. Buffer damage is observed
+before visibility culling because content hidden behind a window can still be
+visible through that window's cached blur. Invalidation also schedules a frame
+when the source itself has no visible damage.
+
+Frame callback requests with no visual changes leave the cache valid. Multiple
+changes before the next cache rebuild share one invalidation. The cache node
+lives outside the observed subtree, so rebuilding it cannot invalidate itself.
+Output and backdrop configuration changes retain their explicit invalidation.
+
+`render/optimized_blur_idle` checks that a background client receives a batch of
+callbacks without producing captured pixel damage, then verifies new parent
+and child pixels, child placement, and layer geometry through a blurred window.
+`render/optimized_blur_layer_exit` covers animated map and unmap transitions.
+
+## Surface opacity
+
+Each window's content tree owns its compositor opacity multiplier in a node
+addon. A scene surface resolves the closest multiplier on itself or its
+ancestors and combines it with committed client alpha before the guarded buffer
+setter runs. Unchanged commits, clip changes, and scale changes therefore
+preserve rule, fade, drag, and focus opacity without resetting to client alpha
+and damaging the same pixels again.
+
+New subsurfaces and popups inherit opacity when their scene surfaces are
+created or reconfigured. An unchanged commit only resolves the committing
+surface's ancestry; it never refreshes the whole window. Changing the tree's
+multiplier refreshes existing descendant surfaces, including disabled nodes,
+and reparenting refreshes inherited opacity against the new ancestry. An
+explicit `1.0` multiplier overrides any outer multiplier. Plain snapshot
+buffers keep their directly assigned opacity.
+
+The separate window-capture scene has no desktop opacity marker, so its
+surfaces use client alpha without baking in the desktop multiplier.
+
+`render/color_damage` verifies callback delivery without captured damage at
+opacity `1.0` and `0.95` for PQ and sRGB content, including synchronized and
+desynchronized subsurfaces. Title-based window rules change opacity in both
+directions and must each produce one changed frame without a config reload.
+`render/window_capture_color` also checks the first frame from a late
+subsurface, a rule change during same-surface remapping, and independent window
+capture pixels throughout those transitions.
 
 ## Per-frame work outside the render pass
 
@@ -96,25 +166,25 @@ cardinality.
 
 **Invariant:** a plane-cursor transition on an output whose capture source
 carries a live cursor-metadata session must deliver a frame, even when nothing
-else damaged the output — except a cursor that is already hidden and merely
-moves, which presents nothing and therefore lands no damage.
+else damaged the output. A cursor that is already hidden and merely moves
+presents nothing and therefore lands no damage.
 
 With `hardware_cursor = true` the cursor is KMS state, so a cursor-only move
 produces no scene damage. Capture consumers are fed from commits, so an idle
 output would record a frozen cursor.
 
-`Output::paceCursorPlaneTransition` diffs a plane sample — visibility, enabled
-state, position, dimensions, hotspot, buffer identity — and on change damages
+`Output::paceCursorPlaneTransition` diffs a plane sample (visibility, enabled
+state, position, dimensions, hotspot, buffer identity) and on change damages
 both the old and the new box. The old box is the load-bearing part: a leave must
 come from the *previous* sample, because wlroots has already marked the cursor
 invisible by the time the move is observed. A transition that changes what the
-cursor presents lands at least one box — a hidden cursor in motion deliberately
-lands none, since nothing visible changed — and the damage itself schedules the
-commit a cursor-metadata client is blocked on.
+cursor presents lands at least one box. A hidden cursor in motion lands none,
+since nothing visible changed. The damage itself schedules the commit a
+cursor-metadata client is blocked on.
 
 **Gate:** `Server::hasCopyCaptureFor`, keyed on the source output: a live cursor
 session attaches its update listener to the cursor of the source it was created
-for, and the gate reads that attachment for this output's sources only — one
+for, and the gate reads that attachment for this output's sources only. One
 client recording output A with cursor metadata never paces its pixel-only
 capture of output B. Screencopy and export-dmabuf never register; pixel-only
 sessions register but no cursor session is attached to their source. Software
@@ -124,9 +194,9 @@ cursors drop the plane entirely.
 the `wlr_scene_output_needs_frame` test, so the frame already running commits
 the damage. wlroots clears `needs_frame` on commit, so every plane mutation
 since the last commit is diffed exactly once; the umbrielfx scene's own
-`needs_frame` listener is what scheduled that frame. Sampling at frame time —
-not inside `wlr_cursor_move` — also keeps position and cursor-buffer identity
-consistent, since wlroots raises the signal before it swaps
+`needs_frame` listener is what scheduled that frame. Sampling at frame time
+keeps position and cursor-buffer identity consistent, since wlroots raises
+the signal inside `wlr_cursor_move` before it swaps
 `cursor_front_buffer`. Checked by `render/capture_pacing` (move, crossings both
 directions, hide, image, hotspot, size, and pixel-only idle held by the same
 client that holds the cursor session on the other output) through the synthetic
@@ -134,11 +204,15 @@ client that holds the cursor session on the other output) through the synthetic
 `tests/unit/cursor_plane_pace.cpp` for the transition decisions. Real-plane
 behaviour needs a native session.
 
-`Output::handleFrame` (`output.cpp:1282`) runs before any damage test:
-`flushDirty`, `Server::tickAnimations`, `flushPendingViewOpacities` over every
-view, and `WineColorManager::applySurfaceDescriptions`, which walks every
-`wlr_scene_buffer` in the scene with a map lookup per buffer
-([`wine_color_manager.cpp:1061-1100`](../../src/server/wine_color_manager.cpp)).
+`Output::handleFrame` runs `flushDirty` and `Server::tickAnimations` before any
+damage test. Surface commits preserve compositor opacity directly, so no
+per-frame opacity repair walk is needed.
+`ColorManager::updatePreferredDescriptions` compares cached output descriptions
+and surface preferences so output membership and reference-white changes reach
+clients. Scene surfaces resolve their committed native or Wine color state
+during surface reconfiguration, before applying guarded scene setters. An
+unchanged description therefore produces no reset and restore damage. Snapshot
+and overview copy paths apply each surface's committed description directly.
 
 `wlr_scene_output_send_frame_done` at the end of that function is unconditional
 and must stay so (`output.cpp:1557`). Mailbox and FIFO clients block on
@@ -173,14 +247,28 @@ require a running-session check.
 
 A `tracy` build carries CPU zones at those boundaries through
 [`src/core/tracy.h`](../../src/core/tracy.h): `Output::handleFrame`,
-`Output::flushDirty`, `Output::render`, `Server::tickAnimations`, and
-`WineColorManager::applySurfaceDescriptions`, plus the frame-pacing zones and
-plots listed in [Pacing protocols](pacing-protocols.md#diagnostics). umbrielfx carries paired CPU and
+`Output::flushDirty`, `Output::render` (split into `Output::buildState` and
+`Output::commitState`), `Server::tickAnimations`,
+`WineColorManager::applySurfaceDescriptions`, and the overview's setup:
+`Overview::open`, `Overview::beginPresentation`, `Overview::buildState`, and
+`Overview::layoutOutput`, plus the frame-pacing zones and plots listed in
+[Pacing protocols](pacing-protocols.md#diagnostics). umbrielfx carries paired CPU and
 GPU zones across its render pass. Every `wlr_scene_output_build_state` exit
 emits a frame mark, including the scanout one, so a capture separates
 scanned-out frames from composited ones: a scanned-out frame has a frame mark
 and no render-pass zones. Build and capture instructions are in
 [CONTRIBUTING.md](../../CONTRIBUTING.md#profiling).
+
+Two plots per output come from `Output::handlePresent` and show whether frames
+reached the screen: `<output> present interval ms`, the time between presented
+frames, and `<output> vblanks per present`, the vblank counter's step between
+them. While frames keep coming, a step above 1 is a missed vblank. The vblank
+plot is absent on backends without a vblank counter, such as headless.
+
+The GPU zone `fx_render_pass` spans a whole render pass, from
+`fx_begin_buffer_pass` to the last command `render_pass_submit` issues, so its
+length is the pass's GPU time. Both GPU zones end before the flush or fence that
+submits the pass.
 
 umbrielfx adds these zones for effect costs:
 
@@ -193,10 +281,10 @@ umbrielfx adds these zones for effect costs:
 | `draw_animation_texture` (CPU and GPU) | [`fx_pass.c:691`](../../umbrielfx/render/fx_renderer/fx_pass.c) | Every effect program draw: animation slots, border, window, screen, and cursor effects, border light, and the shadow of a slot program | |
 
 `tracy-csvexport -u` prints each CPU zone event with its text in the `value`
-column, and `-g` prints each GPU zone event. These zones end with
-`TRACY_ZONE_END_QUIET`, which adds no text. `draw_animation_texture`, like the
-other render-pass zones, ends with `TRACY_BOTH_ZONES_END`, which appends a
-`Success On Line` line to its text.
+column, and `-g` prints each GPU zone event. Zone text is formatted only while
+a profiler is connected, so a disconnected `tracy` build pays no formatting per
+draw. A render-pass zone that ends on a failure path carries a `Fail On Line`
+text; a successful one carries only the labels its draw adds.
 
 ## Workloads
 
@@ -294,10 +382,12 @@ carries the effect and B a workload that stays the same. Transient animations
 are off (`[animation] enabled = false`), blur is off, and the effect is toggled
 by editing the configuration and running `umbriel msg config-reload`.
 
-- **Scanout.** A shows an ordinary desktop with several visible windows, so it
-  never scans out. B runs an eligible fullscreen client, such as
-  `vkmark --fullscreen --present-mode fifo`, whose `render list` zone reads
-  `1`, and `~/.cache/umbriel/umbriel.log` shows `Direct scan-out enabled`.
+- **Scanout.** The scan-out messages are wlroots debug output, so this run
+  starts the compositor with `UMBRIEL_WLR_DEBUG=1`. A shows an ordinary desktop
+  with several visible windows, so it never scans out. B runs an eligible
+  fullscreen client, such as `vkmark --fullscreen --present-mode fifo`, whose
+  `render list` zone reads `1`, and `~/.cache/umbriel/umbriel.log` shows
+  `Direct scan-out enabled`.
   Toggling A's effect at least three times must add no
   `Direct scan-out disabled` after that line. The log rotates at 1 MiB and
   keeps one previous file, so the check reads both, oldest first:

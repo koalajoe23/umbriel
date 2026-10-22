@@ -2,7 +2,8 @@
 // surface exactly. The parent buffer is opaque red and the child opaque blue, so a screenshot tells which surface a
 // pixel came from and whether the compositor rounded the subsurface to the window corner radius. Prints "mapped" once
 // both surfaces are up, then stays connected until killed. The optional "animate" mode continually damages only the
-// child. TRANSLUCENT_CONTENT gives the child premultiplied half-alpha magenta over a transparent parent.
+// child. TRANSLUCENT_CONTENT gives the child premultiplied half-alpha magenta over a transparent parent. OPAQUE_CONTENT
+// draws both surfaces in XRGB8888, so the child hides the parent and is the one buffer a fullscreen window shows.
 // OFFSET_GEOMETRY=<px> places the child above and left of the parent and puts the window geometry origin there, so the
 // main surface is inset and its corners are interior to the window; the child then sits below the parent.
 // STALE_GEOMETRY declares the window geometry once, at the first size, while still redrawing both buffers at every
@@ -56,6 +57,7 @@ namespace {
     bool fullscreenBeforeMap = false;
     bool transparentContent = false;
     bool translucentContent = false;
+    bool opaqueContent = false;
     // Declare the window geometry once and never again, the way Electron acks a configure and redraws at the new size
     // while leaving set_window_geometry at the size it had before.
     bool staleGeometry = false;
@@ -123,7 +125,8 @@ namespace {
     std::fill_n(static_cast<uint32_t*>(buffer.pixels), buffer.size / sizeof(uint32_t), color);
 
     wl_shm_pool* pool = wl_shm_create_pool(state.shm, fd, static_cast<int>(buffer.size));
-    buffer.resource = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
+    const uint32_t format = state.opaqueContent ? WL_SHM_FORMAT_XRGB8888 : WL_SHM_FORMAT_ARGB8888;
+    buffer.resource = wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
     wl_shm_pool_destroy(pool);
     close(fd);
     return buffer;
@@ -283,6 +286,7 @@ int main(int argc, char** argv) {
   state.fullscreenBeforeMap = std::getenv("FULLSCREEN_BEFORE_MAP") != nullptr;
   state.transparentContent = std::getenv("TRANSPARENT_CONTENT") != nullptr;
   state.translucentContent = std::getenv("TRANSLUCENT_CONTENT") != nullptr;
+  state.opaqueContent = std::getenv("OPAQUE_CONTENT") != nullptr;
   state.staleGeometry = std::getenv("STALE_GEOMETRY") != nullptr;
   if (const char* offset = std::getenv("OFFSET_GEOMETRY")) {
     state.offset = std::max(0, std::atoi(offset));

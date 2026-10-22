@@ -16,10 +16,14 @@ namespace umbriel {
   // it against the generation they cached at.
   class ConfigStore {
   public:
-    // Resolve the user, system, or packaged config and load it. Missing explicit
-    // paths, invalid includes, syntax errors, and DRM policy errors fail closed;
-    // other parsed errors retain the compatibility fallback to defaults.
-    [[nodiscard]] bool load(const char* explicitPath);
+    // Resolve the user, system, or packaged config and load it. Any error,
+    // including a missing explicit path, starts with defaults and leaves the
+    // diagnostics for the error banner.
+    void load(const char* explicitPath);
+    // Replace the root config file. On failure the previous configuration is kept
+    // and the generation does not move: a config with a syntax error must not take
+    // the session down.
+    [[nodiscard]] ConfigReloadResult replace(const std::filesystem::path& explicitPath, std::string& errors);
     // Re-parse. On failure the previous configuration is kept and the generation
     // does not move: a config with a syntax error must not take the session down.
     [[nodiscard]] ConfigReloadResult reload();

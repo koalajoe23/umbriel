@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A portal-style dialog is created by another process and attached through
 # xdg-foreign. A visible scratchpad parent owns that dialog's presentation,
-# focus, and transient placement unless an explicit window rule says otherwise.
+# focus, and transient placement. A dialog a rule keeps from attaching places by
+# its own rules, so an explicit scratchpad wins for it.
 set -euo pipefail
 
 readonly PARENT_CLIENT="${UMBRIEL_SEAT_LOG_CLIENT:-./build-debug/tests/seat-log-client}"
@@ -40,9 +41,6 @@ cat >> "$UMBRIEL_CONFIG" <<'EOF'
 [animation]
 enabled = false
 
-[animation.scratchpad]
-scale = 0
-
 [[scratchpad]]
 name = "portal"
 
@@ -57,6 +55,7 @@ default_position = { x = 100, y = 110, anchor = "top_left" }
 
 [[window_rule]]
 match.title = "^scratchpad-foreign-explicit$"
+attach_to_parent = false
 default_scratchpad = "forced"
 default_floating = true
 default_floating_size_px = { width = 300, height = 200 }
@@ -117,8 +116,8 @@ wait_for_query \
   "late parent request did not move the dialog into the visible scratchpad"
 
 # A configured scratchpad is an explicit placement decision and wins over
-# inherited parent placement. The forced pad stays hidden, so the late child
-# must also retain seat focus.
+# inherited parent placement for a dialog that does not attach. The forced pad
+# stays hidden, so the late child must also retain seat focus.
 TRANSIENT_FOREIGN_HANDLE="$handle" \
   "$CHILD_CLIENT" scratchpad-foreign-explicit 300 200 > "$EXPLICIT_LOG" 2>&1 &
 wait_for_count 4

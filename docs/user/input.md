@@ -9,7 +9,9 @@ Configure keyboard, pointer, touchpad, tablet, cursor, and focus behavior under
 [input]
 middle_click_paste = false
 client_window_drag = true
+window_snapping = false
 window_drag_toggle = "none"
+mod_right_double_click = "none"
 ```
 
 `middle_click_paste = false` disables primary-selection paste, including
@@ -17,10 +19,52 @@ Shift+Insert. The regular Ctrl+C and Ctrl+V clipboard is unaffected.
 Applications started while primary selection is disabled must be restarted
 after it is re-enabled.
 
+`window_snapping = true` enables edge and corner drop zones for floating windows
+in any layout, using title bar, client move, or Mod+drag. A preview shows the
+placement before release. Left, right, top, and bottom edges snap to the
+corresponding half of the screen. All four corners snap to quarters. Maximize
+remains available through the title bar button, double-click, or an action.
+The targets respect panels, layout struts, gaps, borders, title bars, and client
+size limits, all in logical coordinates.
+
+Dragging a snapped or maximized window away restores its normal size under the
+pointer, keeping the title bar and content aligned while the application redraws.
+Snapping on another monitor maps the normal restore position to that monitor.
+Shared monitor edges require a 150 ms dwell before offering a zone, so
+dragging straight across monitors remains possible. Tiled, pinned, scratchpad,
+overview, data-device, and toplevel-transfer drags do not use these zones.
+Keyboard actions `window-snap:<region>` and `window-unsnap` work independently
+of the pointer setting. See [Actions](actions.md).
+
 `client_window_drag = false` ignores move requests from applications, such as
 dragging a client-side title bar or the empty tab strip of Chromium, Firefox,
-or Electron apps. Windows then move only with Mod+drag or keybinds.
-Resizing from client-side borders is unaffected.
+or Electron apps. Ordinary window moves then use Mod+drag, keybinds, or an
+enabled [Umbriel title bar](appearance.md#title-bar).
+Resizing from client-side borders and tab tear-off operations using
+`xdg-toplevel-drag-v1` are unaffected.
+
+When the title bar is shown by `[appearance.title_bar] mode` or a window rule, dragging empty server-side title
+bar space moves a window without a modifier. Double-click it to maximize or
+restore. Floating windows also resize by dragging the frame's edges or corners
+without a modifier. These compositor-owned interactions work with
+`client_window_drag = false`.
+
+In tiled layouts, pressing a client-side or Umbriel title bar focuses and reveals
+the window while keeping it in the layout. It detaches only after the pointer
+crosses the drag threshold. Holding or releasing a stationary press preserves
+the spacing between windows, including while applications repaint.
+
+Mod+right-click drags a window's resize edge. `mod_right_double_click` gives a
+second Mod+right-click on the same window a job beyond resizing:
+
+| Value | Behavior |
+| --- | --- |
+| `"none"` | (default) Mod+right-click only drags a resize edge. |
+| `"maximize"` | A second Mod+right-click on the same window within 300 ms and 8 px of the first toggles maximize, with the same target a client's titlebar double-click picks: `client_maximize` decides between the column and the edges for a tiled window, and a floating window fills the usable area. |
+
+With `"maximize"`, the first click starts resizing only once the pointer moves
+more than 8 px from the press, and then resizes the edge under the press.
+A `Mod+MouseRight` keybind overrides the built-in button entirely.
 
 `window_drag_toggle` controls what pressing the other main mouse button does
 during a window drag:
@@ -34,13 +78,24 @@ during a window drag:
 The state changes when the window is dropped. Unsupported transitions, such as
 pinning a fullscreen window, leave the window unchanged.
 
+### Detached tabs and panels
+
+Umbriel supports `xdg-toplevel-drag-v1` for native Wayland applications that
+implement it, including Chromium-based browsers. During a pointer drag, a
+detached window follows the pointer above ordinary windows and stays outside
+the tiling layout. Windows underneath it can receive the drop, allowing the
+application to merge a tab or dock a panel. If the application keeps the
+detached window after the drop, Umbriel places it using normal tiled or
+floating window-drag behavior. No additional configuration is needed.
+
 ### Keyboard
 
 ```toml
 [input.keyboard]
-layout = ""           # empty uses the system default
+layout = ""           # empty uses the system keymap
 variant = ""
 options = ""
+model = ""
 repeat_rate = 25
 repeat_delay = 600
 numlock_toggle = true
@@ -63,8 +118,16 @@ options = "grp:alt_shift_toggle"
 ```
 
 `options` accepts XKB options such as `caps:escape` or `compose:ralt`. Invalid
-layouts and variants are reported in the log and fall back to the system
-default. Run `xkbcli list` to inspect available values.
+layouts, variants, and models are reported in the log and fall back to the
+system default. Run `xkbcli list` to inspect available values.
+
+When `[input.keyboard]` sets none of `layout`, `variant`, `options`, and
+`model`, Umbriel uses the X11 keymap configured with
+`localectl set-x11-keymap`, read from systemd-localed at startup and on every
+config reload. Run `umbriel msg config-reload` to apply a keymap changed with
+`localectl`. Without systemd-localed, the `XKB_DEFAULT_*` environment
+variables apply, then `us`. A `[[input.device]]` rule that sets any of these
+keys uses only its own and `[input.keyboard]`'s values.
 
 Run `umbriel keyboard-layouts` to list the configured layouts. The active one
 is prefixed with `*`.
@@ -103,7 +166,10 @@ surface layouts.
 
 ```toml
 [input.touchpad]
+# enabled = true
 tap = true
+# tap_and_drag = false
+# drag_lock = "sticky"
 natural_scroll = true
 left_handed = false
 # accel_profile = "adaptive"
@@ -120,7 +186,10 @@ settings are reported in the log.
 
 | Key | Description |
 | --- | --- |
+| `enabled` | Enable or disable touchpad input. |
 | `tap` | Enable tap-to-click. |
+| `tap_and_drag` | Keep dragging after a tap when the finger stays down and moves. |
+| `drag_lock` | Keep dragging after the finger lifts during a tap-and-drag: `"off"` disables it, `"timeout"` ends the drag shortly after the finger lifts, `"sticky"` holds the drag until the next tap. |
 | `natural_scroll` | Reverse scrolling and three-finger gesture direction. |
 | `left_handed` | Swap the primary and secondary buttons. |
 | `accel_profile` | Use `"flat"`, `"adaptive"`, or a custom acceleration curve. |
@@ -183,6 +252,7 @@ the `Device` value from `libinput list-devices`:
 name = "Acme Split Keyboard"
 layout = "us"
 variant = "colemak_dh"
+model = "pc104angle"
 repeat_rate = 40
 repeat_delay = 250
 
@@ -197,11 +267,15 @@ click_method = "clickfinger"
 name = "Acme Gaming Mouse"
 accel_profile = "flat"
 sensitivity = 0.0
+
+[[input.device]]
+name = "Acme Controller Touchpad"
+enabled = false
 ```
 
 Each rule inherits its keyboard, touchpad, or mouse class settings and replaces
-only the keys it contains. Duplicate rules for the same device name are
-rejected.
+only the keys it contains. `enabled = false` turns off a keyboard, touchpad, or
+mouse. Duplicate rules for the same device name are rejected.
 
 ### Tablet
 

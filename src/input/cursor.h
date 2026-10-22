@@ -1,5 +1,7 @@
 #pragma once
 #include "layout/drop_target.h"
+#include "scene/ssd_frame_geometry.h"
+#include "view/snap.h"
 
 #include <cstdint>
 #include <memory>
@@ -26,6 +28,7 @@ struct wlr_xcursor_manager;
 namespace umbriel {
 
   class LayerSurface;
+  class Layout;
   class Output;
   class Server;
   class View;
@@ -45,6 +48,8 @@ namespace umbriel {
       double offsetX = 0;
       double offsetY = 0;
       DragTarget target = DragTarget::Tiled;
+      // Floating workspace moves commit each pointer position instead of holding a layout slot until release.
+      bool floatingLayout = false;
       // Where a pin toggle sends the window when it turns pinning off: back to
       // the layout when that is where the window was pinned from, otherwise
       // floating.
@@ -55,6 +60,14 @@ namespace umbriel {
       int sourceColumn = -1;
       std::optional<DropColumnWidth> sourceWidth;
       DropTarget drop;
+      std::optional<SnapRegion> snap;
+      Output* snapOutput = nullptr;
+      int preDragX = 0;
+      int preDragY = 0;
+      wlr_box preDragArea{};
+      Output* dwellOutput = nullptr;
+      uint32_t dwellEdges = 0;
+      bool dwellReady = false;
       // A tiled drag holds the window in the layout until the pointer clears
       // the threshold. A floating drag is detached from the start.
       bool pending = true;
@@ -89,7 +102,25 @@ namespace umbriel {
       double lastX = 0;
       double lastY = 0;
     };
-    using GrabState = std::variant<PassthroughGrab, MoveGrab, FloatingResizeGrab, TiledResizeGrab, ScrollDragGrab>;
+    // A Mod+right-click awaiting enough pointer motion to become a resize. The
+    // real grab would drop the maximize bookkeeping the double-click toggle
+    // restores from (scrolling clears the saved width fraction at grab start);
+    // as a grab state the press still sits behind the release, swallow,
+    // isPassthrough() and reset paths. The edges are the press point's, since
+    // the thirds zones make them position-sensitive.
+    struct PendingResizeGrab {
+      View* view = nullptr;
+      uint32_t button = 0;
+      double startX = 0;
+      double startY = 0;
+      uint32_t edges = 0;
+      // Where the edges were resolved; a layout or axis change invalidates them
+      // (a floating press keeps nullptr: its edges are plain flags).
+      Workspace* workspace = nullptr;
+      Layout* layout = nullptr;
+    };
+    using GrabState =
+        std::variant<PassthroughGrab, MoveGrab, FloatingResizeGrab, TiledResizeGrab, PendingResizeGrab, ScrollDragGrab>;
 
     struct TabletToolState {
       Cursor* cursor = nullptr;
@@ -144,6 +175,8 @@ namespace umbriel {
     // layout, so layout-directed input (wheel scrolling, insert hints) applies
     // to the drag.
     [[nodiscard]] bool isDraggingIntoLayout() const;
+    // Pending presses do not own geometry until they become an actual resize.
+    [[nodiscard]] bool isResizingView(const View* view) const;
     // A tiled resize updates every view in its workspace without size
     // animations trailing the pointer.
     [[nodiscard]] bool isResizingWorkspace(const Workspace* workspace) const;
@@ -155,16 +188,23 @@ namespace umbriel {
     // Data-device drags can scroll a scrolling workspace while held at its
     // primary-axis edge. Seat owns the drag lifecycle; Cursor owns its pointer
     // position and timer-driven motion.
+    void beginToplevelDrag(View* view, int x, int y, bool tileOnDrop);
+    void finishToplevelDrag(bool place);
+    [[nodiscard]] View* toplevelDragView() const { return m_toplevelDrag ? grabbedView() : nullptr; }
     void handleDataDragStarted();
     void handleDataDragEnded();
     void setCursorSurface(wlr_surface* surface, int32_t hotspotX, int32_t hotspotY, wl_client* owner);
     void setXcursor(const char* name);
-    // A deferred move starts as a click and becomes a drag once the pointer travels, the way a tiled move does.
-    bool beginMove(View* view, uint32_t button, bool deferred = false);
+    void noteActivity();
+    void hideCursor();
+    bool beginMove(View* view, uint32_t button, bool deferUntilThreshold = false);
     bool beginResize(View* view, uint32_t edges, uint32_t button);
     // A null seat client is an X11 move/resize request, which carries no serial.
     void beginClientMove(View* view, wlr_seat_client* seatClient, uint32_t serial);
     void beginClientResize(View* view, wlr_seat_client* seatClient, uint32_t serial, uint32_t edges);
+    // A view is going away: drop the click-pair record that references it. The
+    // grab reset paths cover any deferred or promoted press.
+    void forgetView(const View* view);
     void resetMode();
     // Warp the cursor to a layout position and run the motion pipeline (pointer focus, xcursor, pointer-output
     // tracking, idle). Output actions use it so focus follows the cursor onto the target monitor.
@@ -281,6 +321,9 @@ namespace umbriel {
     // the pointer has committed to the drag.
     void beginDrag(MoveGrab& grab);
     void updateDropTarget();
+    void updateSnapPreview();
+    void clearSnapPreview();
+    static int onSnapDwellTimer(void* data);
     // Present the size the drop will land on, so the drag is already the right
     // shape when it gets there.
     void retargetDragSize(MoveGrab& grab);
@@ -299,6 +342,25 @@ namespace umbriel {
     clientPointerGrabButton(const View* view, wlr_seat_client* seatClient, uint32_t serial) const;
     [[nodiscard]] uint32_t floatResizeEdges(View* view) const;
     [[nodiscard]] uint32_t hoverResizeEdges(View* view) const;
+    // True when this press completes a Mod+double-right-click with the
+    // recorded one (same window, within the time window and pointer slop).
+    [[nodiscard]] bool isModRightDoubleClick(uint32_t timeMsec, const View* view) const;
+    // Record a Mod+right-click as the pair's first press.
+    void recordModRightClick(uint32_t timeMsec, View* view);
+    // Promote a deferred Mod+right resize to a real grab once the pointer is
+    // about to leave the click's slop. Runs before the cursor moves so the grab
+    // starts at the press-side position: beginResize derives its resize edges
+    // and grab offsets from the pointer, and a jump-then-grab would propose the
+    // wrong edges.
+    void promotePendingModRightResize(double nextX, double nextY);
+    // The resize edges a press point proposes (0 = none): thirds zones over the
+    // presented box intersected with the usable area, minus the edges the
+    // layout cannot resize. Shared with beginResize so a deferred grab and a
+    // live one cannot drift apart.
+    [[nodiscard]] uint32_t tiledResizeEdges(View* view, double x, double y) const;
+    // A Mod+right click that resized nothing still reveals the focused tile,
+    // since a grab focus skips the reveal.
+    void revealClickedTile(View* view);
     void updateInteractiveCursor(View* under);
     void setCompositorCursor(const char* name);
     void restoreClientCursor();
@@ -318,9 +380,7 @@ namespace umbriel {
     static void onClientCursorDestroy(wl_listener* listener, void* data);
     static void onClientCursorClientCommit(wl_listener* listener, void* data);
     static void onClientCursorCommit(wl_listener* listener, void* data);
-    void noteActivity();
     void updateHideTimer();
-    void hideCursor();
     // Sends the pointer and its visibility to the cursor effect, only while one is active.
     void forwardEffectPointer() const;
     static int onHideTimer(void* data);
@@ -361,6 +421,7 @@ namespace umbriel {
     std::string m_ruleConfinementView;
     uint64_t m_ruleConfinementGeneration = 0;
 
+    bool m_toplevelDrag = false;
     GrabState m_grab;
     // Physical button that owns the current interactive pointer operation.
     uint32_t m_grabButton = 0;
@@ -370,6 +431,25 @@ namespace umbriel {
     // Presses consumed by config binds or ignored during an interactive move;
     // their release is swallowed too, even if the grab ended first.
     std::vector<uint32_t> m_swallowedButtons;
+    // Previous Mod+right-click, for the double-click that toggles maximize.
+    struct ModRightClick {
+      uint32_t timeMsec = 0;
+      double x = 0;
+      double y = 0;
+      View* view = nullptr;
+    };
+    ModRightClick m_lastModRightClick;
+    struct TitleBarClick {
+      uint32_t timeMsec = 0;
+      double x = 0;
+      double y = 0;
+      View* view = nullptr;
+    } m_lastTitleBarClick;
+    struct SsdButtonPress {
+      View* view = nullptr;
+      SsdFramePart part = SsdFramePart::None;
+    } m_ssdButtonPress;
+    View* m_ssdHoverView = nullptr;
     std::vector<std::unique_ptr<TabletToolState>> m_tools;
     bool m_hoverFocusInvalidated = false;
     bool m_compositorOwnsCursor = false;
@@ -392,6 +472,7 @@ namespace umbriel {
     uint32_t m_clientCursorImageHeight = 0;
     wl_event_source* m_hideTimer = nullptr;
     wl_event_source* m_hotCornerTimer = nullptr;
+    wl_event_source* m_snapDwellTimer = nullptr;
     wl_event_source* m_dataDragEdgeScrollTimer = nullptr;
     Workspace* m_dataDragEdgeScrollWorkspace = nullptr;
     double m_dataDragEdgeScrollSpeed = 0;

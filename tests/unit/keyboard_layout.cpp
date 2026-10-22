@@ -71,4 +71,44 @@ UMBRIEL_TEST(rejectsAnInvalidSourceGroup) {
   CHECK(!matchingLayoutGroup(target.get(), source.get(), 2).has_value());
 }
 
+namespace {
+  const umbriel::XkbNames kSystem{
+      .layout = "us", .variant = "intl", .options = "terminate:ctrl_alt_bksp", .model = "pc105"
+  };
+} // namespace
+
+UMBRIEL_TEST(systemKeymapAppliesWhenConfigSetsNoXkbNames) {
+  const umbriel::Config::Input input;
+  CHECK(umbriel::usesSystemXkbNames(input));
+  CHECK(umbriel::resolveXkbNames(input.keyboard, nullptr, kSystem) == kSystem);
+}
+
+UMBRIEL_TEST(anyConfiguredXkbNameReplacesTheWholeSystemKeymap) {
+  umbriel::Config::Input input;
+  input.keyboard.options = "caps:escape";
+  CHECK(!umbriel::usesSystemXkbNames(input));
+  const umbriel::XkbNames expected{.layout = "", .variant = "", .options = "caps:escape", .model = ""};
+  CHECK(umbriel::resolveXkbNames(input.keyboard, nullptr, kSystem) == expected);
+}
+
+UMBRIEL_TEST(deviceXkbNamesReplaceTheSystemKeymap) {
+  const umbriel::Config::Input input;
+  umbriel::Config::Input::Device device;
+  device.name = "kbd";
+  device.layout = "de";
+  const umbriel::XkbNames expected{.layout = "de", .variant = "", .options = "", .model = ""};
+  CHECK(umbriel::resolveXkbNames(input.keyboard, &device, kSystem) == expected);
+}
+
+UMBRIEL_TEST(deviceClearingEveryXkbNameFallsBackToTheSystemKeymap) {
+  umbriel::Config::Input input;
+  input.keyboard.layout = "fr";
+  umbriel::Config::Input::Device device;
+  device.name = "kbd";
+  device.layout = "";
+  input.devices.push_back(device);
+  CHECK(umbriel::usesSystemXkbNames(input));
+  CHECK(umbriel::resolveXkbNames(input.keyboard, input.devices.data(), kSystem) == kSystem);
+}
+
 int main() { return RUN_TESTS(); }

@@ -266,7 +266,6 @@ wait_for_file "$NATIVE" "$NATIVE/trace/dbus-graphical"
 wait_for_file "$NATIVE" "$NATIVE/autostart-environment" true
 assert_autostart_environment "$NATIVE"
 [[ $(< "$NATIVE/trace/order") == $'systemd-graphical\nsystemd-configured\ndbus-graphical\ntarget' ]]
-grep -Fq "spawned 'session environment synchronization'" "$NATIVE/compositor.log"
 ! grep -Fq 'systemctl --user set-environment' "$NATIVE/compositor.log"
 
 sed -i 's/UMBRIEL_TEST_ONE = "alpha beta"/UMBRIEL_TEST_ONE = "reloaded"/' "$NATIVE/config.toml"

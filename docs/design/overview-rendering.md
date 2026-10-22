@@ -17,6 +17,14 @@ focus came from; fullscreen and maximize transitions retain that direction.
 Transparent windows keep their window-rule blur throughout the zoom
 transition.
 
+Top- and overlay-layer panels and their popups remain interactive in overview.
+After the last pointer button is released, pointer focus follows the surface
+under the cursor using the same panel passthrough policy as pointer motion.
+Releasing over a panel retains its pointer position through the pointer frame,
+so menus opened from that release stay anchored to the click. Releasing over
+the inert desktop clears client focus, and a dragged overview card continues
+to own the pointer.
+
 ## Touchpad navigation
 
 Two-finger scrolling and three-finger swipes reach the same `OverviewNavigation`
@@ -141,6 +149,12 @@ client. The background layer stays enabled: it is the blur source and what shows
 around the filmstrip. An output where no client maps either layer shows the flat
 fill.
 
+Each copy carries its surface's opaque region scaled to the preview and rounded
+inward, because a scene buffer's region is in destination coordinates. Behind
+an opaque wallpaper copy the scene then skips the background layer, the tint,
+and the wallpaper blur, which during the zoom would otherwise be drawn under
+every row.
+
 A dedicated scene root between the layer-shell background and bottom layers
 carries each output's wallpaper blur node. This placement blurs the background
 layer while bottom-layer surfaces render afterward and remain sharp. The node's
@@ -183,6 +197,9 @@ The relevant checks are:
 
 - [`tests/harness/checks/overview/wheel.sh`](../../tests/harness/checks/overview/wheel.sh)
   for overview interaction and workspace navigation.
+- [`tests/harness/checks/overview/panel_popup_anchor.sh`](../../tests/harness/checks/overview/panel_popup_anchor.sh)
+  for release-driven panel menu anchors, rendered popup positions, and an
+  implicit grab releasing over the inert desktop.
 - [`tests/unit/animation.cpp`](../../tests/unit/animation.cpp) for terminal
   spring motion following the analytic solution without accelerating in either
   direction at the same refresh rate.

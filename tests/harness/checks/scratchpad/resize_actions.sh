@@ -16,9 +16,6 @@ cat >> "$UMBRIEL_CONFIG" <<'EOF'
 [animation]
 enabled = false
 
-[animation.scratchpad]
-scale = 0
-
 [[window_rule]]
 match.title = "^scratchpad-resize-background$"
 default_floating = true

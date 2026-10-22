@@ -101,7 +101,8 @@ namespace umbriel {
       wlr_scene_blur_set_ignore_alpha(m_node, options.ignoreAlpha);
     }
 
-    wlr_scene_blur_set_should_only_blur_bottom_layer(m_node, options.optimized.value_or(cfg.optimized));
+    m_optimized = options.optimized.value_or(cfg.optimized);
+    wlr_scene_blur_set_should_only_blur_bottom_layer(m_node, m_optimized && !m_live);
 
     wlr_scene_node_set_enabled(&m_node->node, true);
     wlr_scene_node_set_position(&m_node->node, drawBox.x, drawBox.y);
@@ -120,6 +121,13 @@ namespace umbriel {
     m_alpha = alpha;
     if (m_node != nullptr && m_node->alpha != alpha) {
       wlr_scene_blur_set_alpha(m_node, alpha);
+    }
+  }
+
+  void SurfaceBlur::setLive(bool live) {
+    m_live = live;
+    if (m_node != nullptr) {
+      wlr_scene_blur_set_should_only_blur_bottom_layer(m_node, m_optimized && !m_live);
     }
   }
 

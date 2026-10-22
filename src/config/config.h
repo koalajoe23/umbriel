@@ -3,8 +3,10 @@
 #include "config/effects.h"
 #include "config/keybind_parse.h"
 #include "config/value_parse.h"
+#include "config/window_position.h"
 #include "core/animation.h"
 #include "layout/layout.h"
+#include "scene/ssd_frame_geometry.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +32,8 @@ namespace umbriel {
     Horizontal,
   };
 
+  enum class TitleBarMode : uint8_t { On, Forced, Off };
+
   enum class ModifierKey {
     Super,
     Alt,
@@ -45,6 +49,12 @@ namespace umbriel {
     Floating = 1 << 1,
     Pinned = 1 << 2,
     All = Tiled | Floating | Pinned,
+  };
+
+  // Which maximize state a tiled window's own maximize request enters (client_maximize).
+  enum class ClientMaximize : uint8_t {
+    Column,
+    Edges,
   };
 
   // What a tab bar draws in each slot.
@@ -85,6 +95,7 @@ namespace umbriel {
     LayoutStrutOverrides struts;
     std::optional<std::vector<double>> extentPresets;
     std::optional<FullscreenExitScope> newExitsFullscreen;
+    std::optional<ClientMaximize> clientMaximize;
     struct Scrolling {
       std::optional<double> defaultExtentFraction;
       std::optional<bool> centerUnderfullStrip;
@@ -140,6 +151,7 @@ namespace umbriel {
     LayoutStruts struts;
     std::vector<double> extentPresets{1.0 / 3, 0.5, 2.0 / 3};
     FullscreenExitScope newExitsFullscreen = FullscreenExitScope::None;
+    ClientMaximize clientMaximize = ClientMaximize::Column;
     struct Scrolling {
       std::optional<double> defaultExtentFraction;
       bool centerUnderfullStrip = true;
@@ -168,6 +180,8 @@ namespace umbriel {
       bool middleClickCloses = false;
       // Derived from [appearance.tab_bar]; set by resolve function. The bar's space is part of the layout.
       int barHeight = 24;
+      // [appearance.tab_bar] gap, or the layout gap when that is -1.
+      int barGap = 8;
       TabBarPosition barPosition = TabBarPosition::Top;
       bool hideWhenSingle = false;
       // Whether bars are drawn unless a group says otherwise.
@@ -221,10 +235,23 @@ namespace umbriel {
     LeftMiddleRight,
   };
 
+  enum class DragLock : uint8_t {
+    Off,
+    Timeout,
+    Sticky,
+  };
+
   enum class WindowDragToggle : uint8_t {
     None,
     Floating,
     Pinned,
+  };
+
+  // What a second Mod+right-click on the same window does; "none" disables the
+  // gesture and keeps the button a pure resize drag.
+  enum class ModRightDoubleClick : uint8_t {
+    None,
+    Maximize,
   };
 
   enum class HdrMode {
@@ -232,6 +259,10 @@ namespace umbriel {
     On,
     Auto,
     Fullscreen,
+  };
+  enum class SdrTransfer {
+    Gamma22,
+    Srgb,
   };
   [[nodiscard]] constexpr std::string_view hdrModeName(HdrMode mode) {
     switch (mode) {
@@ -281,6 +312,7 @@ namespace umbriel {
     bool directScanout = true;
     HdrMode hdr = HdrMode::Off;
     float sdrWhite = 203.0F;
+    SdrTransfer sdrTransfer = SdrTransfer::Gamma22;
     std::optional<std::string> screenEffect; // "off" disables the default
     // Render bit depth for SDR output: 8 (default) or 10 for 10-bit SDR.
     int bitDepth = 8;
@@ -307,25 +339,6 @@ namespace umbriel {
       bool operator==(const Layout&) const = default;
     } layout;
     bool operator==(const OutputRule&) const = default;
-  };
-
-  enum class WindowPositionAnchor {
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-    Top,
-    Bottom,
-    Left,
-    Right,
-    Center,
-  };
-
-  struct WindowPosition {
-    int x = 0;
-    int y = 0;
-    WindowPositionAnchor anchor = WindowPositionAnchor::Center;
-    bool operator==(const WindowPosition&) const = default;
   };
 
   enum class ContentType {
@@ -359,6 +372,8 @@ namespace umbriel {
     bool alone = false;
     // Stricter than alone: floating windows are included.
     bool onlyWindow = false;
+    // The client named a parent window for it.
+    bool dialog = false;
 
     [[nodiscard]] bool operator==(const WindowRuleState& other) const = default;
   };
@@ -393,6 +408,7 @@ namespace umbriel {
     std::optional<bool> matchScratchpad;
     std::optional<bool> matchAlone;
     std::optional<bool> matchOnlyWindow;
+    std::optional<bool> matchDialog;
     std::optional<bool> matchAtStartup;
     std::optional<std::string> defaultOutput;
     std::optional<bool> defaultFloating;
@@ -414,7 +430,12 @@ namespace umbriel {
     std::optional<bool> defaultFocused;
     std::optional<bool> defaultPinned;
     std::optional<bool> focusOnActivate;
+    // Lets a modal dialog hang on its parent's frame (true, the default) or opens it as an ordinary window (false).
+    std::optional<bool> attachToParent;
     std::optional<bool> confinePointer;
+    // Keep a hidden window unsuspended and pace its frame callbacks at its output's refresh rate, for clients whose
+    // non-rendering work stalls without them.
+    std::optional<bool> backgroundRender;
     std::optional<VrrMode> vrr;
     // Overrides the client's tearing-control hint. Omitted follows the hint,
     // true forces async preference, and false vetoes it.
@@ -425,6 +446,7 @@ namespace umbriel {
     std::optional<bool> blurPopups;
     std::optional<double> blurIgnoreAlpha;
     std::optional<bool> blurOptimized;
+    std::optional<TitleBarMode> titleBar;
     // Overrides [colors.border] for windows this rule matches.
     std::optional<std::array<float, 4>> borderColorFocused;
     std::optional<std::array<float, 4>> borderColorUnfocused;
@@ -451,6 +473,7 @@ namespace umbriel {
           && matchScratchpad == other.matchScratchpad
           && matchAlone == other.matchAlone
           && matchOnlyWindow == other.matchOnlyWindow
+          && matchDialog == other.matchDialog
           && matchAtStartup == other.matchAtStartup
           && defaultOutput == other.defaultOutput
           && defaultFloating == other.defaultFloating
@@ -472,7 +495,9 @@ namespace umbriel {
           && defaultFocused == other.defaultFocused
           && defaultPinned == other.defaultPinned
           && focusOnActivate == other.focusOnActivate
+          && attachToParent == other.attachToParent
           && confinePointer == other.confinePointer
+          && backgroundRender == other.backgroundRender
           && vrr == other.vrr
           && allowTearing == other.allowTearing
           && hdr == other.hdr
@@ -481,6 +506,7 @@ namespace umbriel {
           && blurPopups == other.blurPopups
           && blurIgnoreAlpha == other.blurIgnoreAlpha
           && blurOptimized == other.blurOptimized
+          && titleBar == other.titleBar
           && borderColorFocused == other.borderColorFocused
           && borderColorUnfocused == other.borderColorUnfocused
           && borderColorOuter == other.borderColorOuter
@@ -515,7 +541,9 @@ namespace umbriel {
     std::optional<bool> defaultFocused;
     std::optional<bool> defaultPinned;
     std::optional<bool> focusOnActivate;
+    std::optional<bool> attachToParent;
     std::optional<bool> confinePointer;
+    std::optional<bool> backgroundRender;
     std::optional<VrrMode> vrr;
     std::optional<bool> allowTearing;
     std::optional<HdrMode> hdr;
@@ -524,6 +552,7 @@ namespace umbriel {
     std::optional<bool> blurPopups;
     std::optional<double> blurIgnoreAlpha;
     std::optional<bool> blurOptimized;
+    std::optional<TitleBarMode> titleBar;
     std::optional<std::array<float, 4>> borderColorFocused;
     std::optional<std::array<float, 4>> borderColorUnfocused;
     std::optional<std::array<float, 4>> borderColorOuter;
@@ -594,6 +623,15 @@ namespace umbriel {
     // cheatsheet, the diagnostics banner, the quit confirmation, and overview
     // badge text.
     struct Colors {
+      struct TitleBar {
+        std::array<float, 4> background{0.1607843F, 0.1607843F, 0.2F, 1.0F};
+        std::array<float, 4> backgroundUnfocused{0.1019608F, 0.1019608F, 0.1215686F, 1.0F};
+        std::array<float, 4> text{0.9098039F, 0.9098039F, 0.9176471F, 1.0F};
+        std::array<float, 4> textUnfocused{0.5411765F, 0.5411765F, 0.5725490F, 1.0F};
+        std::array<float, 4> close{1.0F, 0.4196078F, 0.4196078F, 1.0F};
+        std::array<float, 4> maximize{0.4784314F, 0.6392157F, 1.0F, 1.0F};
+        bool operator==(const TitleBar&) const = default;
+      } titleBar;
       std::array<float, 4> background{0.0784314F, 0.0784314F, 0.0980392F, 1.0F};
       std::array<float, 4> textPrimary{0.9098039F, 0.9098039F, 0.9176471F, 1.0F};
       std::array<float, 4> textMuted{0.5411765F, 0.5411765F, 0.5725490F, 1.0F};
@@ -644,6 +682,13 @@ namespace umbriel {
     } colors;
 
     struct Appearance {
+      struct TitleBar {
+        TitleBarMode mode = TitleBarMode::Off;
+        int height = 28;
+        std::string font = "sans 10";
+        TitleBarButtonSide buttonPosition = TitleBarButtonSide::Right;
+        bool operator==(const TitleBar&) const = default;
+      } titleBar;
       int borderWidth = 2;
       int outerBorderWidth = 0;
       int cornerRadius = 10;
@@ -682,6 +727,8 @@ namespace umbriel {
         int padding = 8;
         // Space between neighbouring slots.
         int tabGap = 2;
+        // Space between the bar and its window; -1 follows the layout gap.
+        int gap = -1;
         // -1 follows corner_radius.
         int cornerRadius = -1;
         // {title}, {app_id} and {index} are replaced; a window without a title shows its app id instead.
@@ -735,11 +782,20 @@ namespace umbriel {
         std::string effect;
         bool enabled = true;
         int durationMs = 250;
-        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 900.0}};
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 800.0}};
         bool operator==(const WindowsMove&) const = default;
       } windowsMove;
 
+      // The size half of a tiled window's layout change; windows_move keeps the position.
+      struct WindowsResize {
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 900.0}};
+        bool operator==(const WindowsResize&) const = default;
+      } windowsResize;
+
       struct Workspaces {
+        std::string style = "slide";
         std::string effect;
         bool enabled = true;
         int durationMs = 250;
@@ -766,11 +822,17 @@ namespace umbriel {
         AnimationCurve curve{.easing = Easing::Spring, .spring = {.damping = 1.0, .stiffness = 800.0}};
         double dim = 0.8;
         bool blur = false;
-        double scale = 0.0;
-        bool maximize = false;
-        bool fullscreen = false;
         bool operator==(const Scratchpad&) const = default;
       } scratchpad;
+
+      // The shade over a window while a modal dialog is attached to it. `dim` stays without the fade when disabled.
+      struct Dialogs {
+        bool enabled = true;
+        int durationMs = 250;
+        AnimationCurve curve{.easing = Easing::EaseOutCubic};
+        double dim = 0.3;
+        bool operator==(const Dialogs&) const = default;
+      } dialogs;
 
       struct Border {
         std::string effect;
@@ -883,6 +945,7 @@ namespace umbriel {
       LayoutStruts struts;
       std::vector<double> extentPresets{1.0 / 3, 0.5, 2.0 / 3};
       FullscreenExitScope newExitsFullscreen = FullscreenExitScope::None;
+      ClientMaximize clientMaximize = ClientMaximize::Column;
       struct Scrolling {
         std::optional<double> defaultExtentFraction;
         bool centerUnderfullStrip = true;
@@ -941,10 +1004,14 @@ namespace umbriel {
       // Present outputs to X11 clients at their physical resolution, so they render at native size instead of being
       // upscaled on scaled outputs. Requires restart.
       bool xwaylandNativeResolution = false;
+      // Run an XSETTINGS manager in Xwayland that announces the X screen scale and cursor theme. Requires restart.
+      bool xwaylandXsettings = true;
       // Show the keybinds cheatsheet overlay on startup.
       bool showCheatsheet = true;
       // Honor activation requests by focusing and revealing the target window.
       bool focusOnActivate = false;
+      // Hang a modal dialog on its parent's frame, so it follows the parent and holds its input.
+      bool attachModalDialogs = true;
       // Honor maximized state restored by a client while its window opens.
       bool honorRestoredMaximize = false;
       bool operator==(const General&) const = default;
@@ -979,9 +1046,15 @@ namespace umbriel {
       // Let a client start an interactive move from its own drag area
       // (xdg_toplevel.move), such as a CSD title bar or Chromium tab strip.
       bool clientWindowDrag = true;
+      // Preview and apply half or quarter placement while dragging to output edges.
+      bool windowSnapping = false;
       // Retarget an interactive window drag with the free mouse button: float
       // it, pin it, or leave the drag alone.
       WindowDragToggle windowDragToggle = WindowDragToggle::None;
+      // What a second Mod+right-click on the same window within the
+      // double-click window does. "none" keeps Mod+right-click a pure resize
+      // drag.
+      ModRightDoubleClick modRightDoubleClick = ModRightDoubleClick::None;
 
       struct Keyboard {
         // Comma-separated XKB layout list ("us,de"); the first entry is active at startup. `options` carries XKB option
@@ -990,6 +1063,7 @@ namespace umbriel {
         std::string layout;
         std::string variant;
         std::string options;
+        std::string model;
         int repeatRate = 25;
         int repeatDelay = 600;
         bool numlockToggle = false;
@@ -1000,7 +1074,10 @@ namespace umbriel {
       } keyboard;
 
       struct Touchpad {
+        bool enabled = true;
         std::optional<bool> tap = true;
+        std::optional<bool> tapAndDrag;
+        std::optional<DragLock> dragLock;
         std::optional<bool> naturalScroll;
         std::optional<bool> leftHanded;
         std::optional<AccelProfile> accelProfile;
@@ -1087,9 +1164,13 @@ namespace umbriel {
         std::optional<std::string> layout;
         std::optional<std::string> variant;
         std::optional<std::string> options;
+        std::optional<std::string> model;
         std::optional<int> repeatRate;
         std::optional<int> repeatDelay;
+        std::optional<bool> enabled;
         std::optional<bool> tap;
+        std::optional<bool> tapAndDrag;
+        std::optional<DragLock> dragLock;
         std::optional<bool> naturalScroll;
         std::optional<bool> leftHanded;
         std::optional<AccelProfile> accelProfile;
@@ -1143,7 +1224,8 @@ namespace umbriel {
   }
 
   [[nodiscard]] const Config& config();
-  [[nodiscard]] bool loadConfig(const char* explicitPath);
+  void loadConfig(const char* explicitPath);
+  [[nodiscard]] ConfigReloadResult replaceConfig(const std::filesystem::path& explicitPath, std::string& errors);
   [[nodiscard]] ConfigReloadResult reloadConfig();
   [[nodiscard]] const std::vector<std::filesystem::path>& configWatchPaths();
   [[nodiscard]] const std::vector<ConfigDiagnostic>& configDiagnostics();

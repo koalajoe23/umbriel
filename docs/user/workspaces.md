@@ -94,7 +94,8 @@ forms:
 - Bare digits from `1` to `64` select a one-based position.
 - Other text selects an exact, case-sensitive name.
 - Double quotes force name lookup for an all-digit name.
-- `/output` restricts either form to one output.
+- `/output` restricts selection to that output. A named selector can also use
+  its unavailable original output to find an evacuated workspace.
 
 ```text
 workspace-switch:3
@@ -106,6 +107,14 @@ workspace-switch:"3"/DP-2
 Duplicate names resolve on the pointer-preferred output when possible.
 Otherwise the selector is ambiguous. On a dynamic output, a numeric position
 beyond the current count selects the last workspace.
+
+Evacuated named workspaces keep their names even when appended at different
+positions on another output. Within one output, a native workspace takes
+precedence over evacuated workspaces with the same name. Multiple evacuated
+workspaces with the same name are ambiguous unless qualified by their original
+output. For example, `workspace-switch:"4"/DP-1` follows the named workspace
+`"4"` while `DP-1` is unavailable; `workspace-switch:4/DP-1` remains a position
+on a live `DP-1`. Disabled outputs are excluded from global name lookup.
 
 ## Inspect workspace state
 
@@ -171,11 +180,12 @@ rule can override only `layout.struts.top`.
 | `name` | Select an exact name and create it on matching dynamic outputs. |
 | `index` | Select a current one-based position from 1 to 64. |
 | `output` | Restrict the rule to a connector or monitor name. |
-| `layout.mode` | Use `"scrolling"`, `"dwindle"`, or `"master"`. |
+| `layout.mode` | Use `"scrolling"`, `"dwindle"`, `"master"`, or `"floating"`. |
 | `layout.gap` | Set the window gap. |
 | `layout.struts.{left,right,top,bottom}` | Reserve signed logical pixels at each edge. |
 | `layout.extent_presets` | Set extent-cycle fractions. |
 | `layout.new_exits_fullscreen` | Choose which arriving windows exit fullscreen; see [Leaving fullscreen](layout.md#leaving-fullscreen). |
+| `layout.client_maximize` | Choose `"column"` or `"edges"` for a tiled window's own maximize request; see [Maximize and fullscreen](layout.md#maximize-and-fullscreen). |
 | `layout.scrolling.default_extent_fraction` | Set the initial scrolling-column extent. |
 | `layout.scrolling.center_underfull_strip` | Center or start-align an underfull strip. |
 | `layout.scrolling.center_focused` | Control when focus changes center a column. |

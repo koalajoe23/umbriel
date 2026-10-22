@@ -63,6 +63,42 @@ wait_for_home() {
   return 1
 }
 
+assert_workspace_evacuation() {
+  local native=$1 title workspace home other found
+  shift
+  local -A temporary=()
+  for title in "$@"; do
+    workspace=
+    found=false
+    for _ in $(seq 80); do
+      workspace=$(field_of "$title" workspace)
+      if [[ $workspace == HEADLESS-2:* && $workspace != "$native" ]] \
+        && "$UMBRIEL" workspaces --json | jq -e --arg id "$workspace" \
+          'any(.[]; .id == $id and .named == false)' > /dev/null; then
+        found=true
+        break
+      fi
+      sleep 0.1
+    done
+    if [[ $found != true ]]; then
+      echo "expected '$title' on a separate anonymous temporary workspace, got '$workspace' (native '$native')"
+      return 1
+    fi
+    home=${workspace_of[$title]}
+    if [[ -n ${temporary[$home]:-} && ${temporary[$home]} != "$workspace" ]]; then
+      echo "source workspace '$home' split '$title' from its peers: ${temporary[$home]} and $workspace"
+      return 1
+    fi
+    for other in "${!temporary[@]}"; do
+      if [[ $other != "$home" && ${temporary[$other]} == "$workspace" ]]; then
+        echo "source workspaces '$home' and '$other' merged into '$workspace'"
+        return 1
+      fi
+    done
+    temporary[$home]=$workspace
+  done
+}
+
 wait_for_field() {
   local title=$1 field=$2 expected=$3 actual=
   for _ in $(seq 80); do
@@ -151,17 +187,24 @@ wait_for_snapshot() {
 }
 
 destroy_home_with_workspace_views() {
+  local native
+  native=$("$UMBRIEL" workspaces --json | jq -r '.[] | select(.output == "HEADLESS-2" and .index == 1) | .id')
   "$UMBRIEL" output-destroy HEADLESS-1 > /dev/null
-  for title in "${titles[@]}"; do
-    wait_for_home "$title" HEADLESS-2/1
-  done
+  if [[ ${1:-} == pinned ]]; then
+    assert_workspace_evacuation "$native" "${anchors[@]}"
+    for title in "${probes[@]}"; do
+      wait_for_field "$title" workspace "$native"
+    done
+  else
+    assert_workspace_evacuation "$native" "${titles[@]}"
+  fi
 }
 
 destroy_home_with_scratchpad_views() {
+  local native
+  native=$("$UMBRIEL" workspaces --json | jq -r '.[] | select(.output == "HEADLESS-2" and .index == 1) | .id')
   "$UMBRIEL" output-destroy HEADLESS-1 > /dev/null
-  for title in "${anchors[@]}"; do
-    wait_for_home "$title" HEADLESS-2/1
-  done
+  assert_workspace_evacuation "$native" "${anchors[@]}"
   for title in "${probes[@]}"; do
     wait_for_home "$title" ''
   done
@@ -311,7 +354,7 @@ for title in "${probes[@]}"; do
   "$UMBRIEL" msg window-center > /dev/null
 done
 pinned_before=$(wait_for_stable_snapshot all)
-destroy_home_with_workspace_views
+destroy_home_with_workspace_views pinned
 for title in "${probes[@]}"; do
   wait_for_field "$title" floating true
 done
@@ -357,13 +400,11 @@ wait_for_field late-float floating true
 
 write_matrix_config false true
 "$UMBRIEL" msg config-reload > /dev/null
-for title in "${titles[@]}"; do
-  wait_for_home "$title" HEADLESS-2/1
-done
+wait_for_home late-float HEADLESS-2/1
+assert_workspace_evacuation "$(field_of late-float workspace)" "${titles[@]}"
 for title in "${probes[@]}"; do
   wait_for_field "$title" floating true
 done
-wait_for_home late-float HEADLESS-2/1
 wait_for_field late-float floating true
 wait_for_home legit-scratch ''
 "$UMBRIEL" msg "scratchpad-focus-next:$SCRATCHPAD" > /dev/null
@@ -379,6 +420,8 @@ wait_for_home legit-scratch ''
 "$UMBRIEL" msg "window-close:$(field_of legit-scratch id)" > /dev/null
 count=$((count - 1))
 wait_for_count "$count"
+# Closing the last member leaves the empty scratchpad open; dismiss it before the next phase.
+"$UMBRIEL" msg "scratchpad-toggle:$SCRATCHPAD" > /dev/null
 "$UMBRIEL" msg "window-close:$(field_of late-float id)" > /dev/null
 count=$((count - 1))
 wait_for_count "$count"

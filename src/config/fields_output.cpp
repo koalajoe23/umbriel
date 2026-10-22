@@ -138,6 +138,10 @@ namespace umbriel {
           registry::choice("vrr", &O::vrr, vrrModes()),
           registry::choice("hdr", &O::hdr, hdrModes()),
           registry::real("sdr_white", 80.0, 1000.0, &O::sdrWhite),
+          registry::choice(
+              "sdr_transfer", &O::sdrTransfer,
+              {{.name = "gamma22", .value = SdrTransfer::Gamma22}, {.name = "srgb", .value = SdrTransfer::Srgb}}
+          ),
           custom<O>(
               "bit_depth", KeyDescription("int").withRange(8, 10),
               [](const toml::node& node, const std::string& path, O& target, registry::ReadContext&) {

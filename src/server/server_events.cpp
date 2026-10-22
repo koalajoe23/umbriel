@@ -7,6 +7,7 @@
 #include "input/gestures.h"
 #include "input/keyboard.h"
 #include "input/seat.h"
+#include "input/system_keymap.h"
 #include "input/text_input.h"
 #include "layer/layer_surface.h"
 #include "layout/scrolling.h"
@@ -186,6 +187,8 @@ namespace umbriel {
         return;
       }
       watch->pendingMode = resolvedDecorationMode(watch->decoration);
+      if (View* view = View::fromSurface(surface->surface))
+        view->setXdgDecorationPreference(watch->pendingMode == WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
       // set_mode schedules a configure; that asserts unless the xdg_surface is ready.
       if (surface->initialized) {
         clearDecorationCommit(watch);
@@ -209,10 +212,41 @@ namespace umbriel {
       XdgDecorationWatch* watch;
       watch = wl_container_of(listener, watch, destroy);
       if (watch->decoration != nullptr) {
+        if (watch->decoration->toplevel != nullptr && watch->decoration->toplevel->base != nullptr) {
+          if (View* view = View::fromSurface(watch->decoration->toplevel->base->surface))
+            view->setXdgDecorationPreference(std::nullopt);
+        }
         watch->decoration->data = nullptr;
       }
       wl_list_remove(&watch->requestMode.link);
       clearDecorationCommit(watch);
+      wl_list_remove(&watch->destroy.link);
+      delete watch;
+    }
+
+    struct LegacyDecorationWatch {
+      wlr_server_decoration* decoration = nullptr;
+      wl_listener mode{};
+      wl_listener destroy{};
+    };
+
+    void applyLegacyDecorationMode(wlr_server_decoration* decoration) {
+      if (View* view = View::fromSurface(decoration->surface))
+        view->setLegacyDecorationPreference(decoration->mode == WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
+    }
+
+    void onLegacyDecorationMode(wl_listener* listener, void*) {
+      LegacyDecorationWatch* watch;
+      watch = wl_container_of(listener, watch, mode);
+      applyLegacyDecorationMode(watch->decoration);
+    }
+
+    void onLegacyDecorationDestroy(wl_listener* listener, void*) {
+      LegacyDecorationWatch* watch;
+      watch = wl_container_of(listener, watch, destroy);
+      if (View* view = View::fromSurface(watch->decoration->surface))
+        view->setLegacyDecorationPreference(std::nullopt);
+      wl_list_remove(&watch->mode.link);
       wl_list_remove(&watch->destroy.link);
       delete watch;
     }
@@ -463,7 +497,21 @@ namespace umbriel {
 
       const Config::Input& input = config().input;
       const Config::Input::Device* override = input.findDevice(device->name != nullptr ? device->name : "");
+
       const bool isTouchpad = libinput_device_config_tap_get_finger_count(libinputDevice) > 0;
+      const bool enabled =
+          override != nullptr && override->enabled ? *override->enabled : !isTouchpad || input.touchpad.enabled;
+      if ((libinput_device_config_send_events_get_modes(libinputDevice) & LIBINPUT_CONFIG_SEND_EVENTS_DISABLED) != 0) {
+        libinput_device_config_send_events_set_mode(
+            libinputDevice, enabled ? LIBINPUT_CONFIG_SEND_EVENTS_ENABLED : LIBINPUT_CONFIG_SEND_EVENTS_DISABLED
+        );
+      } else if (!enabled) {
+        kLog.warn("input: '{}' cannot be disabled", deviceName(device));
+      }
+      if (!enabled) {
+        return;
+      }
+
       if (isTouchpad) {
         const std::optional<bool>& tap = override != nullptr && override->tap ? override->tap : input.touchpad.tap;
         const auto tapState =
@@ -474,6 +522,45 @@ namespace umbriel {
           kLog.warn(
               "input: failed to apply {} to '{}'",
               override != nullptr && override->tap ? "input.device.tap" : "input.touchpad.tap", deviceName(device)
+          );
+        }
+        const bool hasTapDragOverride = override != nullptr && override->tapAndDrag.has_value();
+        const std::optional<bool>& tapAndDrag = hasTapDragOverride ? override->tapAndDrag : input.touchpad.tapAndDrag;
+        const auto tapDragState =
+            tapAndDrag.value_or(
+                libinput_device_config_tap_get_default_drag_enabled(libinputDevice) == LIBINPUT_CONFIG_DRAG_ENABLED
+            )
+            ? LIBINPUT_CONFIG_DRAG_ENABLED
+            : LIBINPUT_CONFIG_DRAG_DISABLED;
+        if (libinput_device_config_tap_set_drag_enabled(libinputDevice, tapDragState)
+            != LIBINPUT_CONFIG_STATUS_SUCCESS) {
+          kLog.warn(
+              "input: failed to apply {} to '{}'",
+              hasTapDragOverride ? "input.device.tap_and_drag" : "input.touchpad.tap_and_drag", deviceName(device)
+          );
+        }
+        const bool hasDragLockOverride = override != nullptr && override->dragLock.has_value();
+        const std::optional<DragLock>& dragLock = hasDragLockOverride ? override->dragLock : input.touchpad.dragLock;
+        enum libinput_config_drag_lock_state dragLockState =
+            libinput_device_config_tap_get_default_drag_lock_enabled(libinputDevice);
+        if (dragLock) {
+          switch (*dragLock) {
+          case DragLock::Off:
+            dragLockState = LIBINPUT_CONFIG_DRAG_LOCK_DISABLED;
+            break;
+          case DragLock::Timeout:
+            dragLockState = LIBINPUT_CONFIG_DRAG_LOCK_ENABLED_TIMEOUT;
+            break;
+          case DragLock::Sticky:
+            dragLockState = LIBINPUT_CONFIG_DRAG_LOCK_ENABLED_STICKY;
+            break;
+          }
+        }
+        if (libinput_device_config_tap_set_drag_lock_enabled(libinputDevice, dragLockState)
+            != LIBINPUT_CONFIG_STATUS_SUCCESS) {
+          kLog.warn(
+              "input: failed to apply {} to '{}'",
+              hasDragLockOverride ? "input.device.drag_lock" : "input.touchpad.drag_lock", deviceName(device)
           );
         }
         if ((libinput_device_config_send_events_get_modes(libinputDevice)
@@ -657,14 +744,7 @@ namespace umbriel {
       }
     }
     if (effects.input) {
-      m_surfaceLayouts.clear();
-      for (const auto& keyboard : m_keyboards) {
-        keyboard->applyConfig();
-      }
-      if (m_keyboardLayoutSource != nullptr) {
-        syncKeyboardLayout(m_keyboardLayoutSource);
-        notifyKeyboardLayoutIpc();
-      }
+      applyKeyboardConfig();
       for (const auto& pointer : m_pointers) {
         applyPointerConfig(pointer->device);
       }
@@ -773,12 +853,51 @@ namespace umbriel {
         }
       }
     }
+    if (effects.dialogAttachment) {
+      // Focus moves promote views in the registry, so walk a snapshot.
+      std::vector<View*> views;
+      views.reserve(m_registry.all().size());
+      for (const auto& view : m_registry.all()) {
+        views.push_back(view.get());
+      }
+      for (View* view : views) {
+        if (view->mapped()) {
+          view->reconcileAttachment();
+        }
+      }
+    }
   }
 
-  void Server::handleConfigReload() {
+  void Server::applyKeyboardConfig() {
+    m_surfaceLayouts.clear();
+    for (const auto& keyboard : m_keyboards) {
+      keyboard->applyConfig();
+    }
+    if (m_keyboardLayoutSource != nullptr) {
+      syncKeyboardLayout(m_keyboardLayoutSource);
+      notifyKeyboardLayoutIpc();
+    }
+  }
+
+  bool Server::refreshSystemKeymap() {
+    XkbNames names = usesSystemXkbNames(config().input) ? querySystemKeymap() : XkbNames{};
+    if (names == m_systemKeymap) {
+      return false;
+    }
+    if (!names.empty()) {
+      kLog.info(
+          "using the systemd-localed keymap: layout='{}' variant='{}' options='{}' model='{}'", names.layout,
+          names.variant, names.options, names.model
+      );
+    }
+    m_systemKeymap = std::move(names);
+    return true;
+  }
+
+  void Server::handleConfigReload(const ConfigReloadResult& result) {
     cancelModifierTap();
-    const ConfigReloadResult result = reloadConfig();
     if (result.success) {
+      const bool systemKeymapChanged = refreshSystemKeymap();
       if (result.change.drm) {
         kLog.warn("DRM configuration changed; restart Umbriel to apply it");
       }
@@ -794,6 +913,9 @@ namespace umbriel {
         m_overview->forceClose();
       }
       applyConfig(result.effects);
+      if (systemKeymapChanged && !result.effects.input) {
+        applyKeyboardConfig();
+      }
       if ((result.change.colors || result.change.appearance) && m_ipc != nullptr) {
         m_ipc->notifyThemeChanged();
       }
@@ -811,15 +933,21 @@ namespace umbriel {
     }
   }
 
-  // Sends frame callbacks to hidden-workspace toplevels (see kBackgroundFrameIntervalMs).
+  // Sends frame callbacks to toplevels off the rendered scene that could not be suspended (see
+  // kBackgroundFrameIntervalMs).
   int Server::onBackgroundFrameTimer(void* data) {
     auto* self = static_cast<Server*>(data);
     timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
 
     for (const auto& view : self->m_registry.all()) {
-      // A hidden tab is on the active workspace but, like a hidden workspace's windows, off the rendered scene.
-      if (!view->mapped() || (view->onActiveWorkspace() && !view->tabHidden())) {
+      // A presented view gets its callbacks from the outputs that draw it, including the outgoing workspace mid-slide,
+      // and a background_render view from its own faster tick. A suspended one gets them only to commit a configure it
+      // still owes, such as a resize while hidden.
+      if (!view->mapped()
+          || view->presented()
+          || view->backgroundRender()
+          || (view->suspended() && !view->configureOutstanding())) {
         continue;
       }
       view->forEachSurface(
@@ -834,6 +962,86 @@ namespace umbriel {
       wl_event_source_timer_update(self->m_backgroundFrameTimer, kBackgroundFrameIntervalMs);
     }
     return 0;
+  }
+
+  namespace {
+    // A hidden background_render window's callback interval: its output's refresh period, or 60 Hz when the output
+    // reports none (headless and nested outputs).
+    int backgroundRenderIntervalMs(const View& view) {
+      const Output* output = view.currentOutput();
+      const int refreshMhz = output != nullptr ? output->wlr()->refresh : 0;
+      if (refreshMhz <= 0) {
+        return 16;
+      }
+      return std::max(1, (1'000'000 + refreshMhz / 2) / refreshMhz);
+    }
+
+    bool needsBackgroundRender(const View& view) {
+      return view.mapped() && view.backgroundRender() && !view.presented();
+    }
+  } // namespace
+
+  int Server::onBackgroundRenderTimer(void* data) {
+    auto* self = static_cast<Server*>(data);
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (const auto& view : self->m_registry.all()) {
+      if (!needsBackgroundRender(*view)) {
+        continue;
+      }
+      view->forEachSurface(
+          [](wlr_surface* surface, int /*sx*/, int /*sy*/, void* userData) {
+            wlr_surface_send_frame_done(surface, static_cast<timespec*>(userData));
+          },
+          &now
+      );
+    }
+    self->armBackgroundRenderTimer();
+    return 0;
+  }
+
+  void Server::armBackgroundRenderTimer() {
+    if (m_backgroundRenderTimer == nullptr) {
+      return;
+    }
+    int interval = 0;
+    for (const auto& view : m_registry.all()) {
+      if (needsBackgroundRender(*view)) {
+        const int candidate = backgroundRenderIntervalMs(*view);
+        interval = interval == 0 ? candidate : std::min(interval, candidate);
+      }
+    }
+    // Zero disarms the timer.
+    wl_event_source_timer_update(m_backgroundRenderTimer, interval);
+  }
+
+  void Server::scheduleSuspensionSync() {
+    if (m_stopping || m_suspensionSyncIdle != nullptr) {
+      return;
+    }
+    m_suspensionSyncIdle = wl_event_loop_add_idle(wl_display_get_event_loop(m_display), onSuspensionSyncIdle, this);
+    if (m_suspensionSyncIdle == nullptr) {
+      kLog.error("failed to register suspension sync idle source");
+    }
+  }
+
+  void Server::onSuspensionSyncIdle(void* data) {
+    auto* server = static_cast<Server*>(data);
+    server->m_suspensionSyncIdle = nullptr;
+    for (const auto& view : server->m_registry.all()) {
+      view->syncSuspendedState();
+    }
+    server->armBackgroundRenderTimer();
+  }
+
+  bool Server::viewRenderedOffscreen(const View& view) const {
+    if (view.backgroundRender() || (m_overview != nullptr && m_overview->presentsLive(&view))) {
+      return true;
+    }
+    return view.m_captureSource != nullptr
+        && std::ranges::any_of(m_imageCopySessions, [&view](const std::unique_ptr<ImageCopySessionWatch>& watch) {
+             return watch->session != nullptr && watch->session->source == view.m_captureSource;
+           });
   }
 
   int Server::onStartupRulesTimer(void* data) {
@@ -904,6 +1112,11 @@ namespace umbriel {
     wl_list_remove(&m_rendererLost.link);
     wl_signal_add(&newRenderer->events.lost, &m_rendererLost);
 
+    for (const auto& output : m_outputs) {
+      if (auto* group = output->workspaceGroup()) {
+        group->cancelReveal();
+      }
+    }
     m_renderer = newRenderer;
     m_allocator = newAllocator;
     effectRegistry().prepare(m_renderer);
@@ -1000,7 +1213,14 @@ namespace umbriel {
   void Server::onNewXdgToplevel(wl_listener* listener, void* data) {
     Server* self;
     self = wl_container_of(listener, self, m_newXdgToplevel);
-    self->adoptView(std::make_unique<View>(*self, static_cast<wlr_xdg_toplevel*>(data)));
+    View& view = self->adoptView(std::make_unique<View>(*self, static_cast<wlr_xdg_toplevel*>(data)));
+    wlr_server_decoration* decoration = nullptr;
+    wl_list_for_each(decoration, &self->m_serverDecorationManager->decorations, link) {
+      if (decoration->surface == view.rootSurface()) {
+        view.setLegacyDecorationPreference(decoration->mode == WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
+        break;
+      }
+    }
   }
 
   View& Server::adoptView(std::unique_ptr<View> view) {
@@ -1018,11 +1238,9 @@ namespace umbriel {
     }
   }
 
-  void Server::onNewXdgDialog(wl_listener* listener, void* data) {
-    Server* self;
-    self = wl_container_of(listener, self, m_newXdgDialog);
+  void Server::onNewXdgDialog(wl_listener* /*listener*/, void* data) {
     auto* dialog = static_cast<wlr_xdg_dialog_v1*>(data);
-    if (View* view = viewForToplevel(*self, dialog->xdg_toplevel)) {
+    if (View* view = View::fromSurface(dialog->xdg_toplevel->base->surface)) {
       view->setDialog(dialog);
     }
   }
@@ -1052,6 +1270,16 @@ namespace umbriel {
     (void)self;
   }
 
+  void Server::onNewLegacyDecoration(wl_listener*, void* data) {
+    auto* decoration = static_cast<wlr_server_decoration*>(data);
+    auto* watch = new LegacyDecorationWatch{.decoration = decoration};
+    watch->mode.notify = onLegacyDecorationMode;
+    wl_signal_add(&decoration->events.mode, &watch->mode);
+    watch->destroy.notify = onLegacyDecorationDestroy;
+    wl_signal_add(&decoration->events.destroy, &watch->destroy);
+    applyLegacyDecorationMode(decoration);
+  }
+
   void Server::onNewLayerSurface(wl_listener* listener, void* data) {
     Server* self;
     self = wl_container_of(listener, self, m_newLayerSurface);
@@ -1060,6 +1288,7 @@ namespace umbriel {
       return;
     }
     self->m_layerSurfaces.push_back(std::move(surface));
+    self->scheduleIpcLayersEvent();
   }
 
   void Server::onNewSessionLock(wl_listener* listener, void* data) {
@@ -1161,7 +1390,6 @@ namespace umbriel {
     watch->destroy.notify = onIdleInhibitorDestroy;
     wl_signal_add(&inhibitor->events.destroy, &watch->destroy);
     self->updateIdleInhibit();
-    kLog.debug("idle inhibitor added");
   }
 
   void Server::onIdleInhibitorDestroy(wl_listener* listener, void* /*data*/) {
@@ -1171,7 +1399,6 @@ namespace umbriel {
     wl_list_remove(&watch->destroy.link);
     delete watch;
     server->updateIdleInhibit();
-    kLog.debug("idle inhibitor removed");
   }
 
   void Server::onNewImageCopySession(wl_listener* listener, void* data) {
@@ -1185,6 +1412,7 @@ namespace umbriel {
     watch->destroy.notify = onImageCopySessionDestroy;
     wl_signal_add(&session->events.destroy, &watch->destroy);
     self->m_imageCopySessions.push_back(std::move(watch));
+    self->scheduleSuspensionSync();
   }
 
   // The session's render lock is released after this signal; the frame it schedules runs from an idle, without it.
@@ -1199,6 +1427,7 @@ namespace umbriel {
     for (const auto& output : server->m_outputs) {
       output->scheduleEffectCaptureRelease();
     }
+    server->scheduleSuspensionSync();
   }
 
   void Server::onNewShortcutsInhibitor(wl_listener* listener, void* data) {
@@ -1307,7 +1536,11 @@ namespace umbriel {
         Workspace* preferredWorkspace = preferredOutput != nullptr && preferredOutput->workspaceGroup() != nullptr
             ? preferredOutput->workspaceGroup()->active()
             : nullptr;
-        const bool launchAway = launchStartup && entry->workspace() != preferredWorkspace;
+        const bool launchAway = launchStartup
+            && (self->m_scratchpadManager != nullptr && self->m_scratchpadManager->contains(entry.get())
+                    ? self->m_scratchpadManager->activeOn(preferredOutput)
+                        != self->m_scratchpadManager->nameFor(entry.get())
+                    : entry->workspace() != preferredWorkspace);
         const bool alreadyFocused = entry->activated();
         kLog.debug(
             "xdg-activation policy target_app_id='{}' trusted={} compositor_issued={} input_backed={} mapped={} "
@@ -1375,9 +1608,15 @@ namespace umbriel {
     if (compositorIssued) {
       if (Output* output = outputFromWlr(preferredOutput()); output != nullptr && output->workspaceGroup() != nullptr) {
         launchWorkspace = output->workspaceGroup()->active();
+        if (m_scratchpadManager != nullptr) {
+          watch->launchScratchpad = m_scratchpadManager->activeOn(output);
+        }
       }
     } else if (watch->inputBacked) {
       if (View* source = viewForSurface(*this, token->surface); source != nullptr) {
+        if (m_scratchpadManager != nullptr) {
+          watch->launchScratchpad = m_scratchpadManager->nameFor(source);
+        }
         launchWorkspace = source->workspace();
         if (source->pinned() || launchWorkspace == nullptr) {
           if (Output* output = source->currentOutput(); output != nullptr && output->workspaceGroup() != nullptr) {
@@ -1389,6 +1628,9 @@ namespace umbriel {
           source != nullptr && source->output() != nullptr && source->output()->workspaceGroup() != nullptr
       ) {
         launchWorkspace = source->output()->workspaceGroup()->active();
+        if (m_scratchpadManager != nullptr) {
+          watch->launchScratchpad = m_scratchpadManager->activeOn(source->output());
+        }
       }
     }
     if (launchWorkspace != nullptr && launchWorkspace->group() != nullptr) {
@@ -1416,7 +1658,9 @@ namespace umbriel {
     std::string launchOutputName = watch->launchOutputName;
     std::string launchWorkspaceId = watch->launchWorkspaceId;
     bool pointerDrop = false;
-    if (watch->pointerBacked && sameWaylandClient(token->surface, view.rootSurface())) {
+    if (watch->launchScratchpad.empty()
+        && watch->pointerBacked
+        && sameWaylandClient(token->surface, view.rootSurface())) {
       Output* output = outputFromWlr(preferredOutput());
       Workspace* pointerWorkspace =
           output != nullptr && output->workspaceGroup() != nullptr ? output->workspaceGroup()->active() : nullptr;
@@ -1442,7 +1686,7 @@ namespace umbriel {
     }
     const bool assigned = workspace != nullptr
         && tokenName != nullptr
-        && view.assignLaunchOrigin(tokenName, std::move(launchWorkspace), timeoutMsec);
+        && view.assignLaunchOrigin(tokenName, std::move(launchWorkspace), timeoutMsec, watch->launchScratchpad);
     watch->launchWorkspace.reset();
     if (sourceGroup != nullptr && !m_stopping) {
       sourceGroup->reconcileDynamic();
@@ -1451,8 +1695,9 @@ namespace umbriel {
       targetGroup->reconcileDynamic();
     }
     kLog.debug(
-        "launch placement token='{}' output='{}' workspace='{}' target_app_id='{}' pointer_drop={} assigned={}",
-        tokenName != nullptr ? tokenName : "<unknown>", launchOutputName, launchWorkspaceId,
+        "launch placement token='{}' output='{}' workspace='{}' scratchpad='{}' target_app_id='{}' pointer_drop={} "
+        "assigned={}",
+        tokenName != nullptr ? tokenName : "<unknown>", launchOutputName, launchWorkspaceId, watch->launchScratchpad,
         view.appId() != nullptr ? view.appId() : "", pointerDrop, assigned
     );
     return assigned;
@@ -1591,6 +1836,10 @@ namespace umbriel {
       if (inhibited) {
         break;
       }
+    }
+    if (inhibited != m_idleInhibited) {
+      m_idleInhibited = inhibited;
+      kLog.debug("idle {}", inhibited ? "inhibited" : "no longer inhibited");
     }
     wlr_idle_notifier_v1_set_inhibited(m_idleNotifier, inhibited);
   }
@@ -1872,6 +2121,8 @@ namespace umbriel {
   }
 
   void Server::scheduleIpcWorkspacesEvent() {
+    // Outputs report their active workspace and focus, which move with the workspace list.
+    scheduleIpcOutputsEvent();
     if (m_ipc == nullptr || m_ipcWorkspacesIdle != nullptr) {
       return;
     }
@@ -1887,6 +2138,48 @@ namespace umbriel {
     if (server->m_ipc != nullptr) {
       server->m_ipc->notifyWorkspacesChanged();
     }
+  }
+
+  void Server::scheduleIpcLayersEvent() {
+    if (m_ipc == nullptr || m_ipcLayersIdle != nullptr) {
+      return;
+    }
+    m_ipcLayersIdle = wl_event_loop_add_idle(wl_display_get_event_loop(m_display), onIpcLayersIdle, this);
+    if (m_ipcLayersIdle == nullptr) {
+      kLog.error("failed to register IPC layers idle source");
+    }
+  }
+
+  void Server::onIpcLayersIdle(void* data) {
+    auto* server = static_cast<Server*>(data);
+    server->m_ipcLayersIdle = nullptr;
+    if (server->m_ipc != nullptr) {
+      server->m_ipc->notifyLayersChanged();
+    }
+  }
+
+  void Server::scheduleIpcOutputsEvent() {
+    if (m_ipc == nullptr || m_ipcOutputsIdle != nullptr) {
+      return;
+    }
+    m_ipcOutputsIdle = wl_event_loop_add_idle(wl_display_get_event_loop(m_display), onIpcOutputsIdle, this);
+    if (m_ipcOutputsIdle == nullptr) {
+      kLog.error("failed to register IPC outputs idle source");
+    }
+  }
+
+  void Server::onIpcOutputsIdle(void* data) {
+    auto* server = static_cast<Server*>(data);
+    server->m_ipcOutputsIdle = nullptr;
+    if (server->m_ipc != nullptr) {
+      server->m_ipc->notifyOutputsChanged();
+    }
+  }
+
+  void Server::onLayerKeyboardFocusChange(wl_listener* listener, void* /*data*/) {
+    Server* self;
+    self = wl_container_of(listener, self, m_layerKeyboardFocusChange);
+    self->scheduleIpcLayersEvent();
   }
 
   void Server::addPointer(wlr_input_device* device) {
@@ -2385,7 +2678,10 @@ namespace umbriel {
       }
     }
     const char* sourceName = source->wlr()->name;
-    if (sourceGroup != nullptr && sourceGroup->active() != nullptr && sourceName != nullptr) {
+    if (sourceGroup != nullptr
+        && sourceGroup->active() != nullptr
+        && !sourceGroup->active()->displacedWorkspace()
+        && sourceName != nullptr) {
       const auto existing = std::ranges::find_if(m_displacedWorkspaceSelections, [sourceName](const auto& selection) {
         return selection.outputName == sourceName;
       });
@@ -2399,14 +2695,26 @@ namespace umbriel {
       }
     }
     const auto rememberWorkspace = [this](Workspace* workspace, Output* output, bool tiledOnly) {
-      if (workspace == nullptr || output == nullptr || output->wlr()->name == nullptr) {
-        return;
+      std::shared_ptr<const DisplacedWorkspace> origin = workspace->displacedWorkspace();
+      if (!origin) {
+        const OutputIdentity identity = output->identity();
+        origin = std::make_shared<const DisplacedWorkspace>(DisplacedWorkspace{
+            .outputName = std::string(identity.connector),
+            .outputMake = std::string(identity.make),
+            .outputModel = std::string(identity.model),
+            .outputSerial = std::string(identity.serial),
+            .workspaceName = workspace->name(),
+            .workspaceIndex = workspace->index(),
+            .workspaceNamed = workspace->named(),
+            .configGeneration = configStore().generation(),
+            .layoutModeOverride = workspace->layoutModeOverride(),
+        });
       }
       const wlr_box outputBox = output->layoutBox();
       const LayoutCapture capture = workspace->scrollingLayout() != nullptr
           ? workspace->scrollingLayout()->captureStateForViewport(workspace->scrollViewportExtent())
           : workspace->layout().captureState();
-      for (const auto& view : m_registry.all()) {
+      for (const auto& view : m_registry.placementRoots()) {
         if (view->workspace() != workspace || view->displacedHome()) {
           continue;
         }
@@ -2420,10 +2728,10 @@ namespace umbriel {
           view->rememberFloatingPosition();
         }
         View::DisplacedHome home{
-            .outputName = output->wlr()->name,
-            .workspaceName = workspace->name(),
-            .workspaceIndex = workspace->index(),
-            .workspaceNamed = workspace->named(),
+            .outputName = origin->outputName,
+            .workspaceName = origin->workspaceName,
+            .workspaceIndex = origin->workspaceIndex,
+            .workspaceNamed = origin->workspaceNamed,
             .layoutSnapshot = nullptr,
             .layoutMember = 0,
             .ownsNamedScrollingColumnExtent = view->m_ownsNamedScrollingColumnExtent,
@@ -2433,6 +2741,7 @@ namespace umbriel {
             .floatingOutputPosition = std::nullopt,
             .configGeneration = configStore().generation(),
             .layoutProtectionOnly = tiledOnly,
+            .workspaceOrigin = origin,
         };
         if (view->floating() && outputBox.width > 0 && outputBox.height > 0) {
           home.floatingOutputPosition = {{
@@ -2446,11 +2755,12 @@ namespace umbriel {
         }
         view->markDisplaced(std::move(home));
       }
+      return origin;
     };
 
     if (sourceGroup != nullptr) {
       std::vector<View*> leaving;
-      for (const auto& view : m_registry.all()) {
+      for (const auto& view : m_registry.placementRoots()) {
         Workspace* workspace = view->workspace();
         if (workspace == nullptr || workspace->group() != sourceGroup) {
           continue;
@@ -2458,37 +2768,180 @@ namespace umbriel {
         leaving.push_back(view.get());
       }
 
-      // Capture every source workspace before the first move. Moving a view can
-      // collapse and renumber a dynamic workspace group.
+      struct EvacuatedWorkspace {
+        std::shared_ptr<WorkspaceLaunchAnchor> source;
+        std::shared_ptr<const DisplacedWorkspace> origin;
+        ResolvedLayoutConfig layout;
+        std::optional<LayoutMode> layoutOverride;
+        LayoutCapture capture;
+        std::vector<View*> views;
+        View* focused = nullptr;
+      };
+      std::vector<EvacuatedWorkspace> workspaces;
+      // Capture every source before moving a view. Reservation anchors keep
+      // dynamic reconciliation from deleting the batches still being moved.
       for (size_t index = 0; index < sourceGroup->workspaceCount(); ++index) {
-        rememberWorkspace(sourceGroup->workspaceAt(index), source, false);
-      }
-      // Refugees alter the destination's tiled structure. Preserve its native
-      // members before the first refugee joins, so a later loss of that output
-      // does not snapshot an already mixed layout.
-      const bool contaminatesDestination = !leaving.empty();
-      if (contaminatesDestination && targetWorkspace != nullptr) {
-        rememberWorkspace(targetWorkspace, destination, true);
+        Workspace* workspace = sourceGroup->workspaceAt(index);
+        refreshDisplacedWorkspace(*workspace);
+        EvacuatedWorkspace batch{
+            .source = workspace->reserveForLaunch(),
+            .origin = rememberWorkspace(workspace, source, false),
+            .layout = workspace->layoutConfig(),
+            .layoutOverride = workspace->layoutModeOverride(),
+            .capture = workspace->scrollingLayout() != nullptr
+                ? workspace->scrollingLayout()->captureStateForViewport(workspace->scrollViewportExtent())
+                : workspace->layout().captureState(),
+            .views = {},
+            .focused = workspace->focusedView(),
+        };
+        for (View* view : leaving) {
+          if (view->workspace() == workspace) {
+            batch.views.push_back(view);
+          }
+        }
+        if (!batch.views.empty()) {
+          workspaces.push_back(std::move(batch));
+        }
       }
 
-      for (View* view : leaving) {
-        if (view->displacedHome() && view->displacedHome()->layoutProtectionOnly) {
-          View::DisplacedHome home = *view->displacedHome();
-          home.layoutProtectionOnly = false;
-          view->markDisplaced(std::move(home));
+      bool protectedFallback = false;
+      for (const EvacuatedWorkspace& batch : workspaces) {
+        const bool hasOrdinaryViews =
+            std::ranges::any_of(batch.views, [](const View* view) { return !view->pinned(); });
+        Workspace* refuge =
+            hasOrdinaryViews ? displacedWorkspaceDestination(batch.origin, destination, source) : targetWorkspace;
+        const bool separate = refuge != nullptr && refuge->displacedWorkspace() != nullptr;
+        const auto hold = refuge != nullptr ? refuge->reserveForLaunch() : nullptr;
+        bool capturedLayout = false;
+        if (separate) {
+          refuge->applyLayoutConfig(batch.layout);
+          if (batch.layoutOverride) {
+            refuge->overrideLayoutMode(*batch.layoutOverride);
+          }
+          capturedLayout = batch.capture.snapshot != nullptr
+              && refuge->layout().restoreState(*batch.capture.snapshot, batch.capture.members);
+        } else if (refuge != nullptr && !protectedFallback) {
+          // Only exhausted inventories need to mix with a native workspace.
+          // Keep its clean layout available for the existing restore path.
+          rememberWorkspace(refuge, refuge->group()->output(), true);
+          protectedFallback = true;
         }
-        const bool floating = view->floating();
-        view->setWorkspace(targetWorkspace);
-        if (floating && targetWorkspace != nullptr) {
-          // This output is only a refuge while the recorded home is absent. Present the saved geometry here without
-          // replacing it, since another output can disappear before this animation finishes during VT deactivation.
-          view->restoreFloatingPosition(false);
+        for (View* view : batch.views) {
+          if (view->displacedHome() && view->displacedHome()->layoutProtectionOnly) {
+            View::DisplacedHome home = *view->displacedHome();
+            home.layoutProtectionOnly = false;
+            view->markDisplaced(std::move(home));
+          }
+          const bool floating = view->floating();
+          Workspace* target = view->pinned() ? targetWorkspace : refuge;
+          view->setWorkspace(target, !capturedLayout || target != refuge);
+          if (floating && target != nullptr) {
+            view->restoreFloatingPosition(false);
+          }
+        }
+        if (separate) {
+          refuge->setFocusedView(batch.focused);
+          if (capturedLayout && refuge->scrollingLayout() != nullptr) {
+            refuge->scrollingLayout()->restoreSnapshotViewport(
+                *batch.capture.snapshot, refuge->scrollViewportExtent(), false
+            );
+          }
+          refuge->markArrange(false);
         }
       }
     }
     if (m_scratchpadManager != nullptr) {
       m_scratchpadManager->moveOutput(source, destination);
     }
+    if (sourceGroup != nullptr) {
+      // A disabled output draws no frame to finish its now-empty layouts.
+      sourceGroup->reconcileDynamic();
+      sourceGroup->flushArrange();
+    }
+  }
+
+  void Server::refreshDisplacedWorkspace(Workspace& workspace) {
+    const auto& origin = workspace.displacedWorkspace();
+    if (!origin) {
+      return;
+    }
+    const auto belongsToOrigin = [&origin](const View::DisplacedHome& home) {
+      return home.outputName == origin->outputName
+          && home.workspaceName == origin->workspaceName
+          && home.workspaceIndex == origin->workspaceIndex
+          && home.workspaceNamed == origin->workspaceNamed;
+    };
+    // An unmapped peer still needs its slot in the original complete snapshot.
+    // Otherwise the live temporary layout is authoritative, including edits
+    // and new members made while the original output was absent.
+    if (std::ranges::any_of(m_registry.all(), [&belongsToOrigin](const auto& view) {
+          return !view->mapped()
+              && view->displacedHome()
+              && view->displacedHome()->layoutSnapshot
+              && belongsToOrigin(*view->displacedHome());
+        })) {
+      return;
+    }
+    const LayoutCapture capture = workspace.scrollingLayout() != nullptr
+        ? workspace.scrollingLayout()->captureStateForViewport(workspace.scrollViewportExtent())
+        : workspace.layout().captureState();
+    for (const LayoutMember& member : capture.members) {
+      View* view = member.view;
+      if (view == nullptr || !view->mapped() || !view->displacedHome() || !belongsToOrigin(*view->displacedHome())) {
+        continue;
+      }
+      View::DisplacedHome home = *view->displacedHome();
+      home.layoutSnapshot = capture.snapshot;
+      home.layoutMember = member.id;
+      home.layoutModeOverride = workspace.layoutModeOverride();
+      home.configGeneration = configStore().generation();
+      home.ownsNamedScrollingColumnExtent = view->m_ownsNamedScrollingColumnExtent;
+      view->markDisplaced(std::move(home));
+    }
+  }
+
+  Workspace* Server::displacedWorkspaceDestination(
+      const std::shared_ptr<const DisplacedWorkspace>& home, Output* preferred, Output* excluded
+  ) {
+    const auto onOutput = [&](Output* output) -> Workspace* {
+      if (output == nullptr
+          || output == excluded
+          || !output->desktopEnabled()
+          || !output->wlr()->enabled
+          || output->workspaceGroup() == nullptr) {
+        return nullptr;
+      }
+      return output->workspaceGroup()->displacedDestination(home);
+    };
+    if (Workspace* workspace = onOutput(preferred)) {
+      return workspace;
+    }
+    for (const auto& output : m_outputs) {
+      if (output.get() != preferred) {
+        if (Workspace* workspace = onOutput(output.get())) {
+          return workspace;
+        }
+      }
+    }
+    if (preferred != nullptr
+        && preferred != excluded
+        && preferred->wlr()->enabled
+        && preferred->workspaceGroup() != nullptr) {
+      kLog.warn(
+          "all enabled outputs reached the workspace limit; merging displaced workspace {} from {}",
+          home->workspaceName, home->outputName
+      );
+      WorkspaceGroup* group = preferred->workspaceGroup();
+      if (!group->active()->displacedWorkspace()) {
+        return group->active();
+      }
+      for (size_t index = 0; index < group->workspaceCount(); ++index) {
+        if (!group->workspaceAt(index)->displacedWorkspace()) {
+          return group->workspaceAt(index);
+        }
+      }
+    }
+    return nullptr;
   }
 
   // Deferred to idle: outputs come back one at a time, and a returning one has no workspace group until addOutput is
@@ -2513,6 +2966,25 @@ namespace umbriel {
     Output* fallback = outputFromWlr(preferredOutput());
     if (fallback == nullptr) {
       return;
+    }
+    const auto nativeFallback = [](WorkspaceGroup* group) -> Workspace* {
+      if (group->active() != nullptr && !group->active()->displacedWorkspace()) {
+        return group->active();
+      }
+      for (size_t index = 0; index < group->workspaceCount(); ++index) {
+        Workspace* workspace = group->workspaceAt(index);
+        if (!workspace->displacedWorkspace()) {
+          return workspace;
+        }
+      }
+      return nullptr;
+    };
+    for (const auto& output : m_outputs) {
+      if (WorkspaceGroup* group = output->workspaceGroup()) {
+        for (size_t index = 0; index < group->workspaceCount(); ++index) {
+          refreshDisplacedWorkspace(*group->workspaceAt(index));
+        }
+      }
     }
     std::vector<View*> displaced;
     for (const auto& entry : m_registry.all()) {
@@ -2571,29 +3043,50 @@ namespace umbriel {
 
       Output* target = outputFromName(groupHome.outputName);
       WorkspaceGroup* targetGroup = target != nullptr ? target->workspaceGroup() : nullptr;
-      if (targetGroup == nullptr) {
-        WorkspaceGroup* fallbackGroup = fallback->workspaceGroup();
-        Workspace* refuge = fallbackGroup != nullptr ? fallbackGroup->active() : nullptr;
-        if (refuge != nullptr) {
-          for (size_t index = first; index < last; ++index) {
-            View* view = displaced[index];
-            if (view->workspace() != nullptr) {
-              continue;
-            }
-            const bool floating = view->floating();
-            view->setWorkspace(refuge);
-            if (floating) {
-              view->restoreFloatingPosition(false);
-            }
+      const bool homeAvailable = targetGroup != nullptr;
+      Workspace* workspace = nullptr;
+      std::shared_ptr<WorkspaceLaunchAnchor> refugeHold;
+      if (!homeAvailable) {
+        for (size_t index = first; index < last; ++index) {
+          View* view = displaced[index];
+          if (view->pinned() && view->workspace() == nullptr) {
+            view->setWorkspace(fallback->workspaceGroup()->active());
+            view->restoreFloatingPosition(false);
             ++restored;
           }
         }
-        first = last;
-        continue;
-      }
-
-      Workspace* workspace = nullptr;
-      if (groupHome.workspaceNamed) {
+        const bool needsRefuge = std::ranges::any_of(
+            displaced.begin() + static_cast<std::ptrdiff_t>(first),
+            displaced.begin() + static_cast<std::ptrdiff_t>(last),
+            [](const View* view) { return !view->pinned() && view->workspace() == nullptr; }
+        );
+        if (!needsRefuge) {
+          first = last;
+          continue;
+        }
+        workspace = groupHome.workspaceOrigin ? displacedWorkspaceDestination(groupHome.workspaceOrigin, fallback)
+                                              : fallback->workspaceGroup()->active();
+        if (workspace == nullptr || !workspace->displacedWorkspace()) {
+          if (workspace != nullptr) {
+            for (size_t index = first; index < last; ++index) {
+              View* view = displaced[index];
+              if (view->workspace() == nullptr) {
+                const bool floating = view->floating();
+                view->setWorkspace(workspace);
+                if (floating) {
+                  view->restoreFloatingPosition(false);
+                }
+                ++restored;
+              }
+            }
+          }
+          first = last;
+          continue;
+        }
+        refugeHold = workspace->reserveForLaunch();
+        targetGroup = workspace->group();
+        target = targetGroup->output();
+      } else if (groupHome.workspaceNamed) {
         workspace = targetGroup->workspaceNamed(groupHome.workspaceName);
       } else {
         if (targetGroup->dynamic()) {
@@ -2607,13 +3100,16 @@ namespace umbriel {
           }
         }
         workspace = targetGroup->workspaceAt(groupHome.workspaceIndex);
-        if (targetGroup->dynamic() && workspace != nullptr && workspace->named()) {
+        if (targetGroup->dynamic() && workspace != nullptr && (workspace->named() || workspace->displacedWorkspace())) {
           workspace = targetGroup->insertDynamicWorkspace(groupHome.workspaceIndex);
         }
       }
+      if (workspace != nullptr && workspace->displacedWorkspace() && homeAvailable) {
+        workspace = nullptr;
+      }
       const bool selectorMatched = workspace != nullptr;
       if (workspace == nullptr) {
-        workspace = targetGroup->active();
+        workspace = nativeFallback(targetGroup);
       }
       if (workspace == nullptr) {
         first = last;
@@ -2762,13 +3258,14 @@ namespace umbriel {
           });
       const bool retainLayoutProtection =
           exact != nullptr && exact->representative.layoutProtectionOnly && foreignRefugeesRemain;
-      const auto retainHome = [exact, retainLayoutProtection, snapshotMemberIsUnmapped, selectorMatched,
-                               workspace](const View* view) {
+      const auto retainHome = [exact, retainLayoutProtection, snapshotMemberIsUnmapped, selectorMatched, workspace,
+                               homeAvailable](const View* view) {
         const auto& home = view->displacedHome();
         if (!home) {
           return false;
         }
-        return (retainLayoutProtection && home->layoutProtectionOnly)
+        return !homeAvailable
+            || (retainLayoutProtection && home->layoutProtectionOnly)
             || (snapshotMemberIsUnmapped && home->layoutSnapshot.get() == exact->snapshot.get())
             || (!view->mapped()
                 && selectorMatched
@@ -2778,6 +3275,9 @@ namespace umbriel {
 
       for (size_t index = first; index < last; ++index) {
         View* view = displaced[index];
+        if (!homeAvailable && view->pinned()) {
+          continue;
+        }
         if (std::ranges::find(exactViews, view) != exactViews.end()) {
           if (!retainHome(view)) {
             view->clearDisplaced();
@@ -2822,7 +3322,7 @@ namespace umbriel {
     WorkspaceGroup* fallbackGroup = fallback->workspaceGroup();
     Workspace* refuge = fallbackGroup != nullptr ? fallbackGroup->active() : nullptr;
     if (refuge != nullptr) {
-      for (const auto& entry : m_registry.all()) {
+      for (const auto& entry : m_registry.placementRoots()) {
         View* view = entry.get();
         if (!view->mapped()
             || view->workspace() != nullptr
@@ -2866,13 +3366,16 @@ namespace umbriel {
           }
         }
         workspace = group->workspaceAt(selection->workspaceIndex);
-        if (workspace != nullptr && workspace->named()) {
+        if (workspace != nullptr && (workspace->named() || workspace->displacedWorkspace())) {
           Workspace* inserted = group->insertDynamicWorkspace(selection->workspaceIndex);
           workspace = inserted != nullptr ? inserted : group->active();
         }
       }
       if (workspace == nullptr && group->workspaceCount() > 0) {
         workspace = group->workspaceAt(std::min(selection->workspaceIndex, group->workspaceCount() - 1));
+      }
+      if (workspace != nullptr && workspace->displacedWorkspace()) {
+        workspace = nativeFallback(group);
       }
       if (workspace == nullptr) {
         ++selection;
@@ -2934,7 +3437,7 @@ namespace umbriel {
     return true;
   }
 
-  void Server::notifyKeyboardEnter(wlr_surface* surface) {
+  void Server::notifyKeyboardEnter(wlr_surface* surface, KeyboardGrab grab) {
     wlr_seat* seat = m_seat->wlr();
     wlr_surface* previous = seat->keyboard_state.focused_surface;
     const bool leavesXwayland = m_xwayland != nullptr
@@ -2966,9 +3469,20 @@ namespace umbriel {
       }
     }
 
+    // An active grab's enter handler decides where focus goes; an xdg_popup grab ignores it entirely.
+    const auto enter =
+        [seat,
+         grab](wlr_surface* target, const uint32_t* keycodes, size_t count, const wlr_keyboard_modifiers* modifiers) {
+          if (grab == KeyboardGrab::Bypass) {
+            wlr_seat_keyboard_enter(seat, target, keycodes, count, modifiers);
+          } else {
+            wlr_seat_keyboard_notify_enter(seat, target, keycodes, count, modifiers);
+          }
+        };
+
     wlr_keyboard* keyboard = wlr_seat_get_keyboard(seat);
     if (keyboard == nullptr) {
-      wlr_seat_keyboard_notify_enter(seat, surface, nullptr, 0, nullptr);
+      enter(surface, nullptr, 0, nullptr);
       if (leavesXwayland) {
         m_xwayland->scheduleFocusClear();
       }
@@ -2986,7 +3500,7 @@ namespace umbriel {
       }
     }
     if (consumed == nullptr || consumed->empty()) {
-      wlr_seat_keyboard_notify_enter(seat, surface, keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
+      enter(surface, keyboard->keycodes, keyboard->num_keycodes, &keyboard->modifiers);
       if (leavesXwayland) {
         m_xwayland->scheduleFocusClear();
       }
@@ -2999,7 +3513,7 @@ namespace umbriel {
         forwarded[count++] = keyboard->keycodes[i];
       }
     }
-    wlr_seat_keyboard_notify_enter(seat, surface, forwarded.data(), count, &keyboard->modifiers);
+    enter(surface, forwarded.data(), count, &keyboard->modifiers);
     if (leavesXwayland) {
       m_xwayland->scheduleFocusClear();
     }
@@ -3087,6 +3601,7 @@ namespace umbriel {
       view->detachWorkspace();
     }
     const bool restoreAfterRemoval = view->displacedHome().has_value();
+    m_cursor->forgetView(view);
     m_registry.remove(view);
     if (restoreAfterRemoval) {
       scheduleDisplacedViewRestore();
@@ -3106,6 +3621,7 @@ namespace umbriel {
       return entry.get() == layerSurface;
     });
     arrangeLayers(output);
+    scheduleIpcLayersEvent();
   }
 
   void Server::onOutputManagerApply(wl_listener* listener, void* data) {
@@ -3139,6 +3655,8 @@ namespace umbriel {
   }
 
   void Server::updateOutputManagerConfig() {
+    // Every output state change that output management publishes also changes the IPC output listing.
+    scheduleIpcOutputsEvent();
     if (m_outputManager == nullptr || m_deferOutputManagerConfig) {
       return;
     }
@@ -3253,6 +3771,12 @@ namespace umbriel {
           }
           configuredFrameMasks.emplace_back(mask);
         }
+        // This frame is built without the reveal pair, so resume native slide first.
+        if (WorkspaceGroup* group = output->workspaceGroup()) {
+          group->abandonReveal();
+        }
+        // The pending mode, scale or transform may resize the optimized blur cache.
+        output->markBlurBackgroundDirty();
         wlr_scene_output_state_options options{};
         options.swapchain = wlr_output_swapchain_manager_get_swapchain(&manager, pending[i].output);
         if (!wlr_scene_output_build_state(output->sceneOutput(), &pending[i].base, &options)) {
@@ -3543,6 +4067,10 @@ namespace umbriel {
       }
       view->m_captureSourceDestroy.notify = View::onCaptureSourceDestroy;
       wl_signal_add(&view->m_captureSource->events.destroy, &view->m_captureSourceDestroy);
+    }
+
+    if (Output* output = view->currentOutput()) {
+      umbrielfx_scene_capture_source_set_scale(view->m_captureSource, output->wlr()->scale);
     }
 
     wlr_ext_foreign_toplevel_image_capture_source_manager_v1_request_accept(request, view->m_captureSource);

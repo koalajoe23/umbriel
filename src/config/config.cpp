@@ -70,10 +70,8 @@ namespace umbriel {
 
   ConfigParseOutcome parseConfig(Config& out, const std::filesystem::path& rootPath) {
     ConfigStore& store = configStore();
-    bool drmPolicyRequested = false;
     try {
       auto result = configmerge::mergeWithIncludes(rootPath);
-      drmPolicyRequested = hasRequestedDrmPolicy(result.merged);
       store.setMissingIncludes(result.missingIncludes);
       for (auto& diagnostic : result.diagnostics) {
         store.addDiagnostic(std::move(diagnostic));
@@ -85,12 +83,10 @@ namespace umbriel {
         emitDiag(
             ConfigDiagnostic::Severity::Error, nullptr, "cannot safely load DRM policy while an include is missing"
         );
-        return ConfigParseOutcome::Fatal;
+        return ConfigParseOutcome::Failed;
       }
       if (result.hadError) {
-        // Invalid syntax or include directives can hide DRM policy intent.
-        // Do not silently start with defaults or a partial exclusion list.
-        return ConfigParseOutcome::Fatal;
+        return ConfigParseOutcome::Failed;
       }
 
       Config loaded;
@@ -106,6 +102,17 @@ namespace umbriel {
         registry::readFields(root, configFields(), loaded, context);
         warnScrollButtonBinds(loaded);
         validateEffectReferences(loaded, effectReferences);
+        auto& workspaces = loaded.animation.workspaces;
+        if (workspaces.style == "reveal") {
+          const auto* preset = findEffectPreset(loaded.effects, workspaces.effect);
+          if (preset == nullptr || preset->inert()) {
+            warnAt(
+                result.merged.at_path("animation.workspaces.style").node()->source(),
+                "ignoring animation.workspaces.style (reveal requires an animation preset with a shader)"
+            );
+            workspaces.style = "slide";
+          }
+        }
       }
 
       // Reject config if any error-level diagnostics were emitted.
@@ -113,7 +120,7 @@ namespace umbriel {
         return d.severity == ConfigDiagnostic::Severity::Error;
       });
       if (hasErrors) {
-        return drmPolicyRequested ? ConfigParseOutcome::Fatal : ConfigParseOutcome::DefaultsAllowed;
+        return ConfigParseOutcome::Failed;
       }
 
       out = std::move(loaded);
@@ -123,7 +130,7 @@ namespace umbriel {
     } catch (...) {
       emitDiag(ConfigDiagnostic::Severity::Error, nullptr, "config load error: unknown error");
     }
-    return drmPolicyRequested ? ConfigParseOutcome::Fatal : ConfigParseOutcome::DefaultsAllowed;
+    return ConfigParseOutcome::Failed;
   }
 
   registry::Descriptions registry::describeConfig(const Config& values) {

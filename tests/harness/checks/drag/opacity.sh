@@ -12,7 +12,7 @@ measure_drag_green() {
   local alpha=$1 title=$2
   local screenshot="$UMBRIEL_RUNTIME_DIR/$title.png"
   local client_pid
-  foot --config=/dev/null --override=colors.background=000000 --override="colors.alpha=$alpha" \
+  foot --config=/dev/null --override=colors-dark.background=000000 --override="colors-dark.alpha=$alpha" \
     --title="$title" sh -c 'sleep 120' > /dev/null 2>&1 &
   client_pid=$!
   for _ in $(seq 60); do

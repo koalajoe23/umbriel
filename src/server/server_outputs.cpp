@@ -9,6 +9,8 @@
 #include "wlr.h"
 #include "workspace/workspace.h"
 
+#include <algorithm>
+
 namespace umbriel {
 
   namespace {
@@ -151,6 +153,103 @@ namespace umbriel {
       }
     }
     return nullptr;
+  }
+
+  std::expected<Workspace*, std::string>
+  Server::resolveNamedWorkspace(std::string_view name, WorkspaceGroup* preferred, std::string_view outputName) const {
+    const auto hasName = [name](const Workspace* workspace) { return workspace->named() && workspace->name() == name; };
+    const auto groupHasName = [&hasName](const WorkspaceGroup* group) {
+      for (size_t index = 0; index < group->workspaceCount(); ++index) {
+        if (hasName(group->workspaceAt(index))) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const auto ambiguous = [name, outputName]() -> std::expected<Workspace*, std::string> {
+      const bool numeric =
+          !name.empty() && std::ranges::all_of(name, [](char value) { return value >= '0' && value <= '9'; });
+      const std::string token = numeric ? "\"" + std::string(name) + "\"" : std::string(name);
+      return std::unexpected(
+          "ambiguous workspace: "
+          + std::string(name)
+          + (outputName.empty() ? "" : " on output " + std::string(outputName))
+          + " (qualify it as "
+          + token
+          + "/<output>; displaced names accept their original output)"
+      );
+    };
+    if (!outputName.empty()) {
+      if (Output* output = outputFromName(std::string(outputName))) {
+        WorkspaceGroup* group = output->workspaceGroup();
+        if (group == nullptr) {
+          return std::unexpected("output has no workspace group: " + std::string(outputName));
+        }
+        if (Workspace* workspace = group->workspaceNamed(name)) {
+          return workspace;
+        }
+        if (groupHasName(group)) {
+          return ambiguous();
+        }
+        return std::unexpected("unknown workspace on output " + std::string(outputName) + ": " + std::string(name));
+      }
+
+      Workspace* target = nullptr;
+      for (const auto& output : m_outputs) {
+        if (!output->wlr()->enabled || output->workspaceGroup() == nullptr) {
+          continue;
+        }
+        WorkspaceGroup* group = output->workspaceGroup();
+        for (size_t index = 0; index < group->workspaceCount(); ++index) {
+          Workspace* workspace = group->workspaceAt(index);
+          const auto& origin = workspace->displacedWorkspace();
+          if (!hasName(workspace)
+              || !origin
+              || outputNameMatch(origin->identity(), outputName) == OutputNameMatch::None) {
+            continue;
+          }
+          if (target != nullptr) {
+            return ambiguous();
+          }
+          target = workspace;
+        }
+      }
+      if (target != nullptr) {
+        return target;
+      }
+      return std::unexpected("unknown output: " + std::string(outputName));
+    }
+
+    Workspace* target = nullptr;
+    Workspace* preferredMatch = nullptr;
+    bool multiple = false;
+    for (const auto& output : m_outputs) {
+      if (!output->wlr()->enabled || output->workspaceGroup() == nullptr) {
+        continue;
+      }
+      WorkspaceGroup* group = output->workspaceGroup();
+      Workspace* match = group->workspaceNamed(name);
+      if (group == preferred) {
+        preferredMatch = match;
+      }
+      if (match == nullptr) {
+        // A group with several same-named refugees still participates in global ambiguity.
+        multiple |= groupHasName(group);
+        continue;
+      }
+      if (target != nullptr) {
+        multiple = true;
+      } else {
+        target = match;
+      }
+    }
+    if (multiple) {
+      return preferredMatch != nullptr ? std::expected<Workspace*, std::string>(preferredMatch) : ambiguous();
+    }
+    if (target != nullptr) {
+      return target;
+    }
+    return std::unexpected("unknown workspace: " + std::string(name));
   }
 
   Output* Server::focusedOutput() const {

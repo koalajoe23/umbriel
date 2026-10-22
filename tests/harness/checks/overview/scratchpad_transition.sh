@@ -60,7 +60,6 @@ duration_ms = 5000
 curve = "linear"
 dim = 0.5
 blur = false
-scale = 0.0
 
 [colors]
 backdrop = "#FFFFFFFF"

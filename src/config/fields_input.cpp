@@ -164,7 +164,7 @@ namespace umbriel {
     bool validateKeyboardInput(
         const Config::Input::Keyboard& keyboard, const toml::source_region& source, std::string_view context
     ) {
-      if (keyboard.layout.empty() && keyboard.variant.empty() && keyboard.options.empty()) {
+      if (keyboard.layout.empty() && keyboard.variant.empty() && keyboard.options.empty() && keyboard.model.empty()) {
         return true;
       }
       xkb_context* xkbContext = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
@@ -174,7 +174,7 @@ namespace umbriel {
       }
       const xkb_rule_names names{
           .rules = nullptr,
-          .model = nullptr,
+          .model = keyboard.model.empty() ? nullptr : keyboard.model.c_str(),
           .layout = keyboard.layout.empty() ? nullptr : keyboard.layout.c_str(),
           .variant = keyboard.variant.empty() ? nullptr : keyboard.variant.c_str(),
           .options = keyboard.options.empty() ? nullptr : keyboard.options.c_str(),
@@ -182,8 +182,8 @@ namespace umbriel {
       xkb_keymap* keymap = xkb_keymap_new_from_names(xkbContext, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
       if (keymap == nullptr) {
         warnAt(
-            source, "ignoring {} layout='{}' variant='{}' options='{}' (invalid XKB configuration)", context,
-            keyboard.layout, keyboard.variant, keyboard.options
+            source, "ignoring {} layout='{}' variant='{}' options='{}' model='{}' (invalid XKB configuration)", context,
+            keyboard.layout, keyboard.variant, keyboard.options, keyboard.model
         );
         xkb_context_unref(xkbContext);
         return false;
@@ -211,15 +211,17 @@ namespace umbriel {
         errorAt(entry.source(), "{} duplicates device '{}'", context, device.name);
         return false;
       }
-      if (device.layout || device.variant || device.options) {
+      if (device.layout || device.variant || device.options || device.model) {
         Config::Input::Keyboard keyboard = input.keyboard;
         keyboard.layout = device.layout.value_or(keyboard.layout);
         keyboard.variant = device.variant.value_or(keyboard.variant);
         keyboard.options = device.options.value_or(keyboard.options);
+        keyboard.model = device.model.value_or(keyboard.model);
         if (!validateKeyboardInput(keyboard, entry.source(), context)) {
           device.layout.reset();
           device.variant.reset();
           device.options.reset();
+          device.model.reset();
         }
       }
       return true;
@@ -246,6 +248,11 @@ namespace umbriel {
           {.name = "left_right_middle", .value = TapButtonMap::LeftRightMiddle},
           {.name = "left_middle_right", .value = TapButtonMap::LeftMiddleRight},
       };
+      static const std::vector<Choice<DragLock>> dragLocks{
+          {.name = "off", .value = DragLock::Off},
+          {.name = "timeout", .value = DragLock::Timeout},
+          {.name = "sticky", .value = DragLock::Sticky},
+      };
       static const std::vector<Choice<uint32_t>> scrollButtons{
           {.name = "MouseLeft", .value = BTN_LEFT},     {.name = "MouseRight", .value = BTN_RIGHT},
           {.name = "MouseMiddle", .value = BTN_MIDDLE}, {.name = "MouseBack", .value = BTN_SIDE},
@@ -256,6 +263,7 @@ namespace umbriel {
           text("layout", &In::Keyboard::layout),
           text("variant", &In::Keyboard::variant),
           text("options", &In::Keyboard::options),
+          text("model", &In::Keyboard::model),
           integer("repeat_rate", 0, 1000, &In::Keyboard::repeatRate),
           integer("repeat_delay", 0, 10000, &In::Keyboard::repeatDelay),
           boolean("numlock_toggle", &In::Keyboard::numlockToggle),
@@ -265,7 +273,10 @@ namespace umbriel {
           ),
       };
       static const Fields<In::Touchpad> touchpad{
+          boolean("enabled", &In::Touchpad::enabled),
           boolean("tap", &In::Touchpad::tap),
+          boolean("tap_and_drag", &In::Touchpad::tapAndDrag),
+          choice("drag_lock", &In::Touchpad::dragLock, dragLocks, Case::Fold),
           boolean("natural_scroll", &In::Touchpad::naturalScroll),
           boolean("left_handed", &In::Touchpad::leftHanded),
           real("sensitivity", -1.0, 1.0, &In::Touchpad::sensitivity),
@@ -353,9 +364,13 @@ namespace umbriel {
           text("layout", &In::Device::layout),
           text("variant", &In::Device::variant),
           text("options", &In::Device::options),
+          text("model", &In::Device::model),
           integer("repeat_rate", 0, 1000, &In::Device::repeatRate),
           integer("repeat_delay", 0, 10000, &In::Device::repeatDelay),
+          boolean("enabled", &In::Device::enabled),
           boolean("tap", &In::Device::tap),
+          boolean("tap_and_drag", &In::Device::tapAndDrag),
+          choice("drag_lock", &In::Device::dragLock, dragLocks, Case::Fold),
           boolean("natural_scroll", &In::Device::naturalScroll),
           boolean("left_handed", &In::Device::leftHanded),
           real("sensitivity", -1.0, 1.0, &In::Device::sensitivity),
@@ -369,11 +384,17 @@ namespace umbriel {
       static const Fields<In> fields{
           boolean("middle_click_paste", &In::middleClickPaste),
           boolean("client_window_drag", &In::clientWindowDrag),
+          boolean("window_snapping", &In::windowSnapping),
           choice(
               "window_drag_toggle", &In::windowDragToggle,
               {{.name = "none", .value = WindowDragToggle::None},
                {.name = "floating", .value = WindowDragToggle::Floating},
                {.name = "pinned", .value = WindowDragToggle::Pinned}}
+          ),
+          choice(
+              "mod_right_double_click", &In::modRightDoubleClick,
+              {{.name = "none", .value = ModRightDoubleClick::None},
+               {.name = "maximize", .value = ModRightDoubleClick::Maximize}}
           ),
           table(
               "keyboard", &In::keyboard, keyboard,
@@ -382,6 +403,7 @@ namespace umbriel {
                   target.layout.clear();
                   target.variant.clear();
                   target.options.clear();
+                  target.model.clear();
                 }
                 return true;
               }

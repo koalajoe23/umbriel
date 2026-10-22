@@ -64,8 +64,8 @@ Umbriel handles an Xwayland-to-native keyboard transition in this order:
 4. Set X core input focus to `None`, set `_NET_ACTIVE_WINDOW` to `None`, and
    flush the XWM connection.
 
-The delayed ordering matches xwayland-satellite's cross-process handoff. It is
-also the focus state Hyprland uses for native clients. Performing the X clear
+The delayed ordering is the standard cross-process handoff: the native enter
+is delivered before X focus is cleared. Performing the X clear
 before the native enter can leave the native game unable to receive control. A
 stale timer cannot clear a newly restored X11 focus because the callback
 rechecks the seat, and Xwayland-to-Xwayland refreshes never schedule it.
@@ -73,8 +73,26 @@ rechecks the seat, and Xwayland-to-Xwayland refreshes never schedule it.
 Using `None` means X11 keyboard grabs are unavailable while a native client is
 focused, which is why wlroots normally prefers `PointerRoot`. Umbriel limits
 that tradeoff to a real Xwayland-to-native transfer and lets wlroots restore
-normal X focus when the seat returns to Xwayland. This is the same externally
-observable state as the previously working xwayland-satellite path.
+normal X focus when the seat returns to Xwayland.
+
+## Native selections are reannounced on X11 focus return
+
+wlroots publishes Wayland clipboard ownership changes immediately, including
+while a native client has keyboard focus. It rejects X11 selection reads until
+an Xwayland surface is focused. Wine reads targets eagerly on ownership
+notifications, so a denied background read can leave its clipboard cache empty
+even after the user returns to the game.
+
+On a non-Xwayland or empty-seat transition into Xwayland, Umbriel arms a
+one-millisecond selection timer. The callback rechecks the current seat focus
+and live XWM, then rebinds the same seat through `wlr_xwayland_set_seat()`.
+wlroots reannounces native clipboard and primary selections, allowing eager
+readers to populate their caches after activation. Its X11-owned sources are
+left intact, and its background-read restriction remains unchanged.
+
+The timer is persistent, so focus changes do not allocate event sources.
+Xwayland-to-Xwayland transfers do not schedule a refresh, and a stale timer
+cannot publish selections after the seat has left Xwayland.
 
 ## Xwayland theme cursors use output-native images
 
@@ -108,11 +126,11 @@ an Umbriel cursor override, Umbriel also completes its frame callback so
 Xwayland can submit the next cursor image. Visible raw surfaces retain
 wlroots' normal output pacing.
 
-This deliberately stays inside the compositor. Sway and wlroots preserve raw
-client cursor surfaces and already provide the named, output-scale-aware path
-used after a match. Hyprland's global Xwayland scaling work requires a patched
-X server. Raising `XCURSOR_SIZE` for the whole session, as can be done around
-xwayland-satellite, also changes applications that already account for scale.
+This deliberately stays inside the compositor. wlroots preserves raw
+client cursor surfaces and already provides the named, output-scale-aware path
+used after a match. Global Xwayland scaling requires a patched
+X server. Raising `XCURSOR_SIZE` for the whole session
+also changes applications that already account for scale.
 Neither approach can safely distinguish a theme cursor from a custom one, and
 application-specific rules would only move that ambiguity into configuration.
 
@@ -181,6 +199,13 @@ X11 window to a native client, and requires X core focus and
 client receives keys, the old X11 client does not, and returning to X11 restores
 both focus channels and key delivery. Run it as
 `just check focus/xwayland_native_handoff`.
+
+Selection focus return is covered by
+[`tests/harness/checks/protocol/xwayland_selection.sh`](../../tests/harness/checks/protocol/xwayland_selection.sh).
+Its X11 consumer reads targets and text on ownership notifications, then
+reports its cache without a paste-time retry. It checks repeated native
+updates, fullscreen, primary selection, background-read denial, preserved
+X11-owned sources, and clears. Run it as `just check protocol/xwayland_selection`.
 
 Theme cursor identity is covered by
 [`tests/unit/xcursor_matcher.cpp`](../../tests/unit/xcursor_matcher.cpp),

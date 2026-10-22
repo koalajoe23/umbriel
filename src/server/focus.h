@@ -1,6 +1,9 @@
 #pragma once
 
+#include "scene/ssd_frame_geometry.h"
+
 #include <cstdint>
+#include <optional>
 
 struct wlr_surface;
 
@@ -10,6 +13,12 @@ namespace umbriel {
   class Output;
   class Server;
   class View;
+
+  struct SsdFrameHit {
+    View* view = nullptr;
+    SsdFramePart part = SsdFramePart::None;
+    uint32_t edges = 0;
+  };
 
   // Why focus is moving. The reason decides whether the layout scrolls to reveal the newly focused window, which is not
   // something the focus mechanism can infer: an interactive grab must not scroll (the tile is about to move and a
@@ -72,6 +81,7 @@ namespace umbriel {
 
     // Hit-test the scene. Returns the view under the point, or nullptr with `layer` set when a layer surface is there
     // instead. `surface` receives the wlr_surface under the point in either case, with `sx`/`sy` surface-local.
+    [[nodiscard]] std::optional<SsdFrameHit> ssdFrameAt(double lx, double ly) const;
     View* viewAt(double lx, double ly, wlr_surface** surface, double* sx, double* sy, LayerSurface** layer = nullptr);
 
   private:

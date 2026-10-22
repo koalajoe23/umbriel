@@ -28,6 +28,7 @@ readonly -a NORMAL_GLOBALS=(
   wl_output
   xdg_wm_base
   xdg_toplevel_tag_manager_v1
+  xdg_toplevel_drag_manager_v1
   zxdg_exporter_v2
   xdg_wm_dialog_v1
   zxdg_decoration_manager_v1

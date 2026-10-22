@@ -200,6 +200,56 @@ UMBRIEL_TEST(springSettleStartsFromTheReleaseVelocityAndStops) {
   CHECK_EQ(value.current(), 0.0);
 }
 
+UMBRIEL_TEST(animatedValueReportsItsCurvesSpeed) {
+  umbriel::AnimatedValue value;
+  value.retarget(100.0, 1000, umbriel::Easing::Linear);
+  CHECK(value.tick(1000));
+  CHECK(value.tick(1500));
+  CHECK(std::abs(value.velocity() - 100.0) < 0.5);
+}
+
+UMBRIEL_TEST(animatedValueKeepsSubMillisecondTime) {
+  // Frames tick at vblank instants that fall between milliseconds; the timeline must not round them away.
+  umbriel::AnimatedValue value;
+  value.retarget(100.0, 10, umbriel::Easing::Linear);
+  CHECK(value.tick(1000.0));
+  CHECK(value.tick(1000.5));
+  CHECK(std::abs(value.current() - 5.0) < 1e-9);
+  CHECK(value.tick(1006.06));
+  CHECK(std::abs(value.current() - 60.6) < 1e-6);
+}
+
+UMBRIEL_TEST(interruptedSpringRetargetKeepsItsSpeed) {
+  const umbriel::AnimationCurve spring{
+      .easing = umbriel::Easing::Spring, .spring = {.damping = 1.0, .stiffness = 900.0, .mass = 1.0}
+  };
+  umbriel::AnimatedValue value;
+  value.retarget(1000.0, 0, spring);
+  CHECK(value.tick(1000));
+  CHECK(value.tick(1050));
+  const double position = value.current();
+  const double speed = value.velocity();
+  CHECK(speed > 1000.0);
+
+  // A new target mid-flight bends the motion: same position, same speed, no restart from rest.
+  value.retarget(2000.0, 0, spring);
+  CHECK(value.tick(1050));
+  CHECK_EQ(value.current(), position);
+  CHECK(value.tick(1051));
+  const double carried = (value.current() - position) / 0.001;
+  CHECK(std::abs(carried - speed) < speed * 0.05);
+  CHECK(value.tick(5000));
+  CHECK_EQ(value.current(), 2000.0);
+  CHECK(!value.animating());
+
+  // A curve that cannot take a speed still starts the new target from rest.
+  value.retarget(0.0, 200, umbriel::Easing::EaseOutCubic);
+  value.tick(6000);
+  CHECK(value.tick(6100));
+  value.retarget(500.0, 200, umbriel::Easing::EaseOutCubic);
+  CHECK_EQ(value.velocity(), 0.0);
+}
+
 UMBRIEL_TEST(springCurveTimescaleComesFromItsParameters) {
   const auto stiff = umbriel::CurveRegistry::parse("spring:1,4000");
   const auto soft = umbriel::CurveRegistry::parse("spring:1,250");

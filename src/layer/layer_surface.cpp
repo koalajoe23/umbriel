@@ -121,7 +121,7 @@ namespace umbriel {
     }
   }
 
-  bool LayerSurface::tickAnimations(uint64_t nowMsec) {
+  bool LayerSurface::tickAnimations(double nowMsec) {
     const bool ticked = m_fade.tick(nowMsec);
     if (m_scene != nullptr) {
       bindAnimationEffect(&m_scene->tree->node, AnimationEvent::Layers, m_fade);
@@ -294,6 +294,20 @@ namespace umbriel {
     m_server->refreshOutputPolicies();
   }
 
+  void LayerSurface::focusForPopupGrab() {
+    if (m_server->sessionLocked() || !acceptsKeyboard() || hasKeyboardFocus()) {
+      return;
+    }
+    if (const LayerSurface* exclusive = m_server->exclusiveKeyboardLayer(); exclusive != nullptr && exclusive != this) {
+      return;
+    }
+
+    m_server->deactivateViews(nullptr);
+    // focus() would end the popup's keyboard grab, and wlroots answers that by dismissing the popup. Enter past it.
+    m_server->notifyKeyboardEnter(m_layerSurface->surface, Server::KeyboardGrab::Bypass);
+    m_server->refreshOutputPolicies();
+  }
+
   SurfaceBlurOptions LayerSurface::blurOptions() const {
     return SurfaceBlurOptions{
         .ignoreAlpha = static_cast<float>(m_rule.ignoreAlpha.value_or(0.0)),
@@ -384,6 +398,7 @@ namespace umbriel {
 
   void LayerSurface::handleMap() {
     m_mapped = true;
+    m_server->scheduleIpcLayersEvent();
     m_server->updateIdleInhibit();
     if (Output* out = output()) {
       out->markDirty(Dirty::LayerArrange);
@@ -421,6 +436,7 @@ namespace umbriel {
     wlr_scene_node_clear_animations(&m_scene->tree->node);
     const bool hadFocus = hasKeyboardFocus();
     m_mapped = false;
+    m_server->scheduleIpcLayersEvent();
     m_server->updateIdleInhibit();
     m_blur.hide();
     m_fade.snap(1.0);
@@ -451,11 +467,6 @@ namespace umbriel {
 
   void LayerSurface::handleCommit() {
     updateBlur();
-    if (Output* out = output(); out != nullptr
-        && (m_layerSurface->current.layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND
-            || (m_layerSurface->current.committed & WLR_LAYER_SURFACE_V1_STATE_LAYER) != 0)) {
-      out->markBlurBackgroundDirty();
-    }
     if (m_layerSurface->initial_commit) {
       if (Output* out = output()) {
         out->arrangeLayers();

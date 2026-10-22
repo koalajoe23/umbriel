@@ -110,9 +110,11 @@ namespace umbriel {
       apply(animation.windowsIn.durationMs, animation.windowsIn.curve);
       apply(animation.windowsOut.durationMs, animation.windowsOut.curve);
       apply(animation.windowsMove.durationMs, animation.windowsMove.curve);
+      apply(animation.windowsResize.durationMs, animation.windowsResize.curve);
       apply(animation.workspaces.durationMs, animation.workspaces.curve);
       apply(animation.overview.durationMs, animation.overview.curve);
       apply(animation.scratchpad.durationMs, animation.scratchpad.curve);
+      apply(animation.dialogs.durationMs, animation.dialogs.curve);
       apply(animation.border.durationMs, animation.border.curve);
       apply(animation.dimUnfocused.durationMs, animation.dimUnfocused.curve);
       apply(animation.layers.durationMs, animation.layers.curve);
@@ -129,15 +131,9 @@ namespace umbriel {
       );
     }
 
-    // One animation event: its effect, whether it runs, `extra` keys of its own, and its timeline. duration_ms and
-    // curve resolve together, because a spring derives its own length: a duration configured beside one reaches
-    // nothing and has to say so rather than look honoured.
-    template <typename E> registry::Fields<E> eventFields(registry::Fields<E> extra) {
-      registry::Fields<E> fields{
-          effectField("effect", &E::effect, EffectKind::Animation),
-          registry::boolean("enabled", &E::enabled),
-      };
-      std::ranges::move(extra, std::back_inserter(fields));
+    // A timeline's duration_ms and curve, appended to `fields`. They resolve together, because a spring derives its
+    // own length: a duration configured beside one reaches nothing and has to say so rather than look honoured.
+    template <typename E> registry::Fields<E> timelineFields(registry::Fields<E> fields) {
       registry::Field<E> duration = registry::integer("duration_ms", 1, 10000, &E::durationMs);
       duration.describe = [describe = std::move(duration.describe)](
                               const E& defaults, const std::string& path, registry::Descriptions& out
@@ -159,6 +155,16 @@ namespace umbriel {
         }
       }));
       return fields;
+    }
+
+    // One animation event: its effect, whether it runs, `extra` keys of its own, and its timeline.
+    template <typename E> registry::Fields<E> eventFields(registry::Fields<E> extra) {
+      registry::Fields<E> fields{
+          effectField("effect", &E::effect, EffectKind::Animation),
+          registry::boolean("enabled", &E::enabled),
+      };
+      std::ranges::move(extra, std::back_inserter(fields));
+      return timelineFields(std::move(fields));
     }
 
     template <typename E> registry::Field<E> styleField(std::initializer_list<std::string_view> styles) {
@@ -183,7 +189,10 @@ namespace umbriel {
           styleField<A::WindowsOut>({"fade", "slide", "popin", "zoom"}),
       });
       static const registry::Fields<A::WindowsMove> windowsMove = eventFields<A::WindowsMove>({});
-      static const registry::Fields<A::Workspaces> workspaces = eventFields<A::Workspaces>({});
+      static const registry::Fields<A::WindowsResize> windowsResize =
+          timelineFields<A::WindowsResize>({registry::boolean("enabled", &A::WindowsResize::enabled)});
+      static const registry::Fields<A::Workspaces> workspaces =
+          eventFields<A::Workspaces>({styleField<A::Workspaces>({"slide", "reveal"})});
       static const registry::Fields<A::Overview> overview = [] {
         auto fields = eventFields<A::Overview>({});
         fields.push_back(curveField("workspace_curve", &A::Overview::workspaceCurve));
@@ -192,9 +201,10 @@ namespace umbriel {
       static const registry::Fields<A::Scratchpad> scratchpad = eventFields<A::Scratchpad>({
           real("dim", 0.0, 1.0, &A::Scratchpad::dim),
           boolean("blur", &A::Scratchpad::blur),
-          real("scale", 0.0, 1.0, &A::Scratchpad::scale),
-          boolean("maximize", &A::Scratchpad::maximize),
-          boolean("fullscreen", &A::Scratchpad::fullscreen),
+      });
+      static const registry::Fields<A::Dialogs> dialogs = timelineFields<A::Dialogs>({
+          boolean("enabled", &A::Dialogs::enabled),
+          real("dim", 0.0, 1.0, &A::Dialogs::dim),
       });
       static const registry::Fields<A::Border> border = eventFields<A::Border>({});
       static const registry::Fields<A::DimUnfocused> dimUnfocused = eventFields<A::DimUnfocused>({
@@ -257,9 +267,11 @@ namespace umbriel {
           table("windows_in", &A::windowsIn, windowsIn),
           table("windows_out", &A::windowsOut, windowsOut),
           table("windows_move", &A::windowsMove, windowsMove),
+          table("windows_resize", &A::windowsResize, windowsResize),
           table("workspaces", &A::workspaces, workspaces),
           table("overview", &A::overview, overview),
           table("scratchpad", &A::scratchpad, scratchpad),
+          table("dialogs", &A::dialogs, dialogs),
           table("border", &A::border, border),
           table("dim_unfocused", &A::dimUnfocused, dimUnfocused),
           table("layers", &A::layers, layers),

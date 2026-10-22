@@ -60,6 +60,8 @@ namespace umbriel {
     [[nodiscard]] XwaylandRegion region(const wlr_output* output, int layoutX, int layoutY) const;
     // The region of the output at, or else nearest to, an X point.
     [[nodiscard]] XwaylandRegion regionAtX(int x, int y) const;
+    // The largest output scale in X pixels per layout unit: 1 unless outputs are at their physical resolution.
+    [[nodiscard]] double scale() const { return m_scale; }
 
   private:
     struct Entry {
@@ -89,6 +91,7 @@ namespace umbriel {
     wlr_output_layout* m_layout = nullptr;
     wl_global* m_global = nullptr;
     bool m_nativeResolution = false;
+    double m_scale = 1.0;
     // Stands in when no output is in the layout: a plain translation to the X origin.
     XwaylandRegion m_fallback;
     std::vector<OutputRegion> m_regions;

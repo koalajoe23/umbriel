@@ -1,5 +1,7 @@
 #include "input/keyboard_layout.h"
 
+#include <algorithm>
+
 namespace umbriel {
   std::optional<xkb_layout_index_t> layoutGroupNamed(xkb_keymap* keymap, std::string_view name) {
     if (keymap == nullptr || name.empty()) {
@@ -25,6 +27,27 @@ namespace umbriel {
       return std::nullopt;
     }
     return layoutGroupNamed(target, sourceName);
+  }
+
+  XkbNames resolveXkbNames(
+      const Config::Input::Keyboard& keyboard, const Config::Input::Device* device, const XkbNames& system
+  ) {
+    XkbNames names{
+        .layout = device != nullptr && device->layout ? *device->layout : keyboard.layout,
+        .variant = device != nullptr && device->variant ? *device->variant : keyboard.variant,
+        .options = device != nullptr && device->options ? *device->options : keyboard.options,
+        .model = device != nullptr && device->model ? *device->model : keyboard.model,
+    };
+    return names.empty() ? system : names;
+  }
+
+  bool usesSystemXkbNames(const Config::Input& input) {
+    if (resolveXkbNames(input.keyboard, nullptr, {}).empty()) {
+      return true;
+    }
+    return std::ranges::any_of(input.devices, [&input](const Config::Input::Device& device) {
+      return resolveXkbNames(input.keyboard, &device, {}).empty();
+    });
   }
 
 } // namespace umbriel

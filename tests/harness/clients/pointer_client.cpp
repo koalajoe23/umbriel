@@ -2,6 +2,7 @@
 // has no input devices. The compositor attaches it to its wlr_cursor, so events take the same path as a real mouse.
 // Usage: pointer-client <width> <height> <command>... move <x> <y> absolute motion within the given extent
 // relative <dx> <dy> sends relative motion
+// move-release <x> <y> <button> sends motion and release together, without a roundtrip between them
 // click <button> press and release (button is an evdev BTN_* code) press <button> release <button> notch <dir> one
 // vertical wheel notch, -1 up / 1 down notch-horizontal <dir> the same notch on the horizontal wheel axis, -1 left /
 // 1 right mod <name|none> hold one modifier (shift, control, alt, or logo) tap <key> press and release one evdev key
@@ -225,6 +226,7 @@ int main(int argc, char** argv) {
 
     if (pointer == nullptr
         && (command == "move"
+            || command == "move-release"
             || command == "relative"
             || command == "press"
             || command == "release"
@@ -249,6 +251,14 @@ int main(int argc, char** argv) {
       const auto y = static_cast<uint32_t>(std::atoi(args[i + 2].c_str()));
       i += 2;
       zwlr_virtual_pointer_v1_motion_absolute(pointer, nextTime(), x, y, extentWidth, extentHeight);
+    } else if (command == "move-release") {
+      needs(3);
+      const auto x = static_cast<uint32_t>(std::atoi(args[i + 1].c_str()));
+      const auto y = static_cast<uint32_t>(std::atoi(args[i + 2].c_str()));
+      const auto button = static_cast<uint32_t>(std::atoi(args[i + 3].c_str()));
+      i += 3;
+      zwlr_virtual_pointer_v1_motion_absolute(pointer, nextTime(), x, y, extentWidth, extentHeight);
+      zwlr_virtual_pointer_v1_button(pointer, nextTime(), button, WL_POINTER_BUTTON_STATE_RELEASED);
     } else if (command == "press" || command == "release" || command == "click") {
       needs(1);
       const auto button = static_cast<uint32_t>(std::atoi(args[i + 1].c_str()));

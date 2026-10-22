@@ -51,22 +51,40 @@ namespace umbriel {
     }
     const Config::Input& input = config().input;
     const Config::Input::Device* device = input.findDevice(m_deviceName);
-    const std::string& layout = device != nullptr && device->layout ? *device->layout : input.keyboard.layout;
-    const std::string& variant = device != nullptr && device->variant ? *device->variant : input.keyboard.variant;
-    const std::string& options = device != nullptr && device->options ? *device->options : input.keyboard.options;
+
+    const bool enabled = device != nullptr ? device->enabled.value_or(true) : true;
+    libinput_device* libinputDevice =
+        wlr_input_device_is_libinput(&m_keyboard->base) ? wlr_libinput_get_device_handle(&m_keyboard->base) : nullptr;
+    // A device that is also a pointer, touch, or tablet device has one send-events mode, owned by that device's path.
+    const bool sharedDevice = libinputDevice != nullptr
+        && (libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_POINTER) != 0
+            || libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_TOUCH) != 0
+            || libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_TABLET_TOOL) != 0
+            || libinput_device_has_capability(libinputDevice, LIBINPUT_DEVICE_CAP_TABLET_PAD) != 0);
+    if (libinputDevice != nullptr && !sharedDevice) {
+      if ((libinput_device_config_send_events_get_modes(libinputDevice) & LIBINPUT_CONFIG_SEND_EVENTS_DISABLED) != 0) {
+        libinput_device_config_send_events_set_mode(
+            libinputDevice, enabled ? LIBINPUT_CONFIG_SEND_EVENTS_ENABLED : LIBINPUT_CONFIG_SEND_EVENTS_DISABLED
+        );
+      } else if (!enabled) {
+        kLog.warn("input: '{}' cannot be disabled", m_deviceName);
+      }
+    }
+
+    const XkbNames names = resolveXkbNames(input.keyboard, device, m_server->systemKeymap());
     const int repeatRate = device != nullptr && device->repeatRate ? *device->repeatRate : input.keyboard.repeatRate;
     const int repeatDelay =
         device != nullptr && device->repeatDelay ? *device->repeatDelay : input.keyboard.repeatDelay;
     xkb_context* context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    const xkb_rule_names names{
+    const xkb_rule_names rules{
         .rules = nullptr,
-        .model = nullptr,
-        .layout = layout.empty() ? nullptr : layout.c_str(),
-        .variant = variant.empty() ? nullptr : variant.c_str(),
-        .options = options.empty() ? nullptr : options.c_str(),
+        .model = names.model.empty() ? nullptr : names.model.c_str(),
+        .layout = names.layout.empty() ? nullptr : names.layout.c_str(),
+        .variant = names.variant.empty() ? nullptr : names.variant.c_str(),
+        .options = names.options.empty() ? nullptr : names.options.c_str(),
     };
     xkb_keymap* keymap =
-        context == nullptr ? nullptr : xkb_keymap_new_from_names(context, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+        context == nullptr ? nullptr : xkb_keymap_new_from_names(context, &rules, XKB_KEYMAP_COMPILE_NO_FLAGS);
     if (keymap != nullptr) {
       wlr_keyboard_set_keymap(m_keyboard, keymap);
       xkb_keymap_unref(keymap);
@@ -315,7 +333,7 @@ namespace umbriel {
           }
           if (confirmed) {
             if (confirm->kind() == QuitConfirm::Kind::SessionQuit) {
-              m_server->stop();
+              m_server->requestSessionExit();
             } else {
               m_server->confirmScreenCastDynamic();
             }

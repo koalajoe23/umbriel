@@ -608,17 +608,11 @@ cached client commits. Both clocks run from the close, each with its own
 duration and curve. With movement disabled, live geometry snaps while the close
 lifecycle continues independently.
 
-A layout-sized view that redraws at its requested size crossfades into it. On
-the root surface's `client_commit`, while the scene still shows the outgoing
-state, `View::handleClientCommit` checks that the commit acks the tiled size
-request and changes the buffer size. If so, `ResizeCrossfade` clones the
-toplevel surface tree's buffers into a hidden tree directly above it. The
-applied commit then shows that frame and fades it out on its own `windows_move`
-clock, over the live buffers. Both layers are scaled into the same presented
-box on every presentation change, round against the same content box, and
-multiply the view's opacity. The clones reject input and live inside the view
-tree, so movement, clipping, and view shaders apply to them. Unmap, destroy,
-and a canceled size animation discard the capture.
+A layout-sized view is presented at its animated size by stretching its latest
+committed buffer into the presented box (`croppedSourceBox`). There is no
+second layer: the client's redraw at its requested size replaces the stretched
+frame directly, and the size animation runs on `windows_resize` while the
+position follows `windows_move`.
 
 When movement completes, `completeLayoutMotion` keeps the compositor-owned
 endpoint until both the configure serial and committed content dimensions
@@ -702,8 +696,7 @@ orderings against `windows_move` and asserts that the snapshot holds its
 captured box for every sampled frame. `animation/tiled_repeated_close` interrupts scrolling reflow
 with a second close and verifies independent shader phases, monotonic survivor
 motion on a single movement clock, and no summed delay or starvation. `animation/builtin_window_styles` fades a window whose opaque subsurface covers its parent and verifies
-that the parent never shows through while opening or closing. `animation/tiled_resize_crossfade` redraws a reflowing neighbor in a new color at its new size and
-observes blended pixels mid-reflow, then the redrawn frame alone. `animation/dwindle_many_close_timing` closes
+that the parent never shows through while opening or closing. `animation/dwindle_many_close_timing` closes
 the root leaf of a five-window dwindle tree and verifies that every changing
 survivor follows an overshooting movement curve across its full configured
 clock instead of pinning at its first endpoint crossing. The overview check

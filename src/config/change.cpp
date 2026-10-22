@@ -50,6 +50,7 @@ namespace umbriel {
           && lhs.vrr == rhs.vrr
           && lhs.hdr == rhs.hdr
           && lhs.sdrWhite == rhs.sdrWhite
+          && lhs.sdrTransfer == rhs.sdrTransfer
           && lhs.bitDepth == rhs.bitDepth;
     }
 
@@ -89,6 +90,10 @@ namespace umbriel {
       return std::ranges::any_of(rules, [](const WindowRule& rule) {
         return rule.borderEffect.has_value() || rule.windowEffect.has_value();
       });
+    }
+
+    bool decidesAttachment(const std::vector<WindowRule>& rules) {
+      return std::ranges::any_of(rules, [](const WindowRule& rule) { return rule.attachToParent.has_value(); });
     }
 
     bool sameOutputDirectScanoutPolicy(const OutputRule* before, const OutputRule* after) {
@@ -133,6 +138,7 @@ namespace umbriel {
             || lhs.matchScratchpad != rhs.matchScratchpad
             || lhs.matchAlone != rhs.matchAlone
             || lhs.matchOnlyWindow != rhs.matchOnlyWindow
+            || lhs.matchDialog != rhs.matchDialog
             || lhs.matchAtStartup != rhs.matchAtStartup
             || lhs.allowTearing != rhs.allowTearing) {
           return false;
@@ -230,7 +236,8 @@ namespace umbriel {
             || before.layout != after.layout
             || before.workspaceRules != after.workspaceRules
             || before.appearance.totalBorderWidth() != after.appearance.totalBorderWidth()
-            || before.appearance.tabBar != after.appearance.tabBar,
+            || before.appearance.tabBar != after.appearance.tabBar
+            || before.appearance.titleBar != after.appearance.titleBar,
         .sceneBlur = sceneBlur,
         // [colors] owns the border, backdrop, insert-hint, and shadow colors, so
         // any color edit refreshes window chrome.
@@ -244,6 +251,9 @@ namespace umbriel {
         .overviewPresentation = before.overview != after.overview || before.colors != after.colors,
         .internalUi = before.colors != after.colors || before.general.modKey != after.general.modKey,
         .effects = effectsChanged,
+        .dialogAttachment = before.general.attachModalDialogs != after.general.attachModalDialogs
+            || (before.windowRules != after.windowRules
+                && (decidesAttachment(before.windowRules) || decidesAttachment(after.windowRules))),
     };
   }
 
@@ -262,6 +272,7 @@ namespace umbriel {
         .overviewPresentation = true,
         .internalUi = true,
         .effects = true,
+        .dialogAttachment = true,
     };
   }
 
@@ -373,6 +384,7 @@ namespace umbriel {
     add(input, "input");
     add(overviewPresentation, "overview presentation");
     add(effects, "effects");
+    add(dialogAttachment, "dialog attachment");
     return out;
   }
 } // namespace umbriel

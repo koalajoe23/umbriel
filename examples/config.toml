@@ -20,39 +20,43 @@ files = []
 
 # ==============================================================================
 # General
-
 # Optional session examples. XWayland support is enabled by default.
 # https://docs.noctalia.dev/umbriel/configuration/#general
-# [general]
+#
+[general]
 # autostart = ["noctalia", "kitty"]
 # xwayland = false
 # Sharp X11 apps and games on scaled outputs; they see physical resolutions.
 # xwayland_native_resolution = true
+# Umbriel announces the X11 interface scale and cursor theme through XSETTINGS.
+# Turn this off to run your own manager, such as xsettingsd.
+# xwayland_xsettings = false
+# Modal dialogs hang on their parent window and follow it. Turn this off to keep them ordinary windows.
+# attach_modal_dialogs = false
 
 # ==============================================================================
 # Lid events
-
 # Remove the laptop panel from the desktop while the lid is closed, then
 # restore it when the lid opens. Replace eDP-1 with the name from
 # `umbriel outputs`.
 # https://docs.noctalia.dev/umbriel/configuration/#events
+#
 # [events]
 # lid_close = "umbriel msg output-disable:eDP-1"
 # lid_open = "umbriel msg output-enable:eDP-1"
 
 # ==============================================================================
 # Screencast
-
 # By default, the first target-changing action during an active share asks for
 # confirmation. Disable that protection only if immediate keybind changes are
 # preferred.
 # https://docs.noctalia.dev/umbriel/configuration/#screencast
+#
 # [screencast]
 # disable_dynamic_confirmation = true
 
 # ==============================================================================
 # Outputs
-
 # Outputs are machine-specific. Run `umbriel outputs` to find names and modes.
 # https://docs.noctalia.dev/umbriel/outputs/
 #
@@ -62,13 +66,23 @@ files = []
 # scale = 1.25
 # vrr = "fullscreen"
 # hdr = "auto"
+# sdr_transfer = "gamma22" # Or "srgb" for piecewise SDR decoding in HDR.
 
 # ==============================================================================
 # Appearance
 # Blur uses a smaller radius than the built-in default.
 # https://docs.noctalia.dev/umbriel/appearance/
+#
 [appearance.blur]
 radius = 3
+
+# Optional title bar with modifier-free dragging and floating frame resizing.
+# [appearance.title_bar]
+# mode = "on" # Follow client decoration preferences.
+# Use "forced" to always show bars, or "off" to hide them. Window rules can override this.
+# height = 28
+# font = "sans 10"
+# button_position = "right" # or "left"
 
 # Choose the background color shown if the lock screen takes too long to appear.
 # [colors]
@@ -80,12 +94,18 @@ radius = 3
 # scale with overview zoom. Include a bundled preset (adjust /usr for the
 # package prefix), then select it by name.
 # https://docs.noctalia.dev/umbriel/effects/
+#
 # [include]
 # files = ["/usr/share/umbriel/effects/border/pulse/effect.toml"]
 # For a cursor tail, include /usr/share/umbriel/effects/cursor/trail/effect.toml
 # and set cursor = "trail" in [effects].
+# For audio-reactive borders, include /usr/share/umbriel/effects/border/audio/effect.toml
+# and set border = "audio" in [effects].
+# Enable Noctalia's Umbriel audio provider in its shell settings, or supply an
+# external effect-audio v2 producer with 64 spectrum bands. Umbriel does not capture audio.
 # Pools accept matching presets defined/included separately. This one-member
 # example uses the bundled pulse preset; add other border names to choose.
+#
 # [effects.pool.borders]
 # kind = "border"
 # choose = ["pulse"]
@@ -95,7 +115,7 @@ radius = 3
 # "Mod+Shift+E" = "effect-border-cycle:borders"
 # "Mod+Ctrl+E" = "effect-border-toggle"
 # "Mod+Alt+E" = "effect-border-reset"
-
+#
 # [effects]
 # border = "pulse"
 
@@ -103,14 +123,20 @@ radius = 3
 # Input
 # Enable NumLock when a physical keyboard connects.
 # https://docs.noctalia.dev/umbriel/input/
+#
+# [input]
+# window_snapping = false # Drag floating windows to edges or corners for snap previews.
+#
 [input.keyboard]
 numlock_toggle = true
 
 # Focus can follow the pointer across tiled, floating, and pinned windows.
+#
 # [input.focus]
 # follows_mouse = true
 
 # Confine touch input to one display.
+#
 # [input.touch]
 # enabled = true
 # map_to_output = "eDP-1"
@@ -129,6 +155,18 @@ numlock_toggle = true
 "Mod+Q" = { action = "window-close", repeat = false }
 "Mod+Escape" = "session-quit"
 "Mod+Shift+Escape" = { action = "shortcuts-inhibit-toggle", allow_when_inhibited = true, repeat = false }
+
+# Media, volume and brightness keys from any input device, routed through the
+# Noctalia shell so its OSDs show. Safe while the session is locked.
+# https://docs.noctalia.dev/noctalia/compositor-settings/umbriel
+"XF86AudioRaiseVolume" = { action = "spawn:noctalia msg volume-up", allow_when_locked = true }
+"XF86AudioLowerVolume" = { action = "spawn:noctalia msg volume-down", allow_when_locked = true }
+"XF86AudioMute" = { action = "spawn:noctalia msg volume-mute", allow_when_locked = true, repeat = false }
+"XF86AudioPlay" = { action = "spawn:noctalia msg media toggle", allow_when_locked = true, repeat = false }
+"XF86AudioNext" = { action = "spawn:noctalia msg media next", allow_when_locked = true }
+"XF86AudioPrev" = { action = "spawn:noctalia msg media previous", allow_when_locked = true }
+"XF86MonBrightnessUp" = { action = "spawn:noctalia msg brightness-up", allow_when_locked = true }
+"XF86MonBrightnessDown" = { action = "spawn:noctalia msg brightness-down", allow_when_locked = true }
 
 # Focus and movement
 "Mod+Left" = "window-focus-left"
@@ -158,6 +196,8 @@ numlock_toggle = true
 "Mod+Period" = "window-consume-right"
 "Mod+Ctrl+Comma" = "window-consume-from-left"
 "Mod+Ctrl+Period" = "window-consume-from-right"
+# Needs layout.mode = "dwindle".
+# "Mod+Alt+T" = "layout-toggle-split"
 "Mod+W" = { action = "column-toggle-tabbed", repeat = false }
 "Mod+Alt+Right" = "column-focus-tab-next"
 "Mod+Alt+Left" = "column-focus-tab-previous"
@@ -198,7 +238,13 @@ numlock_toggle = true
 # their most recently focused row when focus leaves and later returns.
 # https://docs.noctalia.dev/umbriel/layout/
 [layout]
+# mode = "scrolling" # "scrolling", "dwindle", "master", or "floating".
 extent_presets = [0.333, 0.5, 0.667]
+
+# What a tiled window's own maximize button does: "column" fills the column,
+# "edges" fills the usable area without struts, gaps, or borders. The
+# window-toggle-maximize action is unaffected.
+# client_maximize = "column"
 
 [layout.scrolling]
 default_extent_fraction = 0.5
@@ -216,6 +262,7 @@ default_extent_fraction = 0.5
 # [appearance.tab_bar]
 # style = "titles"         # "indicator" draws thin slots without titles
 # height = 24
+# gap = -1                 # space between bar and window; -1 follows layout.gap
 # font = "sans 10"
 # visible = true           # false hides every bar; tabs keep working
 # hide_when_single = false
@@ -227,11 +274,11 @@ default_extent_fraction = 0.5
 # Rules combine in order, with later values overriding earlier ones.
 # https://docs.noctalia.dev/umbriel/window-rules/
 
-# Blur windows using the non-optimized path so translucent windows include
-# overlapping windows behind them.
+# Blur windows over the cached wallpaper blur. Set blur_optimized = false to
+# include overlapping windows behind them, at a GPU cost on every frame that
+# moves anything behind them.
 [[window_rule]]
 blur = true
-blur_optimized = false
 
 [[window_rule]]
 match.app_id = "^dev.noctalia.Noctalia$"
@@ -259,6 +306,17 @@ default_pinned = true
 # [[window_rule]]
 # match.app_id = "^steam_app_.*$"
 # confine_pointer = true
+
+# Keep an application drawing while it is hidden on another workspace, for programs whose other work stalls without it.
+# [[window_rule]]
+# match.app_id = "^obs$"
+# background_render = true
+
+# Keep one application's modal dialogs as ordinary windows.
+# [[window_rule]]
+# match.app_id = "^gimp"
+# match.is_dialog = true
+# attach_to_parent = false
 
 # Named scratchpads can launch an application when toggled while empty.
 # [[scratchpad]]
@@ -290,6 +348,12 @@ match.namespace = "^noctalia-(bar-[^\"]+|notification|dock|panel|attached-panel|
 blur = true
 blur_ignore_alpha = 0.5
 blur_popups = true
+
+# Panels, the dock, notifications and OSDs open over windows, so they blur the
+# live content behind them. The bar and desktop widgets sit on the wallpaper and
+# keep the cached wallpaper blur.
+[[layer_rule]]
+match.namespace = "^noctalia-(notification|dock|panel|attached-panel|osd)$"
 blur_optimized = false
 
 # ==============================================================================
@@ -302,3 +366,15 @@ blur_optimized = false
 enabled = true
 delay_ms = 500
 action = "overview-open"
+
+# Optional live workspace reveal (see docs/user/animation.md).
+# Add the bundled effects/animation/workspace_wipe/effect.toml to your includes.
+# [animation.workspaces]
+# style = "reveal"          # Default: "slide"
+# effect = "workspace_wipe"
+# duration_ms = 300
+# curve = "easeout"
+
+# Shade over a window while a modal dialog is attached to it.
+# [animation.dialogs]
+# dim = 0.3

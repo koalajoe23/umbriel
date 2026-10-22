@@ -54,6 +54,18 @@ UMBRIEL_TEST(globalLayoutUsesTheCallerOwnedConfig) {
   CHECK(firstLayout != secondLayout);
 }
 
+UMBRIEL_TEST(tabBarGapFollowsTheWorkspaceGapUnlessSet) {
+  Config config;
+  WorkspaceConfig wide;
+  wide.name = "wide";
+  wide.layout.gap = 30;
+  config.workspaceRules.push_back(std::move(wide));
+  CHECK_EQ(umbriel::resolveWorkspaceLayout(config, identity("DP-1"), "wide", 0).tabs.barGap, 30);
+
+  config.appearance.tabBar.gap = 0;
+  CHECK_EQ(umbriel::resolveWorkspaceLayout(config, identity("DP-1"), "wide", 0).tabs.barGap, 0);
+}
+
 UMBRIEL_TEST(workspaceOverridesApplyGlobalThenOutputSpecificRules) {
   Config config;
   config.layout.gap = 8;
@@ -63,6 +75,7 @@ UMBRIEL_TEST(workspaceOverridesApplyGlobalThenOutputSpecificRules) {
   config.layout.master.defaultWidthFraction = 0.58;
   config.layout.master.newOnTop = false;
   config.layout.dwindle.preserveSplit = true;
+  config.layout.clientMaximize = umbriel::ClientMaximize::Edges;
 
   WorkspaceConfig global;
   global.name = "dev";
@@ -85,6 +98,7 @@ UMBRIEL_TEST(workspaceOverridesApplyGlobalThenOutputSpecificRules) {
   dpOne.layout.master.defaultWidthFraction = 0.7;
   dpOne.layout.master.newOnTop = false;
   dpOne.layout.dwindle.preserveSplit = true;
+  dpOne.layout.clientMaximize = umbriel::ClientMaximize::Column;
   config.workspaceRules.push_back(std::move(dpOne));
 
   WorkspaceConfig dpTwo;
@@ -108,6 +122,7 @@ UMBRIEL_TEST(workspaceOverridesApplyGlobalThenOutputSpecificRules) {
   CHECK_EQ(onDpOne.master.defaultWidthFraction, 0.7);
   CHECK(!onDpOne.master.newOnTop);
   CHECK(onDpOne.dwindle.preserveSplit);
+  CHECK(onDpOne.clientMaximize == umbriel::ClientMaximize::Column);
 
   const auto onDpTwo = umbriel::resolveWorkspaceLayout(config, identity("DP-2"), "dev", 0);
   CHECK(onDpTwo.mode == LayoutMode::Scrolling);
@@ -122,6 +137,7 @@ UMBRIEL_TEST(workspaceOverridesApplyGlobalThenOutputSpecificRules) {
   CHECK_EQ(onDpTwo.master.defaultWidthFraction, 0.6);
   CHECK(onDpTwo.master.newOnTop);
   CHECK(!onDpTwo.dwindle.preserveSplit);
+  CHECK(onDpTwo.clientMaximize == umbriel::ClientMaximize::Edges);
 
   const auto elsewhere = umbriel::resolveWorkspaceLayout(config, identity("HDMI-A-1"), "dev", 0);
   CHECK_EQ(elsewhere.gap, 12);
@@ -1110,6 +1126,24 @@ UMBRIEL_TEST(windowRulesMatchIsOnlyWindow) {
   CHECK(aloneBesideFloat.defaultMaximize && *aloneBesideFloat.defaultMaximize);
 }
 
+UMBRIEL_TEST(windowRulesMatchIsDialog) {
+  Config config;
+
+  WindowRule dialogRule;
+  dialogRule.appIdPatterns.add("^editor$");
+  dialogRule.matchDialog = true;
+  dialogRule.attachToParent = false;
+  config.windowRules.push_back(std::move(dialogRule));
+
+  const auto dialog =
+      umbriel::resolveWindowRules(config, "editor", std::nullopt, std::nullopt, ContentType::None, {.dialog = true}, 0);
+  CHECK(dialog.attachToParent && !*dialog.attachToParent);
+
+  const auto toplevel =
+      umbriel::resolveWindowRules(config, "editor", std::nullopt, std::nullopt, ContentType::None, {}, 0);
+  CHECK(!toplevel.attachToParent);
+}
+
 UMBRIEL_TEST(windowVrrRuleOverridesTheOutputPolicy) {
   CHECK(umbriel::effectiveVrrEnabled(VrrMode::Disabled, false, VrrMode::Always, false));
   CHECK(!umbriel::effectiveVrrEnabled(VrrMode::Always, false, VrrMode::Disabled, false));
@@ -1310,6 +1344,48 @@ UMBRIEL_TEST(pointerConfinementLastMatchingRuleWins) {
   config.windowRules.emplace_back();
   CHECK(!resolve(true).confinePointer.value_or(true));
   CHECK(resolve(false).confinePointer.value_or(false));
+}
+
+UMBRIEL_TEST(backgroundRenderLastMatchingRuleWins) {
+  Config config;
+  const auto resolve = [&](std::string_view appId) {
+    return umbriel::resolveWindowRules(config, appId, "video", std::nullopt, ContentType::None, {}, 0);
+  };
+  CHECK(!resolve("firefox").backgroundRender.has_value());
+  WindowRule enabled;
+  enabled.appIdPatterns.add("^firefox$");
+  enabled.backgroundRender = true;
+  config.windowRules.push_back(enabled);
+  CHECK(resolve("firefox").backgroundRender.value_or(false));
+  CHECK(!resolve("kitty").backgroundRender.has_value());
+  WindowRule disabled;
+  disabled.backgroundRender = false;
+  config.windowRules.push_back(disabled);
+  CHECK(resolve("firefox").backgroundRender.has_value());
+  CHECK(!*resolve("firefox").backgroundRender);
+}
+
+UMBRIEL_TEST(titleBarAutoResetsAnEarlierOverride) {
+  Config config;
+  const auto resolve = [&] {
+    return umbriel::resolveWindowRules(config, "editor", "file", std::nullopt, ContentType::None, {}, 0);
+  };
+  CHECK(!resolve().titleBar.has_value());
+  WindowRule rule;
+  rule.titleBar = umbriel::TitleBarMode::Forced;
+  config.windowRules.push_back(rule);
+  CHECK_EQ(resolve().titleBar, umbriel::TitleBarMode::Forced);
+  rule.titleBar = umbriel::TitleBarMode::Off;
+  config.windowRules.push_back(rule);
+  CHECK_EQ(resolve().titleBar, umbriel::TitleBarMode::Off);
+  rule.titleBar = umbriel::TitleBarMode::On;
+  config.windowRules.push_back(rule);
+  CHECK_EQ(resolve().titleBar, umbriel::TitleBarMode::On);
+  config.windowRules.emplace_back();
+  CHECK_EQ(resolve().titleBar, umbriel::TitleBarMode::On);
+  WindowRule other = rule;
+  other.titleBar = umbriel::TitleBarMode::Forced;
+  CHECK(!(rule == other));
 }
 
 int main() { return RUN_TESTS(); }

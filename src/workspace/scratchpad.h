@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -26,13 +27,15 @@ namespace umbriel {
   class Server;
   class View;
   class Workspace;
+  struct DisplacedWorkspace;
+  struct WorkspaceLaunchAnchor;
   class ScratchpadManager : public Animatable {
   public:
     ScratchpadManager(Server& server, wlr_scene_tree* root);
     ~ScratchpadManager() override;
 
     [[nodiscard]] AnimationPhase animationPhase() const override { return AnimationPhase::Overlays; }
-    bool tickAnimations(uint64_t nowMsec) override;
+    bool tickAnimations(double nowMsec) override;
     [[nodiscard]] bool hasActiveAnimations() const override;
     [[nodiscard]] bool animatesOn(const Output* output) const override;
 
@@ -51,8 +54,12 @@ namespace umbriel {
     [[nodiscard]] Output* restoreOutputFor(const View* view) const;
     [[nodiscard]] bool moveToScratchpad(View* view, std::string_view name, Output* invokingOutput);
     [[nodiscard]] bool
-    assignByWindowRule(View* view, std::string_view name, Output* placementOutput, const AutomaticAdmission& options);
+    assignAutomatic(View* view, std::string_view name, Output* placementOutput, const AutomaticAdmission& options);
     [[nodiscard]] bool assignFromParent(View* view, const View* parent, const AutomaticAdmission& options);
+    // Launch context survives an empty pad. Explicit workspace focus relinquishes it on that output.
+    [[nodiscard]] std::string_view activeOn(const Output* output) const;
+    void deactivateOn(const Output* output);
+    bool refocusActive(Output* output);
     // Show a scratchpad on the invoking output without changing keyboard focus. Naming `member` while the pad shows a
     // single window shows that member instead.
     bool summon(std::string_view name, Output* invokingOutput, View* member = nullptr);
@@ -92,9 +99,7 @@ namespace umbriel {
 
   private:
     struct PendingSpawn {
-      Output* output = nullptr;
       std::chrono::steady_clock::time_point expiresAt;
-      bool shown = true;
 
       [[nodiscard]] bool live() const { return std::chrono::steady_clock::now() < expiresAt; }
     };
@@ -102,6 +107,7 @@ namespace umbriel {
     struct Scratchpad {
       Output* output = nullptr;
       bool visible = false;
+      bool active = false;
       View* lastFocused = nullptr;
       // While visible, the one member shown in place of all of them; null when every member shows.
       View* solo = nullptr;
@@ -121,6 +127,9 @@ namespace umbriel {
       std::string returnWorkspace;
       size_t returnWorkspaceIndex = 0;
       bool returnWorkspaceNamed = false;
+      // A refuge can share its name with a native workspace and can be pruned while its last view is in a scratchpad.
+      std::weak_ptr<WorkspaceLaunchAnchor> returnWorkspaceAnchor;
+      std::shared_ptr<const DisplacedWorkspace> returnDisplacedWorkspace;
       bool returnTiled = false;
     };
 

@@ -8,32 +8,46 @@
 #include "wlr.h"
 #include "xwayland/window.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace umbriel {
 
   namespace {
     constexpr Logger kLog("xwayland");
 
-    xcb_atom_t resolveAtom(const char* displayName, const char* name) {
+    // Interns `names` over a short-lived connection, so no reply is awaited on the window manager's connection.
+    // Unresolved names stay XCB_ATOM_NONE.
+    template <size_t N>
+    std::array<xcb_atom_t, N> resolveAtoms(const char* displayName, const std::array<const char*, N>& names) {
+      std::array<xcb_atom_t, N> atoms{};
+      atoms.fill(XCB_ATOM_NONE);
       if (displayName == nullptr) {
-        return XCB_ATOM_NONE;
+        return atoms;
       }
       xcb_connection_t* connection = xcb_connect(displayName, nullptr);
       if (connection == nullptr || xcb_connection_has_error(connection) != 0) {
         if (connection != nullptr) {
           xcb_disconnect(connection);
         }
-        return XCB_ATOM_NONE;
+        return atoms;
       }
-      const xcb_intern_atom_cookie_t cookie =
-          xcb_intern_atom(connection, 0, static_cast<uint16_t>(std::strlen(name)), name);
-      xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(connection, cookie, nullptr);
-      const xcb_atom_t atom = reply != nullptr ? reply->atom : static_cast<xcb_atom_t>(XCB_ATOM_NONE);
-      std::free(reply);
+      std::array<xcb_intern_atom_cookie_t, N> cookies{};
+      for (size_t i = 0; i < N; ++i) {
+        cookies[i] = xcb_intern_atom(connection, 0, static_cast<uint16_t>(std::strlen(names[i])), names[i]);
+      }
+      for (size_t i = 0; i < N; ++i) {
+        xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(connection, cookies[i], nullptr);
+        if (reply != nullptr) {
+          atoms[i] = reply->atom;
+        }
+        std::free(reply);
+      }
       xcb_disconnect(connection);
-      return atom;
+      return atoms;
     }
   } // namespace
 
@@ -47,7 +61,9 @@ namespace umbriel {
     );
   }
 
-  Xwayland::Xwayland(Server& server) : m_server(server), m_nativeResolution(config().general.xwaylandNativeResolution) {
+  Xwayland::Xwayland(Server& server)
+      : m_server(server), m_nativeResolution(config().general.xwaylandNativeResolution),
+        m_xsettingsEnabled(config().general.xwaylandXsettings) {
     m_wlr = wlr_xwayland_create(server.display(), server.compositor(), /*lazy=*/true);
     if (m_wlr == nullptr) {
       kLog.error("failed to create the Xwayland server");
@@ -66,12 +82,20 @@ namespace umbriel {
     m_newSurface.notify = onNewSurface;
     wl_signal_add(&m_wlr->events.new_surface, &m_newSurface);
     m_focusClearTimer = wl_event_loop_add_timer(wl_display_get_event_loop(server.display()), onFocusClearTimer, this);
+    m_selectionRefreshTimer =
+        wl_event_loop_add_timer(wl_display_get_event_loop(server.display()), onSelectionRefreshTimer, this);
+    m_keyboardFocusChange.notify = onKeyboardFocusChange;
+    wl_signal_add(&server.seat()->wlr()->keyboard_state.events.focus_change, &m_keyboardFocusChange);
     kLog.info("Xwayland listening on DISPLAY={}", m_wlr->display_name);
   }
 
   Xwayland::~Xwayland() {
     if (m_wlr == nullptr) {
       return;
+    }
+    wl_list_remove(&m_keyboardFocusChange.link);
+    if (m_selectionRefreshTimer != nullptr) {
+      wl_event_source_remove(m_selectionRefreshTimer);
     }
     // Windows only detach here; the server deletes views before destroying this.
     m_windows.clear();
@@ -99,6 +123,7 @@ namespace umbriel {
         m_wlr, wlr_xcursor_image_get_buffer(image), static_cast<int32_t>(image->hotspot_x),
         static_cast<int32_t>(image->hotspot_y)
     );
+    publishXsettings();
   }
 
   void Xwayland::forget(XwaylandWindow* window) {
@@ -137,6 +162,7 @@ namespace umbriel {
     for (const auto& window : m_windows) {
       window->syncGeometry();
     }
+    publishXsettings();
   }
 
   void Xwayland::scheduleFocusClear() {
@@ -162,6 +188,25 @@ namespace umbriel {
     self->handleNewSurface(static_cast<wlr_xwayland_surface*>(data));
   }
 
+  void Xwayland::onKeyboardFocusChange(wl_listener* listener, void* data) {
+    Xwayland* self = wl_container_of(listener, self, m_keyboardFocusChange); // NOLINT(modernize-use-auto)
+    self->handleKeyboardFocusChange(data);
+  }
+
+  int Xwayland::onSelectionRefreshTimer(void* data) {
+    auto* self = static_cast<Xwayland*>(data);
+    wlr_seat* seat = self->m_server.seat()->wlr();
+    if (seat->keyboard_state.focused_surface == nullptr
+        || wlr_xwayland_surface_try_from_wlr_surface(seat->keyboard_state.focused_surface) == nullptr
+        || self->m_wlr->xwm == nullptr) {
+      return 0;
+    }
+    // Wine reads targets on notification, including while unfocused when wlroots denies the read. Rebinding the
+    // same seat republishes native selections after activation without replacing X11-owned sources.
+    wlr_xwayland_set_seat(self->m_wlr, seat);
+    return 0;
+  }
+
   int Xwayland::onFocusClearTimer(void* data) {
     auto* self = static_cast<Xwayland*>(data);
     wlr_surface* focused = self->m_server.seat()->wlr()->keyboard_state.focused_surface;
@@ -172,15 +217,37 @@ namespace umbriel {
   }
 
   void Xwayland::handleReady() {
-    m_netActiveWindow = resolveAtom(m_wlr->display_name, "_NET_ACTIVE_WINDOW");
+    const auto atoms =
+        resolveAtoms<4>(m_wlr->display_name, {"_NET_ACTIVE_WINDOW", "_XSETTINGS_S0", "_XSETTINGS_SETTINGS", "MANAGER"});
+    m_netActiveWindow = atoms[0];
     if (m_netActiveWindow == XCB_ATOM_NONE) {
       kLog.warn("could not resolve _NET_ACTIVE_WINDOW");
+    }
+    if (m_xsettingsEnabled) {
+      if (std::ranges::contains(atoms, static_cast<xcb_atom_t>(XCB_ATOM_NONE))) {
+        kLog.warn("could not resolve the XSETTINGS atoms");
+      } else {
+        m_xsettingsSettingsAtom = atoms[2];
+        startXsettings(atoms[1], atoms[3]);
+      }
     }
     kLog.info("Xwayland ready on DISPLAY={}", m_wlr->display_name);
   }
 
   void Xwayland::handleNewSurface(wlr_xwayland_surface* xsurface) {
     m_windows.push_back(std::make_unique<XwaylandWindow>(m_server, *this, xsurface));
+  }
+
+  void Xwayland::handleKeyboardFocusChange(void* data) {
+    auto* event = static_cast<wlr_seat_keyboard_focus_change_event*>(data);
+    if (event->new_surface == nullptr
+        || wlr_xwayland_surface_try_from_wlr_surface(event->new_surface) == nullptr
+        || (event->old_surface != nullptr && wlr_xwayland_surface_try_from_wlr_surface(event->old_surface) != nullptr)
+        || m_selectionRefreshTimer == nullptr) {
+      return;
+    }
+    // Unmanaged X11 windows can activate after entering the seat. Wait until this dispatch has completed.
+    wl_event_source_timer_update(m_selectionRefreshTimer, 1);
   }
 
   void Xwayland::clearFocus() {
@@ -199,6 +266,63 @@ namespace umbriel {
       }
     }
     xcb_flush(connection);
+  }
+
+  void Xwayland::startXsettings(uint32_t selectionAtom, uint32_t managerAtom) {
+    xcb_connection_t* connection = wlr_xwayland_get_xwm_connection(m_wlr);
+    if (connection == nullptr) {
+      return;
+    }
+    xcb_screen_iterator_t screens = xcb_setup_roots_iterator(xcb_get_setup(connection));
+    if (screens.rem == 0) {
+      return;
+    }
+    const xcb_window_t root = screens.data->root;
+    m_xsettingsConnection = connection;
+    m_xsettingsWindow = xcb_generate_id(connection);
+    m_xsettingsSerial = 0;
+    xcb_create_window(
+        connection, 0, m_xsettingsWindow, root, -1, -1, 1, 1, 0, XCB_WINDOW_CLASS_INPUT_ONLY, XCB_COPY_FROM_PARENT, 0,
+        nullptr
+    );
+    // The property exists before the selection is announced, so a client reacting to MANAGER finds it.
+    m_xsettings = {};
+    publishXsettings();
+    xcb_set_selection_owner(connection, m_xsettingsWindow, selectionAtom, XCB_CURRENT_TIME);
+    xcb_client_message_event_t manager{};
+    manager.response_type = XCB_CLIENT_MESSAGE;
+    manager.format = 32;
+    manager.window = root;
+    manager.type = managerAtom;
+    manager.data.data32[0] = XCB_CURRENT_TIME;
+    manager.data.data32[1] = selectionAtom;
+    manager.data.data32[2] = m_xsettingsWindow;
+    xcb_send_event(connection, 0, root, XCB_EVENT_MASK_STRUCTURE_NOTIFY, reinterpret_cast<const char*>(&manager));
+    xcb_flush(connection);
+  }
+
+  void Xwayland::publishXsettings() {
+    xcb_connection_t* connection = m_wlr != nullptr ? wlr_xwayland_get_xwm_connection(m_wlr) : nullptr;
+    if (connection == nullptr || connection != m_xsettingsConnection) {
+      return;
+    }
+    const Config::Input::Cursor& cursor = config().input.cursor;
+    XsettingsValues values = xsettingsFor(m_outputs->scale(), cursor.theme, cursor.size);
+    if (m_xsettingsSerial != 0 && values == m_xsettings) {
+      return;
+    }
+    m_xsettings = std::move(values);
+    ++m_xsettingsSerial;
+    const std::vector<uint8_t> data = encodeXsettings(m_xsettingsSerial, m_xsettings);
+    xcb_change_property(
+        connection, XCB_PROP_MODE_REPLACE, m_xsettingsWindow, m_xsettingsSettingsAtom, m_xsettingsSettingsAtom, 8,
+        static_cast<uint32_t>(data.size()), data.data()
+    );
+    xcb_flush(connection);
+    kLog.debug(
+        "XSETTINGS {}: scale {} unscaled DPI {} Xft/DPI {}", m_xsettingsSerial, m_xsettings.windowScalingFactor,
+        m_xsettings.unscaledDpi, m_xsettings.xftDpi
+    );
   }
 
 } // namespace umbriel

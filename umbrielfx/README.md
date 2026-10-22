@@ -42,16 +42,31 @@ is destroyed.
 - Shaders are embedded as generated char arrays, so an installed binary never
   locates shader data files at runtime.
 - Replaces wlroots' scene graph completely: every helper that creates or
-  destroys scene nodes lives here, and borrowing one from `libwlroots` is a bug.
+  destroys scene nodes or scene outputs lives here, and borrowing one from
+  `libwlroots` is a bug.
   `umbrielfx_scene_check_helpers()` refuses to start when one does.
 - Structs that wlroots also declares stay a strict prefix extension: fields
   Umbriel adds go after every wlroots field. `tests/abi.c` enforces it.
 
   Both rules exist for the same reason, and the reason is not obvious. See
   [scene helper ownership](../docs/design/scene-helper-ownership.md).
+- `types/scene/capture.c` owns the scene-node image capture helper, adapted from
+  wlroots 0.20.2, so capture outputs use this fork's scene implementation.
+  `umbrielfx_scene_capture_source_set_scale` changes physical capture resolution
+  while scene geometry stays logical. Compare the upstream helper when updating
+  wlroots. Active sources refresh without requiring a client commit; idle
+  sources store the requested scale until capture starts.
 - Unprofiled SDR outputs, implicit surfaces, and compositor-defined colors use
-  the sRGB transfer curve. Color-managed SDR clients are offered gamma 2.2 and
-  their tagged buffers are converted through the linear FP16 path.
+  the sRGB transfer curve. On PQ and gamma 2.2 outputs, implicit surfaces and
+  compositor-defined colors decode with gamma 2.2, and SDR captures encode with
+  it by default. A PQ output can select piecewise sRGB with `sdr_transfer`, which
+  applies consistently to implicit content, compositor colors, effect controls,
+  and SDR capture encoding. The policy lives in an output addon independent of
+  renderer resources. Explicit transfer functions retain their declared meaning,
+  including the piecewise sRGB curve requested by `compound_power_2_4`. Scene
+  buffers keep zero as the unspecified transfer function so the renderer can
+  distinguish it from explicit sRGB. Color-managed SDR clients are offered
+  gamma 2.2 and their tagged buffers are converted through the linear FP16 path.
 - A window's desktop and capture scenes share its `wlr_surface`, so
   `types/scene/surface.c` updates only its own scene's output memberships and
   skips suspended outputs when picking the frame-pacing output. Otherwise

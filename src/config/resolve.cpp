@@ -135,6 +135,9 @@ namespace umbriel {
       if (overrides.newExitsFullscreen) {
         resolved.newExitsFullscreen = *overrides.newExitsFullscreen;
       }
+      if (overrides.clientMaximize) {
+        resolved.clientMaximize = *overrides.clientMaximize;
+      }
       if (overrides.tabs.defaultDisplay) {
         resolved.tabs.defaultDisplay = *overrides.tabs.defaultDisplay;
       }
@@ -150,6 +153,7 @@ namespace umbriel {
       if (overrides.tabs.middleClickCloses) {
         resolved.tabs.middleClickCloses = *overrides.tabs.middleClickCloses;
       }
+      resolved.tabs.barGap = config.appearance.tabBar.gap < 0 ? resolved.gap : config.appearance.tabBar.gap;
       const int borderWidth = config.appearance.totalBorderWidth();
       resolved.totalGap = resolved.gap + 2 * borderWidth;
       resolved.edgePad = resolved.gap + borderWidth;
@@ -266,6 +270,9 @@ namespace umbriel {
       if (rule.matchOnlyWindow && *rule.matchOnlyWindow != state.onlyWindow) {
         continue;
       }
+      if (rule.matchDialog && *rule.matchDialog != state.dialog) {
+        continue;
+      }
       if (rule.matchAtStartup && *rule.matchAtStartup != (uptimeMs < kStartupRuleDurationMs)) {
         continue;
       }
@@ -324,8 +331,14 @@ namespace umbriel {
       if (rule.confinePointer) {
         resolved.confinePointer = rule.confinePointer;
       }
+      if (rule.backgroundRender) {
+        resolved.backgroundRender = rule.backgroundRender;
+      }
       if (rule.focusOnActivate) {
         resolved.focusOnActivate = rule.focusOnActivate;
+      }
+      if (rule.attachToParent) {
+        resolved.attachToParent = rule.attachToParent;
       }
       if (rule.vrr) {
         resolved.vrr = rule.vrr;
@@ -350,6 +363,9 @@ namespace umbriel {
       }
       if (rule.blurOptimized) {
         resolved.blurOptimized = rule.blurOptimized;
+      }
+      if (rule.titleBar) {
+        resolved.titleBar = rule.titleBar;
       }
       if (rule.borderColorFocused) {
         resolved.borderColorFocused = rule.borderColorFocused;
@@ -446,6 +462,7 @@ namespace umbriel {
     resolved.struts = config.layout.struts;
     resolved.extentPresets = config.layout.extentPresets;
     resolved.newExitsFullscreen = config.layout.newExitsFullscreen;
+    resolved.clientMaximize = config.layout.clientMaximize;
     resolved.scrolling.defaultExtentFraction = config.layout.scrolling.defaultExtentFraction;
     resolved.scrolling.centerUnderfullStrip = config.layout.scrolling.centerUnderfullStrip;
     resolved.scrolling.centerFocused = config.layout.scrolling.centerFocused;
@@ -464,6 +481,7 @@ namespace umbriel {
     resolved.tabs.barPosition = config.appearance.tabBar.position;
     resolved.tabs.hideWhenSingle = config.appearance.tabBar.hideWhenSingle;
     resolved.tabs.barVisible = config.appearance.tabBar.visible;
+    resolved.tabs.barGap = config.appearance.tabBar.gap < 0 ? resolved.gap : config.appearance.tabBar.gap;
     const int borderWidth = config.appearance.totalBorderWidth();
     resolved.totalGap = resolved.gap + 2 * borderWidth;
     resolved.edgePad = resolved.gap + borderWidth;

@@ -3,6 +3,7 @@
 #include "check.h"
 
 #include <cstdio>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <unistd.h>
@@ -278,6 +279,48 @@ UMBRIEL_TEST(effectsCommandReportsStatesSuppressionAndDeclarationOrder) {
   CHECK(output.contains("window window-1 (terminal)\tborder"));
   CHECK(output.contains("output vendor/panel\tscreen"));
   CHECK_EQ(captureHumanOutput(*spec, payload), output);
+}
+
+UMBRIEL_TEST(audioRequestsAcceptOnlyTheCompleteBoundedSpectrumContract) {
+  using umbriel::IpcCommands;
+  auto bands = nlohmann::json::array();
+  for (int i = 0; i < FX_AUDIO_BANDS; ++i) {
+    bands.push_back(static_cast<double>(i) / (FX_AUDIO_BANDS - 1));
+  }
+  nlohmann::json request = {{"cmd", "effect-audio"}, {"version", 2}, {"bands", bands}};
+  const auto audio = IpcCommands::parseAudioSpectrum(request);
+  CHECK(audio.has_value());
+  for (int i = 0; i < FX_AUDIO_BANDS; ++i) {
+    CHECK_EQ((*audio)[i], static_cast<float>(i) / (FX_AUDIO_BANDS - 1));
+  }
+  CHECK_EQ((*audio)[FX_AUDIO_BANDS], 1.0F);
+  for (const auto& value :
+       {nlohmann::json(-0.01), nlohmann::json(1.01), nlohmann::json(true), nlohmann::json("0.5"),
+        nlohmann::json(nullptr), nlohmann::json(std::numeric_limits<double>::infinity()),
+        nlohmann::json(std::numeric_limits<double>::quiet_NaN())}) {
+    request["bands"][63] = value;
+    CHECK(!IpcCommands::parseAudioSpectrum(request));
+  }
+  request["bands"] = bands;
+  for (const auto& version : {nlohmann::json(0), nlohmann::json(1), nlohmann::json(2.0), nlohmann::json(true)}) {
+    request["version"] = version;
+    CHECK(!IpcCommands::parseAudioSpectrum(request));
+  }
+  request["version"] = 2;
+  request["level"] = 0.5;
+  CHECK(!IpcCommands::parseAudioSpectrum(request));
+  request.erase("level");
+  request["bands"].erase(63);
+  CHECK(!IpcCommands::parseAudioSpectrum(request));
+  request["bands"] = bands;
+  request["bands"].push_back(0);
+  CHECK(!IpcCommands::parseAudioSpectrum(request));
+  request["bands"] = 0;
+  CHECK(!IpcCommands::parseAudioSpectrum(request));
+  request.erase("bands");
+  CHECK(!IpcCommands::parseAudioSpectrum(request));
+  CHECK(!IpcCommands::parseAudioSpectrum(nlohmann::json::array()));
+  CHECK(!IpcCommands::parseAudioSpectrum(nullptr));
 }
 
 int main() { return RUN_TESTS(); }

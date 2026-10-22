@@ -185,6 +185,12 @@ UMBRIEL_TEST(rejectsMalformedSubmapPrefix) {
 // parseAction
 UMBRIEL_TEST(parsesSimpleActions) {
   Keybind bind;
+  CHECK(parseAction("cursor-hide", bind));
+  CHECK(bind.action == KeybindAction::CursorHide);
+
+  CHECK(parseAction("cursor-show", bind));
+  CHECK(bind.action == KeybindAction::CursorShow);
+
   CHECK(parseAction("window-close", bind));
   CHECK(bind.action == KeybindAction::WindowClose);
 
@@ -591,6 +597,48 @@ UMBRIEL_TEST(parsesOptionalOutputActions) {
   CHECK(!parseAction("output-toggle", bind));
 }
 
+UMBRIEL_TEST(parsesOutputSdrWhiteAction) {
+  const auto sdrWhiteOf = [](const Keybind& bind) {
+    const auto* arg = umbriel::payloadIf<umbriel::SdrWhiteArg>(bind);
+    return arg != nullptr ? arg->nits : -1.0;
+  };
+  const auto outputOf = [](const Keybind& bind) {
+    const auto* arg = umbriel::payloadIf<umbriel::SdrWhiteArg>(bind);
+    return arg != nullptr ? arg->output : std::string{};
+  };
+
+  Keybind bind;
+  CHECK(parseAction("output-sdr-white:203", bind));
+  CHECK(bind.action == KeybindAction::OutputSdrWhite);
+  CHECK(std::fabs(sdrWhiteOf(bind) - 203.0) < 1e-9);
+  CHECK(outputOf(bind).empty());
+
+  CHECK(parseAction("output-sdr-white:120/DP-1", bind));
+  CHECK(std::fabs(sdrWhiteOf(bind) - 120.0) < 1e-9);
+  CHECK_EQ(outputOf(bind), std::string{"DP-1"});
+
+  // Everything after the first slash is the output name, as for effect targets.
+  CHECK(parseAction("output-sdr-white:120.5/vendor/panel", bind));
+  CHECK(std::fabs(sdrWhiteOf(bind) - 120.5) < 1e-9);
+  CHECK_EQ(outputOf(bind), std::string{"vendor/panel"});
+
+  CHECK(parseAction("output-sdr-white:80", bind));
+  CHECK(parseAction("output-sdr-white:1000", bind));
+}
+
+UMBRIEL_TEST(rejectsMalformedOutputSdrWhiteArguments) {
+  Keybind bind;
+  CHECK(!parseAction("output-sdr-white", bind));      // no level
+  CHECK(!parseAction("output-sdr-white:", bind));     // no level
+  CHECK(!parseAction("output-sdr-white:200/", bind)); // empty output
+  CHECK(!parseAction("output-sdr-white:79", bind));   // below the configured floor
+  CHECK(!parseAction("output-sdr-white:1001", bind)); // above the configured ceiling
+  CHECK(!parseAction("output-sdr-white:abc", bind));
+  CHECK(!parseAction("output-sdr-white:nan", bind));
+  CHECK(!parseAction("output-sdr-white:inf", bind));
+  CHECK(!parseAction("output-sdr-white:-203", bind));
+}
+
 UMBRIEL_TEST(parsesOptionalScratchpadActions) {
   const auto scratchpadOf = [](const Keybind& bind) {
     const auto* arg = umbriel::payloadIf<umbriel::ScratchpadArg>(bind);
@@ -648,6 +696,13 @@ UMBRIEL_TEST(parsesWindowIdActions) {
   CHECK(parseAction("window-close:abc123", bind));
   CHECK(bind.action == KeybindAction::WindowClose);
   CHECK_EQ(umbriel::payloadIf<umbriel::WindowIdArg>(bind)->id, std::string{"abc123"});
+  CHECK(parseAction("window-kill", bind));
+  CHECK(bind.action == KeybindAction::WindowKill);
+  CHECK_EQ(umbriel::payloadIf<umbriel::WindowIdArg>(bind)->id, std::string{});
+  CHECK(parseAction("window-kill:abc123", bind));
+  CHECK(bind.action == KeybindAction::WindowKill);
+  CHECK_EQ(umbriel::payloadIf<umbriel::WindowIdArg>(bind)->id, std::string{"abc123"});
+  CHECK(!parseAction("window-kill:", bind));
   CHECK(parseAction("window-focus:abc123", bind));
   CHECK(bind.action == KeybindAction::WindowFocusId);
   CHECK_EQ(umbriel::payloadIf<umbriel::WindowIdArg>(bind)->id, std::string{"abc123"});
@@ -681,6 +736,9 @@ UMBRIEL_TEST(payloadAlternativeMatchesTheDeclaredArgKind) {
     case ActionArgKind::LayoutMode:
       input += ":toggle";
       break;
+    case ActionArgKind::SnapRegion:
+      input += ":left";
+      break;
     case ActionArgKind::ColumnDisplay:
       input += ":tabbed";
       break;
@@ -701,8 +759,17 @@ UMBRIEL_TEST(payloadAlternativeMatchesTheDeclaredArgKind) {
     case ActionArgKind::Output:
       input += ":DP-1";
       break;
+    case ActionArgKind::SdrWhite:
+      input += ":200/DP-1";
+      break;
     case ActionArgKind::WindowId:
       input += ":abc";
+      break;
+    case ActionArgKind::WindowMoveTo:
+      input += ":center/1/1";
+      break;
+    case ActionArgKind::WindowMoveBy:
+      input += ":1/1";
       break;
     }
     CHECK(parseAction(input, bind));
@@ -723,6 +790,9 @@ UMBRIEL_TEST(payloadAlternativeMatchesTheDeclaredArgKind) {
       break;
     case ActionArgKind::LayoutMode:
       CHECK(umbriel::payloadIf<umbriel::LayoutModeArg>(bind) != nullptr);
+      break;
+    case ActionArgKind::SnapRegion:
+      CHECK(umbriel::payloadIf<umbriel::SnapRegionArg>(bind) != nullptr);
       break;
     case ActionArgKind::ColumnDisplay:
       CHECK(umbriel::payloadIf<umbriel::ColumnDisplayArg>(bind) != nullptr);
@@ -758,6 +828,15 @@ UMBRIEL_TEST(payloadAlternativeMatchesTheDeclaredArgKind) {
       break;
     case ActionArgKind::SkipConfirmation:
       CHECK(umbriel::payloadIf<umbriel::QuitArg>(bind) != nullptr);
+      break;
+    case ActionArgKind::SdrWhite:
+      CHECK(umbriel::payloadIf<umbriel::SdrWhiteArg>(bind) != nullptr);
+      break;
+    case ActionArgKind::WindowMoveTo:
+      CHECK(umbriel::payloadIf<umbriel::WindowMoveToArg>(bind) != nullptr);
+      break;
+    case ActionArgKind::WindowMoveBy:
+      CHECK(umbriel::payloadIf<umbriel::WindowMoveByArg>(bind) != nullptr);
       break;
     }
   }
@@ -802,6 +881,9 @@ UMBRIEL_TEST(everyActionSpecRoundTripsThroughParseAction) {
     case ActionArgKind::LayoutMode:
       input += ":toggle";
       break;
+    case ActionArgKind::SnapRegion:
+      input += ":left";
+      break;
     case ActionArgKind::ColumnDisplay:
       input += ":tabbed";
       break;
@@ -822,8 +904,17 @@ UMBRIEL_TEST(everyActionSpecRoundTripsThroughParseAction) {
     case ActionArgKind::Output:
       input += ":DP-1";
       break;
+    case ActionArgKind::SdrWhite:
+      input += ":200/DP-1";
+      break;
     case ActionArgKind::WindowId:
       input += ":abc";
+      break;
+    case ActionArgKind::WindowMoveTo:
+      input += ":center/1/1";
+      break;
+    case ActionArgKind::WindowMoveBy:
+      input += ":1/1";
       break;
     }
     if (!parseAction(input, bind)) {
@@ -964,12 +1055,20 @@ UMBRIEL_TEST(everyAdvertisedActionParsesWithItsDeclaredArgument) {
       return ":0.1";
     case ActionArgKind::LayoutMode:
       return ":scrolling";
+    case ActionArgKind::SnapRegion:
+      return ":top_left";
     case ActionArgKind::ColumnDisplay:
       return ":normal";
     case ActionArgKind::TabIndex:
       return ":-1";
     case ActionArgKind::SkipConfirmation:
       return ":skip-confirmation";
+    case ActionArgKind::SdrWhite:
+      return ":200/DP-1";
+    case ActionArgKind::WindowMoveTo:
+      return ":center/1/1";
+    case ActionArgKind::WindowMoveBy:
+      return ":1/1";
     }
     return {};
   };
@@ -1009,13 +1108,21 @@ UMBRIEL_TEST(everyAdvertisedActionParsesWithItsDeclaredArgument) {
     case ActionArgKind::FractionDelta:
       return "<delta>";
     case ActionArgKind::LayoutMode:
-      return "<scrolling|dwindle|master|toggle[:mode1,mode2,...]>";
+      return "<scrolling|dwindle|master|floating|toggle[:mode1,mode2,...]>";
+    case ActionArgKind::SnapRegion:
+      return "<left|right|top|bottom|top_left|top_right|bottom_left|bottom_right>";
     case ActionArgKind::ColumnDisplay:
       return "<normal|tabbed>";
     case ActionArgKind::TabIndex:
       return "<index>";
+    case ActionArgKind::SdrWhite:
+      return "<nits>[/<output>]";
     case ActionArgKind::SkipConfirmation:
       return "[skip-confirmation]";
+    case ActionArgKind::WindowMoveTo:
+      return "<anchor>/<x>/<y>[/<window-id>]";
+    case ActionArgKind::WindowMoveBy:
+      return "<delta-x>/<delta-y>[/<window-id>]";
     }
     return "";
   };
@@ -1130,6 +1237,111 @@ UMBRIEL_TEST(effectActionReferencesDescribeOnlyNamedRoots) {
   }
   CHECK(parseAction("spawn:hello", bind));
   CHECK(!umbriel::effectActionReference(bind));
+}
+
+UMBRIEL_TEST(windowMoveToActionParseArgs) {
+  using umbriel::WindowMoveToArg;
+  using umbriel::WindowPositionAnchor;
+  Keybind bind;
+  for (const auto& [name, anchor] : umbriel::kWindowPositionAnchorNames) {
+    CHECK(parseAction("window-move-to:" + std::string(name) + "/10/20/abc", bind));
+    const auto* arg = umbriel::payloadIf<WindowMoveToArg>(bind);
+    CHECK((arg != nullptr && *arg == WindowMoveToArg{.id = "abc", .position = {.x = 10, .y = 20, .anchor = anchor}}));
+  }
+  const auto parsed = [&](std::string_view input) {
+    const auto* arg = parseAction(input, bind) ? umbriel::payloadIf<WindowMoveToArg>(bind) : nullptr;
+    return arg != nullptr ? std::optional(*arg) : std::nullopt;
+  };
+  CHECK(
+      (parsed("window-move-to:center/10/20")
+       == WindowMoveToArg{.id = "", .position = {.x = 10, .y = 20, .anchor = WindowPositionAnchor::Center}})
+  );
+  CHECK(
+      (parsed("window-move-to:right/+10/+20")
+       == WindowMoveToArg{.id = "", .position = {.x = 10, .y = 20, .anchor = WindowPositionAnchor::Right}})
+  );
+  CHECK(
+      (parsed("window-move-to:bottom/-10/-20")
+       == WindowMoveToArg{.id = "", .position = {.x = -10, .y = -20, .anchor = WindowPositionAnchor::Bottom}})
+  );
+}
+
+UMBRIEL_TEST(windowMoveToActionRejectMalformedArgs) {
+  Keybind bind;
+  CHECK(!parseAction("window-move-to", bind));
+  CHECK(!parseAction("window-move-to:bottom_left", bind));
+  CHECK(!parseAction("window-move-to:anchor/0/0", bind));
+  CHECK(!parseAction("window-move-to://", bind));
+  CHECK(!parseAction("window-move-to:center//", bind));
+  CHECK(!parseAction("window-move-to:center///", bind));
+  CHECK(!parseAction("window-move-to:center/0", bind));
+  CHECK(!parseAction("window-move-to:center/a/10", bind));
+  CHECK(!parseAction("window-move-to:center/10/a", bind));
+  CHECK(!parseAction("window-move-to:top_left/0/0/0/0", bind));
+  CHECK(!parseAction("window-move-to:top_left/3.9/0", bind));
+  CHECK(!parseAction("window-move-to:top_left/0/3.9", bind));
+  CHECK(!parseAction("window-move-to:center/10/10/", bind));
+}
+
+UMBRIEL_TEST(windowMoveByActionParseArgs) {
+  using umbriel::WindowMoveByArg;
+  Keybind bind;
+  const auto parsed = [&](std::string_view input) {
+    const auto* arg = parseAction(input, bind) ? umbriel::payloadIf<WindowMoveByArg>(bind) : nullptr;
+    return arg != nullptr ? std::optional(*arg) : std::nullopt;
+  };
+  CHECK((parsed("window-move-by:10/20") == WindowMoveByArg{.id = "", .deltaX = 10, .deltaY = 20}));
+  CHECK((parsed("window-move-by:10/20/abc") == WindowMoveByArg{.id = "abc", .deltaX = 10, .deltaY = 20}));
+  CHECK((parsed("window-move-by:+10/+20") == WindowMoveByArg{.id = "", .deltaX = 10, .deltaY = 20}));
+  CHECK((parsed("window-move-by:-10/20") == WindowMoveByArg{.id = "", .deltaX = -10, .deltaY = 20}));
+  CHECK((parsed("window-move-by:10/-20") == WindowMoveByArg{.id = "", .deltaX = 10, .deltaY = -20}));
+}
+
+UMBRIEL_TEST(windowMoveByActionRejectMalformedArgs) {
+  Keybind bind;
+  CHECK(!parseAction("window-move-by", bind));
+  CHECK(!parseAction("window-move-by:10", bind));
+  CHECK(!parseAction("window-move-by:/", bind));
+  CHECK(!parseAction("window-move-by://", bind));
+  CHECK(!parseAction("window-move-by:abc", bind));
+  CHECK(!parseAction("window-move-by:abc/0", bind));
+  CHECK(!parseAction("window-move-by:0/abc", bind));
+  CHECK(!parseAction("window-move-by:3.4/0", bind));
+  CHECK(!parseAction("window-move-by:0/3.4", bind));
+  CHECK(!parseAction("window-move-by:0/0/abc/abc", bind));
+  CHECK(!parseAction("window-move-by:10/10/", bind));
+}
+
+UMBRIEL_TEST(parsesFloatingLayoutAndCustomCycle) {
+  Keybind bind;
+  CHECK(parseAction("workspace-set-layout:floating", bind));
+  auto* arg = umbriel::payloadIf<umbriel::LayoutModeArg>(bind);
+  CHECK(arg != nullptr && arg->mode == umbriel::LayoutMode::Floating);
+  CHECK(parseAction("workspace-set-layout:toggle:floating,scrolling", bind));
+  arg = umbriel::payloadIf<umbriel::LayoutModeArg>(bind);
+  CHECK(arg != nullptr && !arg->mode.has_value());
+  CHECK(arg != nullptr && arg->toggleSequence.size() == 2);
+  CHECK(arg != nullptr && arg->toggleSequence[0] == umbriel::LayoutMode::Floating);
+  CHECK(arg != nullptr && arg->toggleSequence[1] == umbriel::LayoutMode::Scrolling);
+}
+
+UMBRIEL_TEST(parsesFloatingSnapActions) {
+  Keybind bind;
+  CHECK(parseAction("window-snap:top_left", bind));
+  CHECK(bind.action == KeybindAction::WindowSnap);
+  auto* arg = umbriel::payloadIf<umbriel::SnapRegionArg>(bind);
+  CHECK(arg != nullptr && arg->region == umbriel::SnapRegion::TopLeft);
+  CHECK(parseAction("window-snap:top", bind));
+  arg = umbriel::payloadIf<umbriel::SnapRegionArg>(bind);
+  CHECK(arg != nullptr && arg->region == umbriel::SnapRegion::Top);
+  CHECK(parseAction("window-snap:bottom", bind));
+  arg = umbriel::payloadIf<umbriel::SnapRegionArg>(bind);
+  CHECK(arg != nullptr && arg->region == umbriel::SnapRegion::Bottom);
+  CHECK(parseAction("window-unsnap", bind));
+  CHECK(bind.action == KeybindAction::WindowUnsnap);
+  CHECK(!parseAction("window-snap:top-left", bind));
+  CHECK(!parseAction("window-snap", bind));
+  CHECK(!parseAction("window-unsnap:left", bind));
 }
 
 int main() { return RUN_TESTS(); }

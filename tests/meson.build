@@ -10,6 +10,7 @@ unit_tests = [
   ['scene-node', ['unit/scene_node.cpp'], []],
   ['scene-clip', ['unit/scene_clip.cpp'], [wayland_server_dep]],
   ['xwayland-outputs', ['unit/xwayland_outputs.cpp'], [umbriel_core_dep]],
+  ['xwayland-xsettings', ['unit/xwayland_xsettings.cpp'], []],
   ['presentation', ['unit/presentation.cpp'], [umbriel_core_dep]],
   ['surface-pacer', ['unit/surface_pacer.cpp'], [umbriel_core_dep]],
   ['animation', ['unit/animation.cpp'], [umbriel_core_dep]],
@@ -25,6 +26,7 @@ unit_tests = [
   ['modifier-tap', ['unit/modifier_tap.cpp'], []],
   ['keyboard-layout', ['unit/keyboard_layout.cpp'], []],
   ['surface-layouts', ['unit/surface_layouts.cpp'], []],
+  ['shortcuts-inhibit', ['unit/shortcuts_inhibit.cpp'], []],
   ['shortcut-keysym', ['unit/shortcut_keysym.cpp'], []],
   ['xcursor-matcher', ['unit/xcursor_matcher.cpp'], []],
   ['output-direction', ['unit/output_direction.cpp'], []],
@@ -32,10 +34,12 @@ unit_tests = [
   ['output-mode-selection', ['unit/output_mode_selection.cpp'], []],
   ['cursor-plane-pace', ['unit/cursor_plane_pace.cpp'], []],
   ['output-frame-schedule', ['unit/output_frame_schedule.cpp'], []],
+  ['output-direct-scanout', ['unit/output_direct_scanout.cpp'], []],
   ['output-hdr-transition', ['unit/output_hdr_transition.cpp'], []],
   ['output-format-sequence', ['unit/output_format_sequence.cpp'], []],
   ['output-gamma-transition', ['unit/output_gamma_transition.cpp'], []],
   ['hdr-metadata', ['unit/hdr_metadata.cpp'], [umbriel_core_dep]],
+  ['color-description', ['unit/color_description.cpp'], [umbriel_core_dep]],
   ['hdr-format', ['unit/hdr_format.cpp'], []],
   ['sdr-format', ['unit/sdr_format.cpp'], []],
   ['layout-struts', ['unit/layout_struts.cpp'], []],
@@ -43,11 +47,14 @@ unit_tests = [
   ['scrolling-layout', ['unit/scrolling_layout.cpp'], []],
   ['dwindle-layout', ['unit/dwindle_layout.cpp'], []],
   ['master-layout', ['unit/master_layout.cpp'], []],
+  ['floating-layout', ['unit/floating_layout.cpp'], []],
   ['tabbed-layout', ['unit/tabbed_layout.cpp'], []],
   ['cheatsheet-rows', ['unit/cheatsheet_rows.cpp'], []],
   ['shortcut-labels', ['unit/shortcut_labels.cpp'], []],
   ['border-ring', ['unit/border_ring.cpp'], []],
+  ['ssd-frame-geometry', ['unit/ssd_frame_geometry.cpp'], []],
   ['floating', ['unit/floating.cpp'], []],
+  ['snap', ['unit/snap.cpp'], []],
   ['drag-physics', ['unit/drag_physics.cpp'], []],
   ['preset-cycle', ['unit/preset_cycle.cpp'], []],
   ['maximize', ['unit/maximize.cpp'], []],
@@ -168,6 +175,7 @@ drag_client = executable(
   'drag-client',
   [
     'harness/clients/drag_client.cpp',
+    toplevel_drag_client_h, toplevel_drag_c,
     layer_shell_client_h, layer_shell_client_c,
     xdg_shell_client_h, xdg_shell_client_c,
     xdg_activation_client_h, xdg_activation_client_c,
@@ -179,7 +187,13 @@ drag_client = executable(
 # restoration checks use it to reproduce a panel returning after windows do.
 layer_client = executable(
   'layer-client',
-  ['harness/clients/layer_client.cpp', layer_shell_client_h, layer_shell_client_c, xdg_shell_client_c],
+  [
+    'harness/clients/layer_client.cpp',
+    layer_shell_client_h,
+    layer_shell_client_c,
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+  ],
   dependencies: [wayland_client_dep],
 )
 
@@ -341,6 +355,10 @@ fractional_client = executable(
     viewporter_client_c,
     fractional_scale_client_h,
     fractional_scale_client_c,
+    legacy_decoration_client_h,
+    legacy_decoration_client_c,
+    xdg_decoration_client_h,
+    xdg_decoration_client_c,
   ],
   dependencies: [wayland_client_dep],
 )
@@ -401,6 +419,18 @@ security_context_client = executable(
   dependencies: [wayland_client_dep],
 )
 
+color_feedback_client = executable(
+  'color-feedback-client',
+  [
+    'harness/clients/color_feedback_client.cpp',
+    xdg_shell_client_h,
+    xdg_shell_client_c,
+    color_management_client_h,
+    color_management_client_c,
+  ],
+  dependencies: [wayland_client_dep],
+)
+
 # Harness helper that logs the seat input events a window receives, for input state checks.
 seat_log_client = executable(
   'seat-log-client',
@@ -427,6 +457,13 @@ xwayland_focus_client = executable(
   dependencies: [xcb_dep],
 )
 
+# Eager X11 selection reader and owner for clipboard focus transitions.
+xwayland_selection_client = executable(
+  'xwayland-selection-client',
+  ['harness/clients/xwayland_selection_client.cpp'],
+  dependencies: [xcb_dep, dependency('xcb-xfixes')],
+)
+
 # Harness pair that proves only Xwayland-owned theme cursor surfaces are
 # promoted to compositor Xcursors. The X11 fixture also supplies an unmatched
 # custom cursor, while the native fixture supplies matching theme pixels as an
@@ -435,6 +472,13 @@ xwayland_cursor_client = executable(
   'xwayland-cursor-client',
   ['harness/clients/xwayland_cursor_client.cpp'],
   dependencies: [xcb_dep, xcb_render_dep, wlroots_dep],
+)
+
+# Reads the XSETTINGS manager's selection and settings property on DISPLAY.
+xsettings_client = executable(
+  'xsettings-client',
+  ['harness/clients/xsettings_client.cpp'],
+  dependencies: [xcb_dep],
 )
 
 wayland_cursor_client = executable(
@@ -474,12 +518,14 @@ capture_client = executable(
     ext_image_capture_source_client_c,
     ext_image_copy_capture_client_h,
     ext_image_copy_capture_client_c,
+    ext_foreign_toplevel_list_client_h,
     ext_foreign_toplevel_list_client_c,
   ],
   dependencies: [wayland_client_dep],
 )
 
 harness_client_targets = [
+  color_feedback_client,
   pixel_probe,
   capture_client,
   pointer_client,
@@ -503,7 +549,9 @@ harness_client_targets = [
   security_context_client,
   seat_log_client,
   xwayland_focus_client,
+  xwayland_selection_client,
   xwayland_cursor_client,
+  xsettings_client,
   wayland_cursor_client,
   output_management_client,
 ]

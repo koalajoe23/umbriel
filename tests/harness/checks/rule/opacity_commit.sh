@@ -24,7 +24,7 @@ opacity = 0.5
 EOF
 "$UMBRIEL" msg config-reload > /dev/null
 
-foot --config=/dev/null --app-id=opacity-commit --override=colors.background=000000 \
+foot --config=/dev/null --app-id=opacity-commit --override=colors-dark.background=000000 \
   sh -c 'while :; do printf "\\r%08d" "$RANDOM"; sleep 0.02; done' > /dev/null 2>&1 &
 
 for _ in $(seq 60); do

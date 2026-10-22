@@ -218,6 +218,9 @@ namespace umbriel {
     }
     wlr_seat* seat = m_seat->wlr();
     wlr_surface* focused = seat->keyboard_state.focused_surface;
+    if (!m_sessionLocked && m_manualShortcutsInhibit.enabled(focused)) {
+      return true;
+    }
     return focused != nullptr && std::ranges::any_of(m_shortcutsInhibitors, [seat, focused](const auto& watch) {
              const wlr_keyboard_shortcuts_inhibitor_v1* inhibitor = watch->inhibitor;
              return inhibitor->active && inhibitor->seat == seat && inhibitor->surface == focused;
@@ -225,22 +228,34 @@ namespace umbriel {
   }
 
   bool Server::toggleKeyboardShortcutsInhibit() {
-    if (m_seat == nullptr) {
+    if (m_seat == nullptr || m_sessionLocked) {
       return false;
     }
     wlr_seat* seat = m_seat->wlr();
     wlr_surface* focused = seat->keyboard_state.focused_surface;
-    const auto found = std::ranges::find_if(m_shortcutsInhibitors, [seat, focused](const auto& watch) {
-      return focused != nullptr && watch->inhibitor->seat == seat && watch->inhibitor->surface == focused;
-    });
-    if (found == m_shortcutsInhibitors.end()) {
+    if (focused == nullptr) {
       return false;
     }
-    wlr_keyboard_shortcuts_inhibitor_v1* inhibitor = (*found)->inhibitor;
-    if (inhibitor->active) {
-      wlr_keyboard_shortcuts_inhibitor_v1_deactivate(inhibitor);
-    } else {
-      wlr_keyboard_shortcuts_inhibitor_v1_activate(inhibitor);
+
+    const bool enable = !keyboardShortcutsInhibited();
+    // A client may have created an inhibitor after manual passthrough began.
+    // Disable both sources together so a single escape always restores binds.
+    m_manualShortcutsInhibit.disable(focused);
+    bool clientInhibitor = false;
+    for (const auto& watch : m_shortcutsInhibitors) {
+      wlr_keyboard_shortcuts_inhibitor_v1* inhibitor = watch->inhibitor;
+      if (inhibitor->seat != seat || inhibitor->surface != focused) {
+        continue;
+      }
+      clientInhibitor = true;
+      if (enable && !inhibitor->active) {
+        wlr_keyboard_shortcuts_inhibitor_v1_activate(inhibitor);
+      } else if (!enable && inhibitor->active) {
+        wlr_keyboard_shortcuts_inhibitor_v1_deactivate(inhibitor);
+      }
+    }
+    if (enable && !clientInhibitor) {
+      m_manualShortcutsInhibit.enable(focused);
     }
     return true;
   }
@@ -348,7 +363,7 @@ namespace umbriel {
         continue;
       }
       // Non-mouse binds carry 0 here, which never equals a BTN_* code.
-      if (bind.mouseButton != button) {
+      if (bind.mouseButton != canonicalMouseButton(button)) {
         continue;
       }
       const uint32_t expected = bind.modifiers | (bind.useMod ? modKey() : 0);

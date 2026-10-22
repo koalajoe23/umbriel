@@ -81,6 +81,19 @@ UMBRIEL_TEST(interpolateBoxEdgesMoveMonotonically) {
   }
 }
 
+UMBRIEL_TEST(interpolateBoxSplitsPositionFromSize) {
+  const wlr_box from{0, 0, 800, 900};
+  const wlr_box to{400, 500, 400, 400};
+  // A resize that has finished while the move is a quarter done: the final size at a quarter of the travel.
+  CHECK(sameBox(interpolateBox(from, to, 0.25, 1.0), wlr_box{100, 125, 400, 400}));
+  // A move that has finished while the resize lags: the final origin with a size still on its way.
+  CHECK(sameBox(interpolateBox(from, to, 1.0, 0.5), wlr_box{400, 500, 600, 650}));
+  for (int step = 0; step <= 20; ++step) {
+    const double progress = step * 0.05;
+    CHECK(sameBox(interpolateBox(from, to, progress, progress), interpolateBox(from, to, progress)));
+  }
+}
+
 UMBRIEL_TEST(establishedColumnsStaySeparateDuringInsertionReflow) {
   const std::vector<MotionBox> peers{
       {{0, 0, 600, 800}, kColumnA},

@@ -14,7 +14,7 @@ extern "C" {
 namespace umbriel {
 
   void SurfaceShadow::update(
-      wlr_scene_tree* parent, int contentWidth, int contentHeight, int borderTotal, int cornerRadius
+      wlr_scene_tree* parent, int contentWidth, int contentHeight, int borderTotal, int cornerRadius, int topExtension
   ) {
     const auto& cfg = config().appearance.shadow;
     const auto& shadow = config().colors.shadow;
@@ -23,7 +23,7 @@ namespace umbriel {
     // Decorated box origin (in parent coords): (-borderTotal, -borderTotal)
     // Decorated box size: (contentWidth + 2*borderTotal, contentHeight + 2*borderTotal)
     const int decWidth = contentWidth + 2 * borderTotal;
-    const int decHeight = contentHeight + 2 * borderTotal;
+    const int decHeight = contentHeight + topExtension + 2 * borderTotal;
 
     const bool enabled = m_enabled.value_or(cfg.enabled);
     const bool want = enabled && shadow[3] > 0.0F && contentWidth > 0 && contentHeight > 0;
@@ -48,7 +48,7 @@ namespace umbriel {
     int nodeWidth = decWidth + 2 * sigma;
     int nodeHeight = decHeight + 2 * sigma;
     int nodeX = -borderTotal - sigma + cfg.offsetX;
-    int nodeY = -borderTotal - sigma + cfg.offsetY;
+    int nodeY = -borderTotal - sigma + cfg.offsetY - topExtension;
 
     // Hole punched over the window+borders so the shadow never shows through
     // transparent surfaces. Node-local coordinates.

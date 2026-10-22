@@ -14,9 +14,6 @@ readonly SCRATCHPAD_CONFIG='
 [animation]
 enabled = false
 
-[animation.scratchpad]
-scale = 0
-
 [[scratchpad]]
 name = "restore"'
 

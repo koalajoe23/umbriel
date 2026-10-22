@@ -103,6 +103,7 @@ namespace umbriel {
     const bool changed = regions != m_regions || fallback != m_fallback;
     m_regions = std::move(regions);
     m_fallback = fallback;
+    m_scale = m_regions.empty() ? 1.0 : positionScale;
     for (const auto& entry : m_entries) {
       send(*entry, false);
     }

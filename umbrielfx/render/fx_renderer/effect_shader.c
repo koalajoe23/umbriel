@@ -1,13 +1,14 @@
+#include "render/egl.h"
 #include "render/fx_renderer/effect.h"
+#include "render/fx_renderer/fx_renderer.h"
+#include "render/fx_renderer/shaders.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wlr/util/log.h>
 
-#include "render/egl.h"
-#include "render/fx_renderer/fx_renderer.h"
-#include "render/fx_renderer/shaders.h"
+_Static_assert(FX_AUDIO_BANDS == 64, "audio shader coordinates require 64 bands");
 
 // Shared by every kind. Its names are the shared preamble contract.
 static const char kPreamble[] =
@@ -19,12 +20,24 @@ static const char kPreamble[] =
     "#define cos(x) cos(mod((x), 6.283185307179586))\n"
     "varying vec2 v_texcoord;\n"
     "uniform sampler2D umbriel_texture;\n"
+    "uniform sampler2D umbriel_incoming_texture;\n"
     "uniform mat3 umbriel_sample_matrix;\n"
     "uniform sampler2D umbriel_previous_texture;\n"
     "uniform mat3 umbriel_previous_sample_matrix;\n"
     "uniform vec2 umbriel_size;\n"
     "uniform float umbriel_scale;\n"
     "uniform float umbriel_time;\n"
+    "uniform sampler2D umbriel_audio_bands;\n"
+    "uniform float umbriel_audio_ready;\n"
+    "float umbriel_audio_available() { return umbriel_audio_ready; }\n"
+    "float umbriel_audio_entry(float index) {\n"
+    "  return texture2D(umbriel_audio_bands, vec2((index + 0.5) / 64.0, 0.5)).r;\n"
+    "}\n"
+    "float umbriel_audio_spectrum(float position) {\n"
+    "  float index = clamp(position, 0.0, 1.0) * 63.0;\n"
+    "  float low = floor(index);\n"
+    "  return mix(umbriel_audio_entry(low), umbriel_audio_entry(min(low + 1.0, 63.0)), index - low);\n"
+    "}\n"
     "uniform vec2 umbriel_expand;\n"
     "uniform vec4 umbriel_palette[4];\n"
     "uniform int umbriel_palette_count;\n"
@@ -33,6 +46,12 @@ static const char kPreamble[] =
     "  vec2 p = (vec3(uv, 1.0) * umbriel_sample_matrix).xy;\n"
     "  if (any(lessThan(p, vec2(0.0))) || any(greaterThan(p, vec2(1.0)))) return vec4(0.0);\n"
     "  return texture2D(umbriel_texture, p);\n"
+    "}\n"
+    "vec4 umbriel_sample_incoming(vec2 uv) {\n"
+    "  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec4(0.0);\n"
+    "  vec2 p = (vec3(uv, 1.0) * umbriel_sample_matrix).xy;\n"
+    "  if (any(lessThan(p, vec2(0.0))) || any(greaterThan(p, vec2(1.0)))) return vec4(0.0);\n"
+    "  return texture2D(umbriel_incoming_texture, p);\n"
     "}\n"
     "vec4 umbriel_sample_previous(vec2 uv) {\n"
     "  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return vec4(0.0);\n"
@@ -57,12 +76,11 @@ static const char kPreamble[] =
     "  return mix(from, to, scaled - index);\n"
     "}\n";
 
-static const char kAnimationSection[] =
-    "uniform float umbriel_progress;\n"
-    "uniform float umbriel_linear_progress;\n"
-    "uniform float umbriel_direction;\n"
-    "uniform vec4 umbriel_random_seed;\n"
-    "#define umbriel_clamped_progress clamp(umbriel_progress, 0.0, 1.0)\n";
+static const char kAnimationSection[] = "uniform float umbriel_progress;\n"
+                                        "uniform float umbriel_linear_progress;\n"
+                                        "uniform float umbriel_direction;\n"
+                                        "uniform vec4 umbriel_random_seed;\n"
+                                        "#define umbriel_clamped_progress clamp(umbriel_progress, 0.0, 1.0)\n";
 static const char kAnimationSuffix[] = "\nvoid main() { gl_FragColor = animation(v_texcoord); }\n";
 
 // Hole and radii describe the client rectangle inside the drawn rectangle. The
@@ -105,11 +123,10 @@ static const char kWindowSuffix[] =
     "\nvoid main() { gl_FragColor = mix(umbriel_sample(v_texcoord), window(v_texcoord), umbriel_mask(v_texcoord)); }\n";
 static const char kScreenSuffix[] = "\nvoid main() { gl_FragColor = screen(v_texcoord); }\n";
 // The cursor kind is in place too, so it needs the mask helper before its own uniform.
-static const char kCursorSection[] =
-    "uniform vec2 umbriel_pointer;\n"
-    "uniform int umbriel_pointer_count;\n"
-    "uniform vec4 umbriel_pointer_history[8];\n"
-    "uniform vec4 umbriel_pointer_path[64];\n";
+static const char kCursorSection[] = "uniform vec2 umbriel_pointer;\n"
+                                     "uniform int umbriel_pointer_count;\n"
+                                     "uniform vec4 umbriel_pointer_history[8];\n"
+                                     "uniform vec4 umbriel_pointer_path[64];\n";
 static const char kCursorSuffix[] =
     "\nvoid main() { gl_FragColor = mix(umbriel_sample(v_texcoord), cursor(v_texcoord), umbriel_mask(v_texcoord)); }\n";
 
@@ -273,8 +290,8 @@ static GLenum gl_type(enum fx_uniform_type type) {
 }
 
 void fx_effect_shader_bind_uniform_data(
-    struct fx_effect_shader* shader, const char* name, enum fx_uniform_type type,
-    unsigned element_count, const void* data, size_t data_bytes
+    struct fx_effect_shader* shader, const char* name, enum fx_uniform_type type, unsigned element_count,
+    const void* data, size_t data_bytes
 ) {
   struct fx_effect_uniform* cached = (struct fx_effect_uniform*)fx_effect_shader_uniform(shader, name);
   if (cached == NULL) {
@@ -347,15 +364,18 @@ static void reset_optional_uniforms(struct fx_effect_shader* shader) {
   }
 }
 
-void fx_effect_shader_bind_parameters(struct fx_effect_shader* shader, const struct fx_animation_parameters* parameters) {
+void fx_effect_shader_bind_parameters(
+    struct fx_effect_shader* shader, const struct fx_animation_parameters* parameters
+) {
   reset_optional_uniforms(shader);
   for (unsigned i = 0; i < parameters->uniform_count && i < FX_UNIFORMS_MAX; i++) {
     fx_effect_shader_bind_uniform(shader, &parameters->uniforms[i]);
   }
 }
 
-struct fx_effect_shader*
-fx_effect_shader_create(struct wlr_renderer* renderer, enum fx_effect_kind kind, const char* source, const char* label) {
+struct fx_effect_shader* fx_effect_shader_create(
+    struct wlr_renderer* renderer, enum fx_effect_kind kind, const char* source, const char* label
+) {
   if (source == NULL || !wlr_renderer_is_fx(renderer)) {
     return NULL;
   }
@@ -380,7 +400,7 @@ fx_effect_shader_create(struct wlr_renderer* renderer, enum fx_effect_kind kind,
     return NULL;
   }
   snprintf(fragment, length, "%s%s%s%s%s%s", kPreamble, section, extra, line, source, suffix);
-  wlr_log(WLR_DEBUG, "Compiling %s shader: %s", kind_name(kind), label);
+  wlr_log(WLR_INFO, "Compiling %s shader: %s", kind_name(kind), label);
   shader->program = link_program(fragment);
   free(fragment);
   if (shader->program == 0) {
@@ -400,6 +420,8 @@ fx_effect_shader_create(struct wlr_renderer* renderer, enum fx_effect_kind kind,
   shader->position = glGetAttribLocation(shader->program, "pos");
   shader->tex = glGetUniformLocation(shader->program, "umbriel_texture");
   shader->sample_matrix = glGetUniformLocation(shader->program, "umbriel_sample_matrix");
+  shader->audio_tex = glGetUniformLocation(shader->program, "umbriel_audio_bands");
+  shader->incoming_tex = glGetUniformLocation(shader->program, "umbriel_incoming_texture");
   shader->previous_tex = glGetUniformLocation(shader->program, "umbriel_previous_texture");
   shader->previous_sample_matrix = glGetUniformLocation(shader->program, "umbriel_previous_sample_matrix");
   shader->progress = glGetUniformLocation(shader->program, "umbriel_progress");

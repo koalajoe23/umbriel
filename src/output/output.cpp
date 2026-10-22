@@ -22,9 +22,9 @@
 #include "scene/config_banner.h"
 #include "scene/node.h"
 #include "scene/quit_confirm.h"
+#include "server/color_manager.h"
 #include "server/ipc.h"
 #include "server/server.h"
-#include "server/wine_color_manager.h"
 #include "view/view.h"
 #include "wlr.h"
 #include "workspace/scratchpad.h"
@@ -42,11 +42,49 @@ extern "C" {
 #include <drm_fourcc.h>
 #include <format>
 
+#ifdef TRACY_ENABLE
+#include <set>
+#endif
+
 namespace umbriel {
 
   namespace {
     constexpr Logger kLog("output");
     constexpr int kFrameRetryDelayMs = 16;
+
+    std::string_view directScanoutReason(wlr_scene_direct_scanout_status status) {
+      switch (status) {
+      case WLR_SCENE_DIRECT_SCANOUT_ACTIVE:
+        return "";
+      case WLR_SCENE_DIRECT_SCANOUT_DISABLED:
+        return "disabled";
+      case WLR_SCENE_DIRECT_SCANOUT_NO_CANDIDATE:
+        return "no_candidate";
+      case WLR_SCENE_DIRECT_SCANOUT_COMPOSITED:
+        return "composited";
+      case WLR_SCENE_DIRECT_SCANOUT_EFFECTS:
+        return "effects";
+      case WLR_SCENE_DIRECT_SCANOUT_COLOR:
+        return "color_conversion";
+      case WLR_SCENE_DIRECT_SCANOUT_CAPTURE:
+        return "capture";
+      case WLR_SCENE_DIRECT_SCANOUT_CROPPED:
+        return "cropped";
+      case WLR_SCENE_DIRECT_SCANOUT_TRANSFORM:
+        return "transform";
+      case WLR_SCENE_DIRECT_SCANOUT_MODESET:
+        return "modeset";
+      case WLR_SCENE_DIRECT_SCANOUT_RENDER_LOCKED:
+        return "render_locked";
+      case WLR_SCENE_DIRECT_SCANOUT_SOFTWARE_CURSOR:
+        return "software_cursor";
+      case WLR_SCENE_DIRECT_SCANOUT_REJECTED:
+        return "rejected";
+      case WLR_SCENE_DIRECT_SCANOUT_DEBUG_DAMAGE:
+        return "debug_damage";
+      }
+      return "unknown";
+    }
 
     struct OutputFrameScope {
       explicit OutputFrameScope(Server& owner) : server(owner) { server.beginOutputFrame(); }
@@ -78,6 +116,25 @@ namespace umbriel {
       }
       return {.x = sceneOutput.x, .y = sceneOutput.y, .width = width, .height = height};
     }
+
+    // Staging any mode, even the live one, makes wlroots request ALLOW_MODESET, which makes the display resync.
+    wlr_output_mode* keepLiveModeOrStage(wlr_output_state& state, const wlr_output& output, wlr_output_mode* mode) {
+      if (!liveModeMatches(output, mode)) {
+        wlr_output_state_set_mode(&state, mode);
+        return nullptr;
+      }
+      kLog.info("output '{}': keeping live mode {}x{}@{}mHz", output.name, mode->width, mode->height, mode->refresh);
+      return mode;
+    }
+
+#ifdef TRACY_ENABLE
+    // Tracy keeps a plot's name pointer and reads it while a capture runs, so
+    // the per-output names live for the rest of the process.
+    const char* tracyPlotName(std::string name) {
+      static std::set<std::string> names;
+      return names.insert(std::move(name)).first->c_str();
+    }
+#endif
 
   } // namespace
 
@@ -121,6 +178,8 @@ namespace umbriel {
 
     m_frameRetryTimer =
         wl_event_loop_add_timer(wl_display_get_event_loop(m_server->display()), onFrameRetryTimer, this);
+    m_directScanoutTimer =
+        wl_event_loop_add_timer(wl_display_get_event_loop(m_server->display()), onDirectScanoutTimer, this);
 
     applyCursorConfig();
     m_desktopEnabled = m_server->initialOutputEnabled(*this);
@@ -139,6 +198,13 @@ namespace umbriel {
 
     for (uint32_t layer = 0; layer < kLayerCount; ++layer) {
       m_layerTrees[layer] = wlr_scene_tree_create(m_server->shellLayerTree(layer));
+    }
+    m_backgroundUpdate.notify = onBackgroundUpdate;
+    if (!wlr_scene_node_add_update_listener(
+            &layerTree(ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND)->node, &m_backgroundUpdate
+        )) {
+      kLog.error("output '{}': failed to watch background scene updates", m_output->name);
+      std::abort();
     }
     m_popupTree = wlr_scene_tree_create(m_server->shellLayerTree(ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY));
     m_viewRoot = wlr_scene_tree_create(m_server->xdgTree());
@@ -159,6 +225,24 @@ namespace umbriel {
     }
     m_effectFrameDue = true;
     wlr_output_schedule_frame(m_output);
+  }
+
+  void Output::scheduleAudioFrame() {
+    if (m_server->sessionLocked() || !outputFrameAllowed(m_server->stopping(), m_server->session())) {
+      m_effectAudio = {};
+      wlr_scene_output_set_effect_audio(m_sceneOutput, m_effectAudio.data());
+      return;
+    }
+    if (!wlr_scene_output_audio_active(m_sceneOutput)) {
+      return;
+    }
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    armEffectFrame(static_cast<uint64_t>(now.tv_sec) * 1000 + static_cast<uint64_t>(now.tv_nsec) / 1'000'000);
+  }
+
+  bool Output::audioPending() const {
+    return m_effectAudio != m_server->effects().audio() && wlr_scene_output_audio_active(m_sceneOutput);
   }
 
   void Output::applyOutputEffects() {
@@ -295,6 +379,25 @@ namespace umbriel {
     return rule != nullptr ? rule->sdrWhite : 203.0F;
   }
 
+  float Output::sdrWhite() const { return m_runtimeSdrWhite.value_or(configuredSdrWhite()); }
+
+  SdrTransfer Output::configuredSdrTransfer() const {
+    const OutputRule* rule = findOutputRule(config(), identity());
+    return rule != nullptr ? rule->sdrTransfer : SdrTransfer::Gamma22;
+  }
+
+  void Output::setRuntimeSdrWhite(float nits) {
+    if (m_runtimeSdrWhite && *m_runtimeSdrWhite == nits) {
+      return;
+    }
+    m_runtimeSdrWhite = nits;
+    kLog.info("output '{}': live SDR white {} cd/m2", m_output->name, nits);
+    updateSceneSdrWhite();
+    markBlurBackgroundDirty();
+    m_server->updateColorPreferences();
+    wlr_output_schedule_frame(m_output);
+  }
+
   int Output::configuredBitDepth() const {
     const OutputRule* rule = findOutputRule(config(), identity());
     return rule != nullptr ? rule->bitDepth : 8;
@@ -396,8 +499,19 @@ namespace umbriel {
     if (m_sceneOutput == nullptr) {
       return;
     }
-    const float sdrWhite = hdrActive() ? configuredSdrWhite() : 0.0F;
-    wlr_scene_output_set_sdr_white_level(m_sceneOutput, sdrWhite);
+    const float level = hdrActive() ? sdrWhite() : 0.0F;
+    wlr_scene_output_set_sdr_white_level(m_sceneOutput, level);
+    updateSceneHdrWhitePoint(wlr_gamma_control_manager_v1_get_control(m_server->gammaManager(), m_output));
+  }
+
+  void Output::updateSceneHdrWhitePoint(wlr_gamma_control_v1* control) {
+    if (m_sceneOutput == nullptr) {
+      return;
+    }
+    const auto white = hdrWhitePointFromGamma(
+        control != nullptr ? control->table : nullptr, control != nullptr ? control->ramp_size : 0
+    );
+    wlr_scene_output_set_hdr_white_point(m_sceneOutput, white.data());
   }
 
   wlr_scene_rect* Output::createConfiguredFrameMask(const wlr_output_state& state) const {
@@ -419,12 +533,21 @@ namespace umbriel {
   }
 
   bool Output::applyConfiguredState(bool stageGeometry) {
+    if (m_workspaceGroup != nullptr) {
+      m_workspaceGroup->abandonReveal();
+    }
     const OutputRule* rule = findOutputRule(config(), identity());
+    const auto sdrTransfer = configuredSdrTransfer() == SdrTransfer::Srgb ? WLR_COLOR_TRANSFER_FUNCTION_SRGB
+                                                                          : WLR_COLOR_TRANSFER_FUNCTION_GAMMA22;
+    if (!wlr_scene_output_set_sdr_transfer_function(m_sceneOutput, sdrTransfer)) {
+      kLog.error("output '{}': failed to apply SDR transfer function", m_output->name);
+      return false;
+    }
     const std::optional<double> configuredScale = rule != nullptr ? rule->scale : std::nullopt;
     const bool enabled = desktopEnabled() && !m_dpmsOff;
     wlr_output_state state{};
     wlr_output_state_init(&state);
-    if (stageGeometry) {
+    if (stageGeometry && outputEnableNeedsStaging(*m_output, enabled)) {
       wlr_output_state_set_enabled(&state, enabled);
     }
 
@@ -435,6 +558,7 @@ namespace umbriel {
     bool scaleStaged = false;
     const OutputMode* configuredModeSpec = nullptr;
     wlr_output_mode* stagedMode = nullptr;
+    wlr_output_mode* keptLiveMode = nullptr;
     if (enabled && stageGeometry) {
       if (rule != nullptr && rule->mode) {
         if (wlr_output_is_wl(m_output)) {
@@ -443,14 +567,14 @@ namespace umbriel {
           configuredModeSpec = &*rule->mode;
           stagedMode = selectOutputMode(m_output, *rule->mode);
           if (stagedMode != nullptr) {
-            wlr_output_state_set_mode(&state, stagedMode);
+            keptLiveMode = keepLiveModeOrStage(state, *m_output, stagedMode);
           } else {
             wlr_output_state_set_custom_mode(&state, rule->mode->width, rule->mode->height, rule->mode->refreshMHz);
           }
         }
       } else if (!wlr_output_is_wl(m_output)) {
         if (wlr_output_mode* mode = wlr_output_preferred_mode(m_output)) {
-          wlr_output_state_set_mode(&state, mode);
+          keptLiveMode = keepLiveModeOrStage(state, *m_output, mode);
         }
       }
 
@@ -533,6 +657,14 @@ namespace umbriel {
             },
     };
 
+    // wlroots writes max bpc only in commits that allow a modeset, and the kernel may require one to change
+    // colorspace or to switch HDR on or off.
+    const auto allowModesetForColorChange = [&](uint32_t fmt, bool hdr) {
+      if (colorChangeNeedsModeset(*m_output, fmt, hdr)) {
+        state.allow_reconfiguration = true;
+      }
+    };
+
     const auto stageHdr = [&](uint32_t fmt, bool vrr) -> bool {
       if (!isPrimaryFormat(fmt)) {
         return false;
@@ -541,6 +673,7 @@ namespace umbriel {
       (void)stageGammaForOutputMode(GammaOutputMode::Hdr, gammaOps);
       wlr_output_state_set_image_description(&state, &hdrDescription);
       wlr_output_state_set_render_format(&state, fmt);
+      allowModesetForColorChange(fmt, true);
       return true;
     };
 
@@ -551,6 +684,7 @@ namespace umbriel {
       stageVrr(vrr);
       (void)stageGammaForOutputMode(GammaOutputMode::Sdr, gammaOps);
       wlr_output_state_set_render_format(&state, fmt);
+      allowModesetForColorChange(fmt, false);
       return true;
     };
 
@@ -570,6 +704,7 @@ namespace umbriel {
           .tryVrrOn = tryVrrOn,
           .configuredModeSpec = stageGeometry ? configuredModeSpec : nullptr,
           .preferredMode = stageGeometry ? preferredFallbackMode(m_output, stagedMode) : nullptr,
+          .keptLiveMode = keptLiveMode,
           .modeFallbackAlreadyWarned = m_modeFallbackWarned,
           .vrrDroppedTier = m_vrrDroppedTier,
           .earlyHdrFail = earlyHdrFail,
@@ -577,8 +712,10 @@ namespace umbriel {
 
       const auto commitStagedState = [&]() -> FormatCommitResult {
         const bool targetHdr = state.image_description != nullptr;
-        wlr_scene_output_set_sdr_white_level(m_sceneOutput, targetHdr ? configuredSdrWhite() : 0.0F);
+        wlr_scene_output_set_sdr_white_level(m_sceneOutput, targetHdr ? sdrWhite() : 0.0F);
         wlr_damage_ring_add_whole(&m_sceneOutput->damage_ring);
+        // The cache may need a new size, format or SDR curve; re-render it in this frame.
+        markBlurBackgroundDirty();
 
         wlr_output_state frameState{};
         wlr_output_state_init(&frameState);
@@ -656,7 +793,15 @@ namespace umbriel {
       const FormatSequenceOps seqOps{
           .stageSdr = stageSdr,
           .stageHdr = stageHdr,
-          .test = [&] { return wlr_output_test_state(m_output, &state); },
+          .test =
+              [&] {
+                // A kept live mode leaves wlroots nothing to change, so it skips the KMS test unless a buffer is sent.
+                if (keptLiveMode != nullptr
+                    && !wlr_output_configure_primary_swapchain(m_output, &state, &m_output->swapchain)) {
+                  return false;
+                }
+                return wlr_output_test_state(m_output, &state);
+              },
           .commit = commitStagedState,
           .clearImageDescription = [&] { wlr_output_state_set_image_description(&state, nullptr); },
           .stageMode = [&](wlr_output_mode* mode) { wlr_output_state_set_mode(&state, mode); },
@@ -690,6 +835,12 @@ namespace umbriel {
       const FormatSequenceResult seq = runFormatSequence(seqParams, seqOps);
       anyCommitted = seq.committed;
       usedModeFallback = seq.usedModeFallback;
+      if (seq.usedLiveModeRetry) {
+        kLog.info(
+            "output '{}': backend rejected keeping live mode {}x{}@{}mHz, retried with a modeset", m_output->name,
+            keptLiveMode->width, keptLiveMode->height, keptLiveMode->refresh
+        );
+      }
       if (seq.modeFallbackWarnedNow) {
         m_modeFallbackWarned = true;
       }
@@ -721,6 +872,7 @@ namespace umbriel {
       // A failed candidate may have prepared the scene for the requested
       // transfer function. Keep the renderer aligned with the live output.
       updateSceneSdrWhite();
+      markBlurBackgroundDirty();
       kLog.error("output '{}': failed to commit configured state", m_output->name);
       return false;
     }
@@ -881,6 +1033,7 @@ namespace umbriel {
   }
 
   bool Output::applyOutputState() {
+    m_runtimeSdrWhite.reset();
     const bool previousDesktopEnabled = m_desktopEnabled;
     const bool previousDpmsOff = m_dpmsOff;
     m_desktopEnabled = configuredEnabled();
@@ -1092,6 +1245,10 @@ namespace umbriel {
   }
 
   Output::~Output() {
+    if (m_backgroundUpdate.link.next != nullptr) {
+      wl_list_remove(&m_backgroundUpdate.link);
+      m_backgroundUpdate.link.next = nullptr;
+    }
     if (m_frameRetryTimer != nullptr) {
       wl_event_source_remove(m_frameRetryTimer);
       m_frameRetryTimer = nullptr;
@@ -1099,6 +1256,10 @@ namespace umbriel {
     if (m_effectFrameTimer != nullptr) {
       wl_event_source_remove(m_effectFrameTimer);
       m_effectFrameTimer = nullptr;
+    }
+    if (m_directScanoutTimer != nullptr) {
+      wl_event_source_remove(m_directScanoutTimer);
+      m_directScanoutTimer = nullptr;
     }
     if (m_animationRenderLocked) {
       wlr_output_lock_attach_render(m_output, false);
@@ -1236,11 +1397,22 @@ namespace umbriel {
       scratchpad->refreshOutputGeometry(this);
     }
 
+    // Layer geometry and the usable area settle here.
+    m_server->scheduleIpcLayersEvent();
+    m_server->scheduleIpcOutputsEvent();
     const wlr_box layoutUsableArea = this->usableArea();
-    kLog.debug(
-        "{} usable={}x{}+{}+{}", m_output->name, layoutUsableArea.width, layoutUsableArea.height, layoutUsableArea.x,
-        layoutUsableArea.y
-    );
+    // Arrangement runs on every layer commit; only a changed result is worth a line.
+    const wlr_box& logged = m_loggedUsableArea;
+    if (layoutUsableArea.x != logged.x
+        || layoutUsableArea.y != logged.y
+        || layoutUsableArea.width != logged.width
+        || layoutUsableArea.height != logged.height) {
+      m_loggedUsableArea = layoutUsableArea;
+      kLog.debug(
+          "{} usable={}x{}+{}+{}", m_output->name, layoutUsableArea.width, layoutUsableArea.height, layoutUsableArea.x,
+          layoutUsableArea.y
+      );
+    }
     if (m_workspaceGroup != nullptr && m_workspaceGroup->active() != nullptr) {
       m_workspaceGroup->active()->markArrange(false);
     }
@@ -1281,15 +1453,16 @@ namespace umbriel {
   }
 
   void Output::markBlurBackgroundDirty() {
-    if (m_optimizedBlur != nullptr) {
+    if (m_optimizedBlur != nullptr && !m_optimizedBlur->dirty) {
       wlr_scene_optimized_blur_mark_dirty(m_optimizedBlur);
     }
   }
 
-  void Output::onGammaChanged(wlr_gamma_control_v1* /*control*/) {
+  void Output::onGammaChanged(wlr_gamma_control_v1* control) {
+    updateSceneHdrWhitePoint(control);
     if (hdrActive()) {
-      // wlroots has already retained the client's latest table. Keep it for
-      // the next SDR transition without applying an SDR LUT to HDR output.
+      // The scene applies the requested white point before PQ encoding.
+      // Keep the full table for SDR instead of applying it to PQ values.
       m_gammaDirty = false;
       return;
     }
@@ -1302,6 +1475,12 @@ namespace umbriel {
     Output* self;
     self = wl_container_of(listener, self, m_frame);
     self->handleFrame();
+  }
+
+  void Output::onBackgroundUpdate(wl_listener* listener, void* /*data*/) {
+    Output* self;
+    self = wl_container_of(listener, self, m_backgroundUpdate);
+    self->markBlurBackgroundDirty();
   }
 
   void Output::onRequestState(wl_listener* listener, void* data) {
@@ -1327,6 +1506,49 @@ namespace umbriel {
     if (outputFrameAllowed(self->m_server->stopping(), self->m_server->session())) {
       wlr_output_schedule_frame(self->m_output);
     }
+    return 0;
+  }
+
+  void Output::observeDirectScanout() {
+    const wlr_scene_direct_scanout_status status = wlr_scene_output_direct_scanout_status(m_sceneOutput);
+    DirectScanoutState state;
+    state.active = status == WLR_SCENE_DIRECT_SCANOUT_ACTIVE;
+    state.reason = directScanoutReason(status);
+    if (wlr_scene_buffer* buffer = wlr_scene_output_direct_scanout_buffer(m_sceneOutput)) {
+      wlr_scene_surface* sceneSurface = wlr_scene_surface_try_from_buffer(buffer);
+      const View* view =
+          sceneSurface != nullptr ? View::fromSurface(wlr_surface_get_root_surface(sceneSurface->surface)) : nullptr;
+      if (view != nullptr) {
+        state.windowId = view->extForeignIdentifier() != nullptr ? view->extForeignIdentifier() : "";
+        state.appId = view->appId() != nullptr ? view->appId() : "";
+        state.title = view->title() != nullptr ? view->title() : "";
+      }
+    }
+    // Restarting the wait on every change settles only a state that held for the whole interval.
+    const DirectScanoutTracker::Observation observation = m_directScanout.observe(state);
+    if (observation != DirectScanoutTracker::Observation::Unchanged && m_directScanoutTimer != nullptr) {
+      const bool pending = observation == DirectScanoutTracker::Observation::Pending;
+      wl_event_source_timer_update(m_directScanoutTimer, pending ? DirectScanoutTracker::kSettleMs : 0);
+    }
+  }
+
+  int Output::onDirectScanoutTimer(void* data) {
+    auto* self = static_cast<Output*>(data);
+    if (!self->m_directScanout.settle()) {
+      return 0;
+    }
+    const DirectScanoutState& state = self->m_directScanout.settled();
+    if (self->m_directScanout.settledChangeIsNotable()) {
+      if (state.active) {
+        kLog.info(
+            "output '{}': direct scanout on ({} \"{}\")", self->m_output->name,
+            state.appId.empty() ? "unknown" : state.appId, state.title
+        );
+      } else {
+        kLog.info("output '{}': direct scanout off ({})", self->m_output->name, state.reason);
+      }
+    }
+    self->m_server->scheduleIpcOutputsEvent();
     return 0;
   }
 
@@ -1460,12 +1682,12 @@ namespace umbriel {
     timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
     const uint64_t nowMsec = static_cast<uint64_t>(now.tv_sec) * 1000 + static_cast<uint64_t>(now.tv_nsec) / 1'000'000;
-    // A frame is an effect frame when one was asked for, or when an instance here is eligible and the max_fps interval
-    // has elapsed (a delay of 1 ms is the helper's "due now"), whichever timeline scheduled the frame. The output's own
-    // timer supplies the frames nothing else asks for.
+    // A frame is an effect frame when one was asked for, or when an instance here is eligible or an audio change is
+    // pending and the max_fps interval has elapsed (a delay of 1 ms is the helper's "due now"), whichever timeline
+    // scheduled the frame. The output's own timer supplies the frames nothing else asks for.
     const bool effectFrame = m_effectFrameDue
         || (!m_server->sessionLocked()
-            && effectEligible() > 0
+            && (effectEligible() > 0 || audioPending())
             && effectFrameDelayMs(config().effects.maxFps, nowMsec, m_lastEffectFrameMsec) <= 1);
     m_effectFrameDue = false;
     if (effectFrame) {
@@ -1484,14 +1706,23 @@ namespace umbriel {
     if (stampEffectTime) {
       m_effectSeconds = effects.clockSeconds();
     }
-    m_server->tickAnimations(m_server->animationClockMsec());
+    if (effectFrame) {
+      m_effectAudio = effects.audio();
+      wlr_scene_output_set_effect_audio(m_sceneOutput, m_effectAudio.data());
+    }
+    // Sample animations on this output's vblank cadence rather than when the frame event got dispatched, so event-loop
+    // latency and other outputs' rendering do not make motion steps uneven.
+    const uint64_t nowNs = static_cast<uint64_t>(now.tv_sec) * 1'000'000'000 + static_cast<uint64_t>(now.tv_nsec);
+    const uint64_t vblankNs = latestVblankNs(nowNs, m_lastPresentNs, m_refreshNs);
+    const uint64_t sampleNs = vblankNs != 0 ? vblankNs : nowNs;
+    m_server->tickAnimations(m_server->animationFrameClockMsec(static_cast<double>(sampleNs) / 1e6));
     if (stampEffectTime && m_outputEffectsTimed) {
       applyOutputEffects();
     }
 
-    // Surface commits reset scene-buffer opacity to the protocol alpha. Repair
-    // pending rule opacity after every commit listener and before composition.
-    m_server->flushPendingViewOpacities();
+    if (m_workspaceGroup != nullptr) {
+      m_workspaceGroup->refreshReveal();
+    }
 
     // A direct-scanned fullscreen client may stop submitting as soon as it loses focus. On VRR outputs that can leave
     // the first workspace-switch frame waiting on the old client, so the compositor never gets a vblank to advance the
@@ -1505,12 +1736,9 @@ namespace umbriel {
       m_animationRenderLocked = animationsActive;
     }
 
-    // wlroots only knows about descriptions owned by its color manager and resets
-    // compatibility-managed Wine buffers to SDR on every surface commit. Restore
-    // their descriptions at the render boundary so no frame can observe that
-    // transient default state.
-    if (WineColorManager* colorManager = m_server->wineColorManager()) {
-      colorManager->applySurfaceDescriptions();
+    // Keep preferred color descriptions current as output membership and policy change.
+    if (ColorManager* colorManager = m_server->colorManager()) {
+      colorManager->updatePreferredDescriptions();
     }
 
     const int externalLocks = externalRenderLocks();
@@ -1612,7 +1840,24 @@ namespace umbriel {
       sceneOptions.capture_sdr = hdrActive() && captureLocks > 0;
       sceneOptions.effect_capture_pending = effectCapturePending(captureLocks);
       m_effectCaptureBuilt = sceneOptions.effect_capture_pending;
-      if (wlr_scene_output_build_state(m_sceneOutput, &state, &sceneOptions)) {
+      sceneOptions.require_animation_success = m_workspaceGroup != nullptr && m_workspaceGroup->revealActive();
+      if (sceneOptions.require_animation_success) {
+        sceneOptions.workspace_from = m_workspaceGroup->revealRoot(false);
+        sceneOptions.workspace_to = m_workspaceGroup->revealRoot(true);
+      }
+      bool built = false;
+      {
+        UMBRIEL_ZONE("Output::buildState");
+        built = wlr_scene_output_build_state(m_sceneOutput, &state, &sceneOptions);
+      }
+      if (!built && sceneOptions.require_animation_success) {
+        // Reject the incomplete frame and resume native slide at the same progress.
+        m_workspaceGroup->abandonReveal();
+      }
+      if (built) {
+        observeDirectScanout();
+      }
+      if (built) {
         // Hardware gamma only (DRM). Nested Wayland has no gamma LUT; leave that alone.
         // Apply only when dirty: uploading the LUT every frame stalls the compositor.
         bool gammaPending = false;
@@ -1650,7 +1895,10 @@ namespace umbriel {
           }
         }
 
-        commitOk = wlr_output_commit_state(m_output, &state);
+        {
+          UMBRIEL_ZONE("Output::commitState");
+          commitOk = wlr_output_commit_state(m_output, &state);
+        }
         if (hasBuffer) {
           m_tearingRecovery.recordCommit(commitTearing, commitOk);
         }
@@ -1718,7 +1966,7 @@ namespace umbriel {
       break;
     }
 
-    if (effectsEligible && !commitFailed) {
+    if ((effectsEligible || audioPending()) && !commitFailed) {
       armEffectFrame(nowMsec);
     } else {
       disarmEffectFrame();
@@ -1764,6 +2012,32 @@ namespace umbriel {
 
   void Output::handlePresent(void* data) {
     const auto* event = static_cast<const wlr_output_event_present*>(data);
+#ifdef TRACY_ENABLE
+    if (event->presented) {
+      if (m_tracyIntervalPlot == nullptr) {
+        m_tracyIntervalPlot = tracyPlotName(std::format("{} present interval ms", m_output->name));
+        m_tracyVblankPlot = tracyPlotName(std::format("{} vblanks per present", m_output->name));
+      }
+      const int64_t whenNs = static_cast<int64_t>(event->when.tv_sec) * 1'000'000'000 + event->when.tv_nsec;
+      if (m_tracyLastPresentNs != 0) {
+        TracyPlot(m_tracyIntervalPlot, static_cast<double>(whenNs - m_tracyLastPresentNs) / 1e6);
+      }
+      // Above 1 while frames keep coming, the output repeated a vblank: a missed frame.
+      if (event->seq != 0 && m_tracyLastPresentSeq != 0) {
+        TracyPlot(m_tracyVblankPlot, static_cast<int64_t>(event->seq - m_tracyLastPresentSeq));
+      }
+      m_tracyLastPresentNs = whenNs;
+      m_tracyLastPresentSeq = event->seq;
+    }
+#endif
+    if (event->presented) {
+      const bool fixedRefresh =
+          event->refresh > 0 && m_output->adaptive_sync_status != WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED;
+      m_lastPresentNs = fixedRefresh
+          ? static_cast<uint64_t>(event->when.tv_sec) * 1'000'000'000 + static_cast<uint64_t>(event->when.tv_nsec)
+          : 0;
+      m_refreshNs = fixedRefresh ? static_cast<uint64_t>(event->refresh) : 0;
+    }
     if (SessionLock* lock = m_server->sessionLock()) {
       lock->handleOutputPresent(*this, event->commit_seq, event->presented);
     }

@@ -279,6 +279,13 @@ namespace umbriel {
         config(), m_initialRulesAppId, m_initialRulesTitle, m_initialRulesXdgTag, m_initialRulesContentType,
         m_initialRuleState, m_server->uptimeMs()
     );
+    // An attached dialog's placement is its parent's, so the placement rules have nothing to act on.
+    if (attached()) {
+      m_initialRules = rule;
+      m_initialRuleHistory.push_back(rule);
+      applyDynamicRules();
+      return;
+    }
     ScratchpadManager* scratchpadManager = m_server->scratchpadManager();
     const bool wasInScratchpad = scratchpadManager != nullptr && scratchpadManager->contains(this);
     const bool scratchpadChanged =
@@ -351,6 +358,9 @@ namespace umbriel {
     // Move first so a simultaneous floating-size rule resolves against the destination output.
     if (!wasInScratchpad && defaultFloatingChanged) {
       const bool wantFloat = *rule.defaultFloating;
+      if (wantFloat && m_layoutFloated) {
+        m_layoutFloated = false;
+      }
       if (wantFloat != !m_tiled) {
         if (wantFloat) {
           if (floatingWidthChanged) {
@@ -413,7 +423,7 @@ namespace umbriel {
       }
       if (targetOutput != nullptr) {
         const bool wasActivated = m_activated;
-        assignedScratchpad = scratchpadManager->assignByWindowRule(
+        assignedScratchpad = scratchpadManager->assignAutomatic(
             this, *scratchpadTarget, targetOutput,
             ScratchpadManager::AutomaticAdmission{
                 .restoreOutput = targetOutput,
@@ -571,6 +581,7 @@ namespace umbriel {
         .scratchpad = m_inScratchpad,
         .alone = isAloneInLayout(),
         .onlyWindow = isOnlyWindowOnWorkspace(),
+        .dialog = shellParent() != nullptr,
     };
   }
 
@@ -623,6 +634,11 @@ namespace umbriel {
     }
     const ResolvedWindowRule& rule = resolved != nullptr ? *resolved : resolvedRules();
     m_appliedRuleState = ruleState();
+    const std::optional<TitleBarMode> titleBarMode = rule.titleBar;
+    if (m_titleBarMode != titleBarMode) {
+      m_titleBarMode = titleBarMode;
+      refreshTitleBar();
+    }
     // Tile spacing stays on the global border width, so a decoration change redraws this window without an arrange.
     const bool ringChanged = m_decoration.applyRule(rule);
     const auto resolve = [&](EffectKind kind, const std::string& fallback, const std::optional<std::string>& selected) {
@@ -688,6 +704,10 @@ namespace umbriel {
     if (newOpacity != m_ruleOpacity) {
       m_ruleOpacity = newOpacity;
       setFadeAlpha(m_fadeAlpha); // refresh effective opacity
+    }
+    if (const bool backgroundRender = rule.backgroundRender.value_or(false); backgroundRender != m_backgroundRender) {
+      m_backgroundRender = backgroundRender;
+      m_server->scheduleSuspensionSync();
     }
     m_presentation.setFullscreenOpaque(fullscreenOpaque());
     updateBlur();

@@ -43,6 +43,20 @@ namespace umbriel {
     return elapsed >= interval ? 1 : std::max<uint64_t>(1, interval - elapsed);
   }
 
+  // The latest vblank at or before `nowNs` on the cadence of the last presentation: evenly spaced per output, yet
+  // never ahead of now. Projecting forward to the next vblank instead would put a slow output's instant up to a whole
+  // period ahead of a fast one's; outputs share one animation state, so the fast output would then repeat frames.
+  // 0 when nothing predicts it (no presentation yet, or no fixed refresh), so the caller uses now.
+  [[nodiscard]] inline uint64_t latestVblankNs(uint64_t nowNs, uint64_t lastPresentNs, uint64_t refreshNs) {
+    if (lastPresentNs == 0 || refreshNs == 0) {
+      return 0;
+    }
+    if (lastPresentNs >= nowNs) {
+      return lastPresentNs;
+    }
+    return lastPresentNs + (nowNs - lastPresentNs) / refreshNs * refreshNs;
+  }
+
   // An asynchronous page flip can pass the backend test and still fail at commit time. The generic frame retry must
   // submit one fresh regular state before another asynchronous attempt, otherwise a backend rejection can become a
   // self-sustaining retry loop.

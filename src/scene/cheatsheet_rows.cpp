@@ -1,5 +1,7 @@
 #include "scene/cheatsheet_rows.h"
 
+#include "config/window_position.h"
+
 // clang-format off
 // See keybind_parse.cpp: <cmath> must precede the wayland chain.
 #include <cmath>
@@ -203,6 +205,8 @@ namespace {
               return "dwindle";
             case umbriel::LayoutMode::Master:
               return "master";
+            case umbriel::LayoutMode::Floating:
+              return "floating";
             }
             return "scrolling";
           };
@@ -217,6 +221,11 @@ namespace {
             separator = ',';
           }
           return label;
+        }
+        return name;
+      case umbriel::ActionArgKind::SnapRegion:
+        if (const auto* arg = umbriel::payloadIf<umbriel::SnapRegionArg>(bind)) {
+          return name + ": " + std::string(umbriel::snapRegionName(arg->region));
         }
         return name;
       case umbriel::ActionArgKind::ColumnDisplay:
@@ -288,6 +297,37 @@ namespace {
       case umbriel::ActionArgKind::SkipConfirmation:
         if (const auto* quit = umbriel::payloadIf<umbriel::QuitArg>(bind); quit != nullptr && quit->skipConfirmation) {
           return name + ": skip-confirmation";
+        }
+        return name;
+      case umbriel::ActionArgKind::SdrWhite:
+        if (const auto* arg = umbriel::payloadIf<umbriel::SdrWhiteArg>(bind)) {
+          std::string value = std::format("{:g}", arg->nits);
+          if (!arg->output.empty()) {
+            value += "/" + arg->output;
+          }
+          return name + ": " + value;
+        }
+        return name;
+      case umbriel::ActionArgKind::WindowMoveTo:
+        if (const auto* moveTo = umbriel::payloadIf<umbriel::WindowMoveToArg>(bind); moveTo != nullptr) {
+          std::string val(umbriel::windowPositionAnchorName(moveTo->position.anchor));
+          val += "/" + std::to_string(moveTo->position.x);
+          val += "/" + std::to_string(moveTo->position.y);
+          if (!moveTo->id.empty()) {
+            val += "/" + moveTo->id;
+          }
+          return name + ": " + val;
+        }
+        return name;
+      case umbriel::ActionArgKind::WindowMoveBy:
+        if (const auto* moveBy = umbriel::payloadIf<umbriel::WindowMoveByArg>(bind); moveBy != nullptr) {
+          std::string val;
+          val += std::to_string(moveBy->deltaX);
+          val += "/" + std::to_string(moveBy->deltaY);
+          if (!moveBy->id.empty()) {
+            val += "/" + moveBy->id;
+          }
+          return name + ": " + val;
         }
         return name;
       }
@@ -390,7 +430,11 @@ namespace {
     case A::WindowModifyHeightDown:
     case A::WindowCycleSecondaryExtent:
     case A::WindowCycleSecondaryExtentBack:
+    case A::WindowSnap:
+    case A::WindowUnsnap:
     case A::WindowCenter:
+    case A::WindowMoveTo:
+    case A::WindowMoveBy:
     case A::LayoutScrollLeft:
     case A::LayoutScrollRight:
     case A::LayoutScrollUp:
@@ -414,8 +458,10 @@ namespace {
     case A::WindowSwapDown:
     case A::LayoutMasterCountIncrease:
     case A::LayoutMasterCountDecrease:
+    case A::LayoutToggleSplit:
       return Group::MoveSize;
     case A::WindowClose:
+    case A::WindowKill:
     case A::ToggleFloating:
     case A::ToggleMaximize:
     case A::ToggleMaximizeToEdges:
@@ -475,11 +521,14 @@ namespace {
     case A::OverviewClose:
       return Group::Overview;
     case A::ConfigReload:
+    case A::CursorHide:
+    case A::CursorShow:
     case A::DpmsOff:
     case A::DpmsOn:
     case A::OutputDisable:
     case A::OutputEnable:
     case A::OutputToggle:
+    case A::OutputSdrWhite:
     case A::SessionQuit:
     case A::Submap:
     case A::CheatsheetToggle:

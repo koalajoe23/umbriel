@@ -10,9 +10,12 @@ boundaries, or regression-sensitive behavior.
 
 - [Configuration reload](configuration-reload.md)
 - [Effects](effects.md)
+- [Audio shader input](audio-shader-input.md)
 - [Workspace lifecycle](workspace-lifecycle.md)
+- [Live workspace reveal](workspace-reveal.md)
 - [Overview rendering](overview-rendering.md)
 - [Touchpad gestures](touchpad-gestures.md)
+- [Toplevel data drags](toplevel-drag.md)
 - [Border rendering](border-rendering.md)
 - [Render performance](render-performance.md)
 - [Xwayland input stability](xwayland-input-stability.md)
@@ -24,7 +27,8 @@ boundaries, or regression-sensitive behavior.
 ## Harness-only IPC
 
 `settle`, `clock-freeze`, `clock-advance`, `clock-resume`, `renderer-recover`,
-and `effect-frames` exist for `tests/harness` and are compiled only with the
+`animation-capture-fail`, `blur-composite-split`, `swipe-test`, and
+`effect-frames` exist for `tests/harness` and are compiled only with the
 `test_ipc` option (auto: debug builds). The harness also drives hotplug through
 `output-create` and `output-destroy`, which every build ships for
 [virtual outputs](../user/outputs.md#virtual-outputs). `settle` replies once no
@@ -43,7 +47,11 @@ emits two consecutive notifications through the renderer's real mutable lost
 signal. The recovery check uses them to assert that one deferred renderer
 replacement completes and draws a new frame. `effect-frames` reports, per
 output, how many drawn frames advanced persistent effects' time and how many
-effect instances currently need frames of their own.
+effect instances currently need frames of their own. `blur-composite-split on`
+makes backdrop blur store its full-resolution result and composite it as a
+texture instead of drawing it straight into the target, and `off` restores the
+direct draw; both redraw every output and reply once each has drawn, so a check
+can compare the two at one frozen instant.
 
 ## Pointer drag completion
 

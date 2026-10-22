@@ -4,7 +4,9 @@
 // config.h so the parsing can be exercised without loading a config file.
 
 #include "config/effects.h"
+#include "config/window_position.h"
 #include "layout/layout.h"
+#include "view/snap.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +33,7 @@ namespace umbriel {
     None,
     Spawn,
     WindowClose,
+    WindowKill,
     SessionQuit,
     WindowFocusLeft,
     WindowFocusRight,
@@ -81,6 +84,8 @@ namespace umbriel {
     WindowMoveToWorkspaceNext,
     WindowMoveToWorkspacePrevious,
     ConfigReload,
+    CursorHide,
+    CursorShow,
     ScreenCastClear,
     ScreenCastSetOutput,
     ScreenCastSetWindow,
@@ -138,6 +143,8 @@ namespace umbriel {
     WorkspaceSwapActiveOutputPrevious,
     WindowModifyPrimaryExtent,
     WindowCenter,
+    WindowMoveTo,
+    WindowMoveBy,
     WorkspaceSetLayout,
     DpmsOff,
     DpmsOn,
@@ -198,6 +205,10 @@ namespace umbriel {
     ColumnHideTabBar,
     ScratchpadWindowShowNext,
     ScratchpadWindowShowPrevious,
+    LayoutToggleSplit,
+    OutputSdrWhite,
+    WindowSnap,
+    WindowUnsnap,
     Count,
   };
 
@@ -246,9 +257,14 @@ namespace umbriel {
     bool operator==(const WindowIdArg&) const = default;
   };
   struct LayoutModeArg {
-    std::optional<LayoutMode> mode;         // nullopt toggles through toggleSequence
-    std::vector<LayoutMode> toggleSequence; // distinct modes in toggle order; empty = scrolling, dwindle, master
+    std::optional<LayoutMode> mode; // nullopt toggles through toggleSequence
+    std::vector<LayoutMode>
+        toggleSequence; // distinct modes in toggle order; empty = scrolling, dwindle, master, floating
     bool operator==(const LayoutModeArg&) const = default;
+  };
+  struct SnapRegionArg {
+    SnapRegion region = SnapRegion::Left;
+    bool operator==(const SnapRegionArg&) const = default;
   };
   struct ColumnDisplayArg {
     ColumnDisplay display = ColumnDisplay::Normal;
@@ -261,6 +277,12 @@ namespace umbriel {
   struct QuitArg {
     bool skipConfirmation = false;
     bool operator==(const QuitArg&) const = default;
+  };
+  struct SdrWhiteArg {
+    // SDR reference white in cd/m², in the same range the config's `sdr_white` accepts.
+    double nits = 0.0;
+    std::string output; // empty = the preferred output
+    bool operator==(const SdrWhiteArg&) const = default;
   };
 
   struct EffectWindowArg {
@@ -277,10 +299,22 @@ namespace umbriel {
     std::string name; // empty = cycle the underlying pool
     bool operator==(const EffectCursorArg&) const = default;
   };
+  struct WindowMoveToArg {
+    std::string id; // empty = the focused window
+    WindowPosition position;
+    bool operator==(const WindowMoveToArg&) const = default;
+  };
+  struct WindowMoveByArg {
+    std::string id; // empty = the focused window
+    int deltaX = 0;
+    int deltaY = 0;
+    bool operator==(const WindowMoveByArg&) const = default;
+  };
 
   using KeybindPayload = std::variant<
       std::monostate, SpawnArg, SubmapArg, FractionArg, WorkspaceArg, OutputArg, ScratchpadArg, WindowIdArg,
-      LayoutModeArg, ColumnDisplayArg, TabIndexArg, QuitArg, EffectWindowArg, EffectScreenArg, EffectCursorArg>;
+      LayoutModeArg, ColumnDisplayArg, TabIndexArg, QuitArg, EffectWindowArg, EffectScreenArg, EffectCursorArg,
+      SdrWhiteArg, WindowMoveToArg, WindowMoveByArg, SnapRegionArg>;
 
   struct Keybind {
     // What triggers the bind.
@@ -339,6 +373,7 @@ namespace umbriel {
     OptionalWindowId,
     FractionDelta,
     LayoutMode,
+    SnapRegion,
     ColumnDisplay,
     TabIndex,
     SkipConfirmation,
@@ -348,6 +383,9 @@ namespace umbriel {
     ScreenEffectCycle,
     CursorEffectSet,
     CursorEffectCycle,
+    SdrWhite,
+    WindowMoveTo,
+    WindowMoveBy,
   };
 
   struct ActionSpec {
@@ -366,6 +404,10 @@ namespace umbriel {
 
   // Canonical name for an evdev BTN_* code, or nullptr for a button Umbriel does not name.
   [[nodiscard]] const char* mouseButtonName(uint32_t button);
+
+  // The BTN_* code binds store for a pressed button. Mice report their thumb buttons as either BTN_SIDE/BTN_EXTRA or
+  // BTN_BACK/BTN_FORWARD; both pairs map to BTN_SIDE/BTN_EXTRA.
+  [[nodiscard]] uint32_t canonicalMouseButton(uint32_t button);
 
   // Parse a chord such as "Mod+Shift+h", "Ctrl+Alt+Delete", "Mod+WheelUp", "Mod+MouseBack", or "submap[resize],Escape".
   // Only the trigger fields are written; the action is set separately by parseAction. Returns false and leaves `output`

@@ -56,6 +56,8 @@ namespace umbriel {
     // Open and not already zooming back in: pointer/keyboard edits still apply. The IPC `overview` event reports this
     // as `open`, so clients drop overview-scoped surfaces while the windows are still hidden.
     [[nodiscard]] bool interactive() const { return m_active && !m_closing; }
+    // True while a card mirrors `view`, so its client must keep drawing although its real frame is hidden.
+    [[nodiscard]] bool presentsLive(const View* view) const;
 
     void toggle();
     void open();
@@ -76,7 +78,7 @@ namespace umbriel {
 
     [[nodiscard]] AnimationPhase animationPhase() const override { return AnimationPhase::Overlays; }
     // Advances the zoom and workspace-row animations; returns true while either is still running.
-    bool tickAnimations(uint64_t nowMsec) override;
+    bool tickAnimations(double nowMsec) override;
     [[nodiscard]] bool hasActiveAnimations() const override;
     // The overview zooms every output at once.
     [[nodiscard]] bool animatesOn(const Output* /*output*/) const override { return true; }
@@ -86,6 +88,8 @@ namespace umbriel {
     void onViewPinnedChanged(View* view);
     void onViewFloatingChanged(View* view);
     void onViewWorkspaceChanged(View* view);
+    // A dialog attached to or left `parent`: its card mirrors the dialogs over the window.
+    void onViewAttachmentsChanged(View* parent);
     void onWorkspaceActivated(WorkspaceGroup* group);
     void onWorkspaceArranged(Workspace* workspace);
     void onWorkspaceInventoryChanged(WorkspaceGroup* group);
@@ -156,6 +160,8 @@ namespace umbriel {
 
     struct CardSurface {
       Card* card = nullptr;
+      // The window whose surface tree holds `surface`: the card's own, or a dialog attached to it.
+      View* view = nullptr;
       wlr_surface* surface = nullptr;
       wlr_scene_buffer* sourceBuffer = nullptr;
       wlr_scene_buffer* buffer = nullptr;
@@ -186,6 +192,7 @@ namespace umbriel {
       wlr_scene_shadow* shadow = nullptr;
       // Scaled copy of the chrome the view carries beside its borders, such as a tab bar, under `tree`.
       std::unique_ptr<ViewChromeAttachment> chrome;
+      std::unique_ptr<ViewChromeAttachment> frame;
       std::vector<std::unique_ptr<CardSurface>> surfaces;
       wlr_box box{}; // content box in layout coordinates
       wlr_scene_tree* badge = nullptr;
@@ -275,6 +282,15 @@ namespace umbriel {
     static void onCardSurfaceDestroy(wl_listener* listener, void* data);
     static void onCardBufferOutputSample(wl_listener* listener, void* data);
     static void onCardBufferFrameDone(wl_listener* listener, void* data);
+    // One walk over a card's surfaces, for one window of it, offset from the card window's root surface.
+    struct CardWalk {
+      Card* card = nullptr;
+      View* view = nullptr;
+      int dx = 0;
+      int dy = 0;
+    };
+    // The card window's surfaces, then those of every dialog attached to it at their offset over the window.
+    static void forEachCardSurface(Card* card, void (*visit)(wlr_surface*, int, int, void*));
     static void addCardSurface(wlr_surface* surface, int sx, int sy, void* data);
     static void syncCardSurface(wlr_surface* surface, int sx, int sy, void* data);
     static void onDesktopSurfaceCommit(wl_listener* listener, void* data);

@@ -34,14 +34,18 @@ namespace umbriel {
     }
   }
 
-  void ViewDecoration::updateBorderGeometry(int contentWidth, int contentHeight) {
+  void ViewDecoration::updateBorderGeometry(int contentWidth, int contentHeight, int topExtension) {
     if (m_border == nullptr) {
       return;
     }
 
+    wlr_scene_node_set_position(&m_borderTree->node, 0, -topExtension);
     applyBorderGeometry(
         m_border,
-        makeBorderRing(contentWidth, contentHeight, m_cornerRadius, m_borderWidth, m_outerBorderWidth, m_borderPadding),
+        makeBorderRing(
+            contentWidth, contentHeight + topExtension, m_cornerRadius, m_borderWidth, m_outerBorderWidth,
+            m_borderPadding
+        ),
         m_borderWidth, m_outerBorderWidth
     );
   }
@@ -64,13 +68,16 @@ namespace umbriel {
     wlr_scene_border_set_colors(m_border, innerColor, outerColor);
   }
 
-  bool ViewDecoration::borderGeometryStale(int contentWidth, int contentHeight) const {
+  bool ViewDecoration::borderGeometryStale(int contentWidth, int contentHeight, int topExtension) const {
     if (m_border == nullptr) {
       return false;
     }
-    const BorderRing ring =
-        makeBorderRing(contentWidth, contentHeight, m_cornerRadius, m_borderWidth, m_outerBorderWidth, m_borderPadding);
-    return m_border->width != ring.box.width || m_border->height != ring.box.height;
+    const BorderRing ring = makeBorderRing(
+        contentWidth, contentHeight + topExtension, m_cornerRadius, m_borderWidth, m_outerBorderWidth, m_borderPadding
+    );
+    return m_border->width != ring.box.width
+        || m_border->height != ring.box.height
+        || m_borderTree->node.y != -topExtension;
   }
 
   void ViewDecoration::snapshotBorders(
@@ -187,11 +194,13 @@ namespace umbriel {
     }
   }
 
-  void ViewDecoration::updateShadow(int contentWidth, int contentHeight, int borderInset, int cornerRadius) {
+  void ViewDecoration::updateShadow(
+      int contentWidth, int contentHeight, int borderInset, int cornerRadius, int topExtension
+  ) {
     if (m_shadowContainer == nullptr) {
       return;
     }
-    m_shadow.update(m_shadowContainer, contentWidth, contentHeight, borderInset, cornerRadius);
+    m_shadow.update(m_shadowContainer, contentWidth, contentHeight, borderInset, cornerRadius, topExtension);
   }
 
   void ViewDecoration::hideShadow() { m_shadow.hide(); }

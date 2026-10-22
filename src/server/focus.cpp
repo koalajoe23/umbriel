@@ -8,6 +8,7 @@
 #include "output/output.h"
 #include "overview/overview.h"
 #include "scene/node.h"
+#include "scene/ssd_frame.h"
 #include "server/server.h"
 #include "view/view.h"
 #include "wlr.h"
@@ -48,18 +49,17 @@ namespace umbriel {
     if (view == nullptr || m_server.sessionLocked()) {
       return;
     }
-    // Clients ignore input to a window while its modal dialog is open, so the dialog takes the focus instead.
-    while (View* dialog = view->blockingDialog()) {
-      view = dialog;
-    }
+    // Focus policy (workspace, MRU, reveal) belongs to the window that holds the placement; the keyboard goes to the
+    // dialog attached on top of it, if any.
+    view = view->placementRoot();
+    View* seatTarget = view->inputDelegate();
 
     // PointerHover gate: reject focus entirely when revealing would exceed the configured max scroll fraction. Must run
-    // before any side effects (MRU, seat focus) so an over-limit hover focuses nothing. A modal dialog reveals the tile
-    // it is attached to, so that tile is what the gate measures.
-    if (View* tile = view->attachedRoot(); reason == FocusReason::PointerHover && tile->tiled()) {
-      if (Workspace* workspace = tile->workspace()) {
+    // before any side effects (MRU, seat focus) so an over-limit hover focuses nothing.
+    if (reason == FocusReason::PointerHover && view->tiled()) {
+      if (Workspace* workspace = view->workspace()) {
         const auto& maxScroll = config().input.focus.followsMouseMaxScroll;
-        if (maxScroll && workspace->scrollFractionToReveal(tile) > *maxScroll) {
+        if (maxScroll && workspace->scrollFractionToReveal(view) > *maxScroll) {
           return;
         }
       }
@@ -89,7 +89,7 @@ namespace umbriel {
 
     View* previous = View::fromSurface(m_server.seat()->wlr()->keyboard_state.focused_surface);
     // Read the rule before changing activation: a match.is_focused rule stops matching as soon as focus moves.
-    const bool leavingConfinement = previous != nullptr && previous != view && previous->confinePointer();
+    const bool leavingConfinement = previous != nullptr && previous != seatTarget && previous->confinePointer();
     m_server.registry().promote(view);
     view->setUrgent(false);
 
@@ -105,11 +105,11 @@ namespace umbriel {
     if (LayerSurface* layer = exclusiveKeyboardLayer()) {
       layer->focus();
     } else {
-      view->applySeatFocus(!overviewActive);
+      seatTarget->applySeatFocus(!overviewActive);
     }
     Workspace* workspace = view->workspace();
     if (workspace != nullptr && (!view->pinned() || workspace->active())) {
-      workspace->setFocusedView(view);
+      workspace->setFocusedView(view, reason != FocusReason::PointerHover);
     }
     m_server.refreshOutputPolicies();
     if (overviewActive) {
@@ -130,8 +130,8 @@ namespace umbriel {
       }
     }
 
-    // Derive reveal policy from the focus reason. A modal dialog reveals the tile it is attached to.
-    if (workspace == nullptr || !view->attachedRoot()->tiled()) {
+    // Derive reveal policy from the focus reason.
+    if (workspace == nullptr || !view->tiled()) {
       return;
     }
     switch (reason) {
@@ -201,7 +201,8 @@ namespace umbriel {
     };
 
     if (View* view = View::fromSurface(focusedSurface)) {
-      if (!view->mapped() || (!view->onActiveWorkspace() && !view->pinned())) {
+      // A window with a dialog attached hands the keyboard to the dialog instead of keeping it.
+      if (!view->mapped() || view->blocked() || (!view->onActiveWorkspace() && !view->pinned())) {
         return false;
       }
 
@@ -222,7 +223,7 @@ namespace umbriel {
       // and stacking so a popup or input grab keeps the exact focused surface.
       view->applySeatFocus(false);
       if (Workspace* workspace = view->workspace(); workspace != nullptr && (!view->pinned() || workspace->active())) {
-        workspace->setFocusedView(view);
+        workspace->setFocusedView(view->placementRoot(), false);
       }
       m_server.refreshOutputPolicies();
       return true;
@@ -257,6 +258,10 @@ namespace umbriel {
     if (retainCurrentKeyboardFocus()) {
       return;
     }
+    if (ScratchpadManager* pad = m_server.scratchpadManager();
+        pad != nullptr && pad->refocusActive(m_server.outputFromWlr(m_server.preferredOutput()))) {
+      return;
+    }
     // Focus that last sat on a scratchpad still visible on the pointer output
     // returns there, e.g. when an exclusive layer releases the seat.
     if (ScratchpadManager* pad = m_server.scratchpadManager()) {
@@ -284,12 +289,19 @@ namespace umbriel {
         && pad->outputFor(focused) == preferred) {
       return;
     }
+    Output* scratchpadOutput = preferred != nullptr ? preferred : m_server.outputFromWlr(m_server.preferredOutput());
+    if (pad != nullptr && pad->refocusActive(scratchpadOutput)) {
+      return;
+    }
     refocusExplicit(preferred);
   }
 
   void FocusManager::refocusExplicit(Output* preferred) {
     if (m_server.sessionLocked()) {
       return;
+    }
+    if (ScratchpadManager* pad = m_server.scratchpadManager()) {
+      pad->deactivateOn(preferred != nullptr ? preferred : m_server.outputFromWlr(m_server.preferredOutput()));
     }
     if (LayerSurface* layer = exclusiveKeyboardLayer()) {
       layer->focus();
@@ -314,7 +326,7 @@ namespace umbriel {
           return true;
         }
       }
-      for (const auto& entry : m_server.registry().all()) {
+      for (const auto& entry : m_server.registry().placementRoots()) {
         if (entry->mapped() && entry->workspace() == workspace) {
           focusView(entry.get());
           return true;
@@ -375,13 +387,47 @@ namespace umbriel {
     clearKeyboardFocus();
   }
 
+  std::optional<SsdFrameHit> FocusManager::ssdFrameAt(double lx, double ly) const {
+    if (m_server.sessionLocked())
+      return std::nullopt;
+    const View* carried = m_server.cursor()->toplevelDragView();
+    double sx = 0;
+    double sy = 0;
+    wlr_scene_node* node = wlr_scene_node_at_excluding(
+        &m_server.scene()->tree.node, lx, ly, &sx, &sy, carried != nullptr ? &carried->sceneTree()->node : nullptr
+    );
+    if (node == nullptr)
+      return std::nullopt;
+    for (wlr_scene_tree* tree = node->parent; tree != nullptr; tree = tree->node.parent) {
+      SceneNode* tag = sceneNodeFrom(tree->node.data);
+      if (tag == nullptr)
+        continue;
+      if (tag->kind != SceneNodeKind::View)
+        return std::nullopt;
+      auto* view = static_cast<View*>(tag);
+      if (!view->mapped()
+          || (!view->pinned() && !view->onActiveWorkspace())
+          || view->ssdFrame() == nullptr
+          || !view->ssdFrame()->contains(node))
+        return std::nullopt;
+      const auto point = view->ssdFramePointAt(lx, ly);
+      if (point.part == SsdFramePart::None)
+        return std::nullopt;
+      return SsdFrameHit{view, point.part, point.edges};
+    }
+    return std::nullopt;
+  }
+
   View*
   FocusManager::viewAt(double lx, double ly, wlr_surface** surface, double* sx, double* sy, LayerSurface** layer) {
     if (layer != nullptr) {
       *layer = nullptr;
     }
 
-    wlr_scene_node* node = wlr_scene_node_at(&m_server.scene()->tree.node, lx, ly, sx, sy);
+    const View* carried = m_server.cursor()->toplevelDragView();
+    wlr_scene_node* node = wlr_scene_node_at_excluding(
+        &m_server.scene()->tree.node, lx, ly, sx, sy, carried != nullptr ? &carried->sceneTree()->node : nullptr
+    );
     if (node == nullptr || node->type != WLR_SCENE_NODE_BUFFER) {
       return nullptr;
     }
@@ -422,9 +468,9 @@ namespace umbriel {
       *surface = nullptr;
       return nullptr;
     }
-    // A window with an open modal dialog gets no pointer, the way it gets no keyboard. The view is still reported so a
-    // click on it focuses the dialog.
-    if (view->blockingDialog() != nullptr) {
+    // A window with a dialog attached gets no pointer, the way it gets no keyboard. The view is still reported so a
+    // press on it focuses the dialog and a Mod-drag moves it.
+    if (view->blocked()) {
       *surface = nullptr;
     }
     return view;
